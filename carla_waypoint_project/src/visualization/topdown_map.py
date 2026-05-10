@@ -57,17 +57,24 @@ class TopDownMapRenderer:
             height,
         )
 
-    def contains_screen_point(self, surface: pygame.Surface, position: tuple[int, int]) -> bool:
+    def contains_screen_point(
+        self,
+        surface: pygame.Surface,
+        position: tuple[int, int],
+        panel_rect: Optional[pygame.Rect] = None,
+    ) -> bool:
         """Return whether a screen point is inside the top-down map panel."""
-        return self.get_panel_rect(surface).collidepoint(position)
+        rect = panel_rect if panel_rect is not None else self.get_panel_rect(surface)
+        return rect.collidepoint(position)
 
     def screen_to_world(
         self,
         surface: pygame.Surface,
         position: tuple[int, int],
+        panel_rect: Optional[pygame.Rect] = None,
     ) -> Optional["carla.Location"]:
         """Convert a point in the pygame window to a CARLA world location."""
-        rect = self.get_panel_rect(surface)
+        rect = panel_rect if panel_rect is not None else self.get_panel_rect(surface)
         if not rect.collidepoint(position):
             return None
 
@@ -76,16 +83,21 @@ class TopDownMapRenderer:
         y = self._center_y - (position[1] - rect.centery) / scale
         return carla.Location(x=float(x), y=float(y), z=0.0)
 
-    def handle_mouse_button_down(self, surface: pygame.Surface, event: pygame.event.Event) -> bool:
+    def handle_mouse_button_down(
+        self,
+        surface: pygame.Surface,
+        event: pygame.event.Event,
+        panel_rect: Optional[pygame.Rect] = None,
+    ) -> bool:
         """Handle map zoom or pan start. Returns True if event was consumed."""
-        if not self.contains_screen_point(surface, event.pos):
+        if not self.contains_screen_point(surface, event.pos, panel_rect):
             return False
 
         if event.button == 4:
-            self._zoom_at(surface, event.pos, TOPDOWN_MAP.zoom_step)
+            self._zoom_at(surface, event.pos, TOPDOWN_MAP.zoom_step, panel_rect)
             return True
         if event.button == 5:
-            self._zoom_at(surface, event.pos, 1.0 / TOPDOWN_MAP.zoom_step)
+            self._zoom_at(surface, event.pos, 1.0 / TOPDOWN_MAP.zoom_step, panel_rect)
             return True
         if event.button in (2, 3):
             self._is_panning = True
@@ -99,12 +111,17 @@ class TopDownMapRenderer:
             self._is_panning = False
             self._last_pan_pos = None
 
-    def handle_mouse_motion(self, surface: pygame.Surface, event: pygame.event.Event) -> bool:
+    def handle_mouse_motion(
+        self,
+        surface: pygame.Surface,
+        event: pygame.event.Event,
+        panel_rect: Optional[pygame.Rect] = None,
+    ) -> bool:
         """Pan the map while right or middle mouse is held."""
         if not self._is_panning or self._last_pan_pos is None:
             return False
 
-        rect = self.get_panel_rect(surface)
+        rect = panel_rect if panel_rect is not None else self.get_panel_rect(surface)
         scale = self._scale_for_rect(rect)
         dx = event.pos[0] - self._last_pan_pos[0]
         dy = event.pos[1] - self._last_pan_pos[1]
@@ -118,13 +135,14 @@ class TopDownMapRenderer:
         surface: pygame.Surface,
         position: tuple[int, int],
         wheel_y: int,
+        panel_rect: Optional[pygame.Rect] = None,
     ) -> bool:
         """Zoom the map around the mouse position."""
-        if not self.contains_screen_point(surface, position):
+        if not self.contains_screen_point(surface, position, panel_rect):
             return False
 
         zoom_factor = TOPDOWN_MAP.zoom_step if wheel_y > 0 else 1.0 / TOPDOWN_MAP.zoom_step
-        self._zoom_at(surface, position, zoom_factor)
+        self._zoom_at(surface, position, zoom_factor, panel_rect)
         return True
 
     def draw(
@@ -136,12 +154,15 @@ class TopDownMapRenderer:
         goal_waypoint: Optional["carla.Waypoint"],
         route: Sequence["carla.Waypoint"],
         target_waypoint: Optional["carla.Waypoint"],
+        panel_rect: Optional[pygame.Rect] = None,
     ) -> None:
         """Draw the complete top-down map panel."""
-        rect = self.get_panel_rect(surface)
+        rect = panel_rect if panel_rect is not None else self.get_panel_rect(surface)
         pygame.draw.rect(surface, TOPDOWN_MAP.background_color, rect)
         pygame.draw.rect(surface, TOPDOWN_MAP.border_color, rect, width=1)
 
+        old_clip = surface.get_clip()
+        surface.set_clip(rect)
         for polyline in self._road_polylines:
             points = [self._world_to_screen(rect, point[0], point[1]) for point in polyline]
             if len(points) >= 2:
@@ -153,6 +174,7 @@ class TopDownMapRenderer:
         self._draw_target(surface, rect, target_waypoint)
         self._draw_vehicle(surface, rect, ego_state)
         self._draw_hud(surface, rect, hud, start_waypoint, goal_waypoint)
+        surface.set_clip(old_clip)
 
     def _build_road_polylines(self) -> List[List[Point2D]]:
         polylines: List[List[Point2D]] = []
@@ -198,10 +220,16 @@ class TopDownMapRenderer:
         screen_y = rect.centery - (y - self._center_y) * scale
         return int(screen_x), int(screen_y)
 
-    def _zoom_at(self, surface: pygame.Surface, position: tuple[int, int], zoom_factor: float) -> None:
-        before = self.screen_to_world(surface, position)
+    def _zoom_at(
+        self,
+        surface: pygame.Surface,
+        position: tuple[int, int],
+        zoom_factor: float,
+        panel_rect: Optional[pygame.Rect] = None,
+    ) -> None:
+        before = self.screen_to_world(surface, position, panel_rect)
         self._zoom = max(TOPDOWN_MAP.min_zoom, min(TOPDOWN_MAP.max_zoom, self._zoom * zoom_factor))
-        after = self.screen_to_world(surface, position)
+        after = self.screen_to_world(surface, position, panel_rect)
         if before is None or after is None:
             return
         self._center_x += before.x - after.x
@@ -296,7 +324,7 @@ class TopDownMapRenderer:
             rows.append(hud.planner_status[:42])
 
         x = rect.left + 8
-        y = rect.top + 8
+        y = rect.top + 26
         for row in rows:
             text_surface = self._small_font.render(row, True, TOPDOWN_MAP.text_color)
             surface.blit(text_surface, (x, y))

@@ -130,6 +130,7 @@ class RoutePlanner:
             return []
 
         if start_edge == goal_edge and start_index <= goal_index:
+            self._planner_error = None
             return [start] + start_edge.path[start_index : goal_index + 1] + [goal]
 
         middle_edges = self._shortest_fallback_edges(start_edge.end_key, goal_edge.start_key)
@@ -143,6 +144,7 @@ class RoutePlanner:
             route.extend(edge.path[1:])
         route.extend(goal_edge.path[: goal_index + 1])
         route.append(goal)
+        self._planner_error = None
         return route
 
     def _build_fallback_graph_if_needed(self) -> None:

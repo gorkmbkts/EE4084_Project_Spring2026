@@ -16,10 +16,15 @@ from src.planning.map_selector import MapSelector
 from src.planning.route_planner import RoutePlanner
 from src.planning.waypoint_manager import WaypointManager
 from src.sensors.camera_sensor import CameraSensor
+from src.sensors.gnss_sensor import GnssSensor
+from src.sensors.imu_sensor import ImuSensor
+from src.sensors.lidar_sensor import LidarSensor
 from src.sensors.sensor_manager import SensorManager
 from src.vehicle.manual_controller import ManualController
 from src.vehicle.vehicle_manager import VehicleManager
+from src.visualization.lidar_panel import LidarPanelRenderer
 from src.visualization.pygame_display import PygameDisplay
+from src.visualization.sensor_panel import SensorPanelData, SensorPanelRenderer
 from src.visualization.topdown_map import TopDownHudData, TopDownMapRenderer
 from src.visualization.waypoint_overlay import WaypointOverlayRenderer
 from src.utils.carla_import import ensure_carla_import
@@ -47,9 +52,14 @@ class SimulationApp:
         self._waypoint_manager: Optional[WaypointManager] = None
         self._manual_controller: Optional[ManualController] = None
         self._camera_sensor: Optional[CameraSensor] = None
+        self._gnss_sensor: Optional[GnssSensor] = None
+        self._imu_sensor: Optional[ImuSensor] = None
+        self._lidar_sensor: Optional[LidarSensor] = None
         self._vehicle: Optional["carla.Vehicle"] = None
 
         self._overlay_renderer = WaypointOverlayRenderer()
+        self._lidar_renderer = LidarPanelRenderer()
+        self._sensor_panel_renderer = SensorPanelRenderer()
         self._state_provider: Optional[GroundTruthStateProvider] = None
         self._map_selector: Optional[MapSelector] = None
         self._topdown_renderer: Optional[TopDownMapRenderer] = None
@@ -65,6 +75,8 @@ class SimulationApp:
             closest_index=0,
             target_index=0,
             cross_track_error_m=float("inf"),
+            distance_to_goal_m=float("inf"),
+            heading_error_deg=None,
             completed=False,
         )
         self._planner_status = ""
@@ -85,6 +97,9 @@ class SimulationApp:
             blueprint_library=self._client_manager.blueprint_library,
         )
         self._camera_sensor = self._sensor_manager.create_rgb_camera(attach_to=self._vehicle)
+        self._gnss_sensor = self._sensor_manager.create_gnss(attach_to=self._vehicle)
+        self._imu_sensor = self._sensor_manager.create_imu(attach_to=self._vehicle)
+        self._lidar_sensor = self._sensor_manager.create_lidar(attach_to=self._vehicle)
 
         world_map = self._client_manager.world_map
         self._waypoint_manager = WaypointManager(world_map=world_map)
@@ -103,6 +118,9 @@ class SimulationApp:
         required = {
             "vehicle": self._vehicle,
             "camera sensor": self._camera_sensor,
+            "GNSS sensor": self._gnss_sensor,
+            "IMU sensor": self._imu_sensor,
+            "LiDAR sensor": self._lidar_sensor,
             "waypoint manager": self._waypoint_manager,
             "manual controller": self._manual_controller,
             "state provider": self._state_provider,
@@ -116,25 +134,28 @@ class SimulationApp:
 
     def run(self) -> None:
         """Run the camera, route-selection, and route-following application loop."""
-        self._setup()
-        self._ensure_ready()
-
-        manual_controller = self._manual_controller
-        camera_sensor = self._camera_sensor
-        waypoint_manager = self._waypoint_manager
-        vehicle = self._vehicle
-        state_provider = self._state_provider
-
-        assert manual_controller is not None
-        assert camera_sensor is not None
-        assert waypoint_manager is not None
-        assert vehicle is not None
-        assert state_provider is not None
-
-        running = True
         try:
+            self._setup()
+            self._ensure_ready()
+
+            manual_controller = self._manual_controller
+            camera_sensor = self._camera_sensor
+            waypoint_manager = self._waypoint_manager
+            vehicle = self._vehicle
+            state_provider = self._state_provider
+
+            assert manual_controller is not None
+            assert camera_sensor is not None
+            assert waypoint_manager is not None
+            assert vehicle is not None
+            assert state_provider is not None
+
+            running = True
             while running:
                 running = self._process_events()
+                if not running:
+                    break
+                self._client_manager.tick()
                 self._latest_state = state_provider.get_state()
                 self._latest_tracking = self.waypoint_tracker.update(self._latest_state)
 
@@ -152,8 +173,10 @@ class SimulationApp:
                 self._display.begin_frame(camera_surface)
                 self._draw_camera_waypoints(waypoint_manager, camera_sensor, vehicle)
                 self._draw_topdown_map()
+                self._draw_lidar_panel()
+                self._draw_sensor_panel()
                 self._display.end_frame()
-                self._clock.tick()
+                self._clock.tick_pygame()
         finally:
             self.shutdown()
 
@@ -202,14 +225,22 @@ class SimulationApp:
         if renderer is None or not self._map_selection_active:
             return
 
-        consumed = renderer.handle_mouse_button_down(self._display.surface, event)
+        consumed = renderer.handle_mouse_button_down(
+            self._display.surface,
+            event,
+            panel_rect=self._display.map_rect,
+        )
         if consumed:
             return
 
         if event.button != 1:
             return
 
-        world_location = renderer.screen_to_world(self._display.surface, event.pos)
+        world_location = renderer.screen_to_world(
+            self._display.surface,
+            event.pos,
+            panel_rect=self._display.map_rect,
+        )
         if world_location is None:
             return
 
@@ -226,7 +257,11 @@ class SimulationApp:
 
     def _handle_mouse_motion(self, event: pygame.event.Event) -> None:
         if self._topdown_renderer is not None and self._map_selection_active:
-            self._topdown_renderer.handle_mouse_motion(self._display.surface, event)
+            self._topdown_renderer.handle_mouse_motion(
+                self._display.surface,
+                event,
+                panel_rect=self._display.map_rect,
+            )
 
     def _handle_mouse_wheel(self, event: pygame.event.Event) -> None:
         if self._topdown_renderer is None or not self._map_selection_active:
@@ -235,6 +270,7 @@ class SimulationApp:
             surface=self._display.surface,
             position=pygame.mouse.get_pos(),
             wheel_y=event.y,
+            panel_rect=self._display.map_rect,
         )
 
     def _try_enable_autonomous_mode(self) -> None:
@@ -312,10 +348,11 @@ class SimulationApp:
             camera=camera_sensor.actor,
             vehicle=vehicle,
             target_waypoint=target_waypoint,
+            surface_offset=self._display.main_view_rect.topleft,
         )
 
     def _draw_topdown_map(self) -> None:
-        if not self._map_selection_active or self._topdown_renderer is None:
+        if self._topdown_renderer is None:
             return
 
         route = self.route_planner.get_route() if self.route_planner is not None else []
@@ -340,6 +377,42 @@ class SimulationApp:
             goal_waypoint=goal,
             route=route,
             target_waypoint=self._latest_tracking.target_waypoint,
+            panel_rect=self._display.map_rect,
+        )
+
+    def _draw_lidar_panel(self) -> None:
+        measurement = None
+        if self._lidar_sensor is not None:
+            measurement = self._lidar_sensor.get_latest_measurement()
+        self._lidar_renderer.draw(
+            surface=self._display.surface,
+            rect=self._display.lidar_rect,
+            measurement=measurement,
+        )
+
+    def _draw_sensor_panel(self) -> None:
+        route = self.route_planner.get_route() if self.route_planner is not None else []
+        gnss = self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None
+        imu = self._imu_sensor.get_latest_measurement() if self._imu_sensor is not None else None
+        lidar = self._lidar_sensor.get_latest_measurement() if self._lidar_sensor is not None else None
+        data = SensorPanelData(
+            drive_mode=self._drive_mode.value,
+            map_selection_active=self._map_selection_active,
+            sync_status=self._client_manager.sync_status,
+            fixed_delta_seconds=self._client_manager.fixed_delta_seconds,
+            pygame_frame_dt_seconds=self._clock.last_frame_dt_seconds,
+            planner_status=self._planner_status,
+            route_size=len(route),
+            ego_state=self._latest_state,
+            tracking=self._latest_tracking,
+            gnss=gnss,
+            imu=imu,
+            lidar=lidar,
+        )
+        self._sensor_panel_renderer.draw(
+            surface=self._display.surface,
+            rect=self._display.sensor_panel_rect,
+            data=data,
         )
 
     def shutdown(self) -> None:
@@ -350,9 +423,14 @@ class SimulationApp:
         if self._sensor_manager is not None:
             self._sensor_manager.destroy_all()
             self._sensor_manager = None
+            self._camera_sensor = None
+            self._gnss_sensor = None
+            self._imu_sensor = None
+            self._lidar_sensor = None
 
         if self._vehicle_manager is not None:
             self._vehicle_manager.destroy()
             self._vehicle_manager = None
 
+        self._client_manager.restore_world_settings()
         self._display.shutdown()

@@ -21,6 +21,8 @@ class TrackingStatus:
     closest_index: int
     target_index: int
     cross_track_error_m: float
+    distance_to_goal_m: float
+    heading_error_deg: Optional[float]
     completed: bool
 
 
@@ -34,18 +36,22 @@ class WaypointTracker:
         search_backtrack_count: int = WAYPOINT_TRACKER.search_backtrack_count,
         search_forward_count: int = WAYPOINT_TRACKER.search_forward_count,
         completion_distance_m: float = WAYPOINT_TRACKER.completion_distance_m,
+        completion_index_window: int = WAYPOINT_TRACKER.completion_index_window,
     ) -> None:
         self._lookahead_base_m = lookahead_base_m
         self._lookahead_gain_s = lookahead_gain_s
         self._search_backtrack_count = search_backtrack_count
         self._search_forward_count = search_forward_count
         self._completion_distance_m = completion_distance_m
+        self._completion_index_window = completion_index_window
         self._route: List["carla.Waypoint"] = []
         self._closest_index = 0
         self._target_index = 0
         self._completed = False
         self._current_target: Optional["carla.Waypoint"] = None
         self._cross_track_error_m = float("inf")
+        self._distance_to_goal_m = float("inf")
+        self._heading_error_deg: Optional[float] = None
 
     @property
     def closest_index(self) -> int:
@@ -67,6 +73,8 @@ class WaypointTracker:
         self._completed = False
         self._current_target = self._route[0] if self._route else None
         self._cross_track_error_m = float("inf")
+        self._distance_to_goal_m = float("inf")
+        self._heading_error_deg = None
 
     def clear_route(self) -> None:
         """Clear route and tracking state."""
@@ -77,15 +85,25 @@ class WaypointTracker:
         if not self._route:
             self._completed = False
             self._current_target = None
+            self._cross_track_error_m = float("inf")
+            self._distance_to_goal_m = float("inf")
+            self._heading_error_deg = None
             return self._status()
 
         self._closest_index, self._cross_track_error_m = self._find_closest_index(state)
-        self._target_index = self._find_target_index(state)
+        candidate_target_index = self._find_target_index(state)
+        self._target_index = max(self._target_index, candidate_target_index)
         self._current_target = self._route[self._target_index]
-        self._completed = self._is_route_completed(state)
-        if self._completed:
+        self._distance_to_goal_m = self._compute_distance_to_goal(state)
+        self._heading_error_deg = self._compute_heading_error(state, self._current_target)
+
+        if self._completed or self._is_route_completed():
+            self._completed = True
             self._target_index = len(self._route) - 1
             self._current_target = self._route[-1]
+            self._heading_error_deg = self._compute_heading_error(state, self._current_target)
+        if self._completed:
+            self._distance_to_goal_m = self._compute_distance_to_goal(state)
         return self._status()
 
     def get_target(self) -> Optional["carla.Waypoint"]:
@@ -135,12 +153,41 @@ class WaypointTracker:
             index += 1
         return index
 
-    def _is_route_completed(self, state: EgoState) -> bool:
+    def _compute_distance_to_goal(self, state: EgoState) -> float:
         goal_location = self._route[-1].transform.location
-        distance_to_goal = math.hypot(goal_location.x - state.x, goal_location.y - state.y)
-        near_goal = distance_to_goal <= self._completion_distance_m
-        near_end_index = self._closest_index >= max(0, len(self._route) - 3)
-        return near_goal and near_end_index
+        return math.hypot(goal_location.x - state.x, goal_location.y - state.y)
+
+    def _is_route_completed(self) -> bool:
+        near_goal = self._distance_to_goal_m <= self._completion_distance_m
+        end_window_start = max(0, len(self._route) - self._completion_index_window)
+        near_end_index = self._closest_index >= end_window_start
+        target_at_end = self._target_index >= len(self._route) - 1
+        return near_goal and (near_end_index or target_at_end)
+
+    @staticmethod
+    def _compute_heading_error(
+        state: EgoState,
+        target_waypoint: Optional["carla.Waypoint"],
+    ) -> Optional[float]:
+        if target_waypoint is None:
+            return None
+
+        target_location = target_waypoint.transform.location
+        dx = target_location.x - state.x
+        dy = target_location.y - state.y
+        if math.hypot(dx, dy) < 0.1:
+            desired_yaw = float(target_waypoint.transform.rotation.yaw)
+        else:
+            desired_yaw = math.degrees(math.atan2(dy, dx))
+        return WaypointTracker._normalize_angle_deg(desired_yaw - state.yaw)
+
+    @staticmethod
+    def _normalize_angle_deg(angle_deg: float) -> float:
+        while angle_deg > 180.0:
+            angle_deg -= 360.0
+        while angle_deg < -180.0:
+            angle_deg += 360.0
+        return angle_deg
 
     def _status(self) -> TrackingStatus:
         return TrackingStatus(
@@ -148,5 +195,7 @@ class WaypointTracker:
             closest_index=self._closest_index,
             target_index=self._target_index,
             cross_track_error_m=self._cross_track_error_m,
+            distance_to_goal_m=self._distance_to_goal_m,
+            heading_error_deg=self._heading_error_deg,
             completed=self._completed,
         )

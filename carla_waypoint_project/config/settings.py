@@ -12,16 +12,24 @@ ColorRGB = Tuple[int, int, int]
 class CarlaSettings:
     host: str = "localhost"
     port: int = 2000
-    timeout_seconds: float = 10.0
+    timeout_seconds: float = 20.0
+    connection_attempts: int = 3
+    retry_delay_seconds: float = 2.0
 
 
 @dataclass(frozen=True)
 class DisplaySettings:
-    width: int = 1280
-    height: int = 720
+    width: int = 1742
+    height: int = 982
     fps: int = 30
-    title: str = "CARLA Route Selection + Ground Truth Following"
-    clear_color: ColorRGB = (15, 15, 15)
+    title: str = "CARLA Phase 1-3 Dashboard"
+    clear_color: ColorRGB = (10, 12, 16)
+
+
+@dataclass(frozen=True)
+class SimulationSettings:
+    synchronous_mode: bool = True
+    fixed_delta_seconds: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -44,6 +52,39 @@ class CameraSettings:
     relative_pitch: float = -15.0
     relative_yaw: float = 0.0
     relative_roll: float = 0.0
+
+
+@dataclass(frozen=True)
+class GnssSettings:
+    blueprint_id: str = "sensor.other.gnss"
+    sensor_tick: float = 0.05
+    relative_x: float = 0.0
+    relative_y: float = 0.0
+    relative_z: float = 2.2
+
+
+@dataclass(frozen=True)
+class ImuSettings:
+    blueprint_id: str = "sensor.other.imu"
+    sensor_tick: float = 0.05
+    relative_x: float = 0.0
+    relative_y: float = 0.0
+    relative_z: float = 2.0
+
+
+@dataclass(frozen=True)
+class LidarSettings:
+    blueprint_id: str = "sensor.lidar.ray_cast"
+    sensor_tick: float = 0.05
+    channels: int = 32
+    range_m: float = 50.0
+    points_per_second: int = 56000
+    rotation_frequency_hz: float = 20.0
+    upper_fov_deg: float = 10.0
+    lower_fov_deg: float = -30.0
+    relative_x: float = 0.0
+    relative_y: float = 0.0
+    relative_z: float = 2.4
 
 
 @dataclass(frozen=True)
@@ -74,16 +115,17 @@ class RoutePlannerSettings:
 @dataclass(frozen=True)
 class WaypointTrackerSettings:
     lookahead_base_m: float = 3.0
-    lookahead_gain_s: float = 0.20
-    search_backtrack_count: int = 6
-    search_forward_count: int = 90
+    lookahead_gain_s: float = 0.35
+    search_backtrack_count: int = 10
+    search_forward_count: int = 120
     completion_distance_m: float = 4.0
+    completion_index_window: int = 5
 
 
 @dataclass(frozen=True)
 class AutonomousControlSettings:
-    target_speed_mps: float = 5.0
-    turn_speed_mps: float = 2.8
+    target_speed_mps: float = 4.8
+    turn_speed_mps: float = 2.6
     wheel_base_m: float = 2.8
     max_steer: float = 1.0
     max_steer_angle_deg: float = 55.0
@@ -98,9 +140,32 @@ class AutonomousControlSettings:
 
 
 @dataclass(frozen=True)
+class DashboardSettings:
+    margin_px: int = 14
+    gap_px: int = 14
+    right_column_width: int = 420
+    bottom_panel_height: int = 220
+    panel_radius_px: int = 4
+    panel_border_width_px: int = 1
+    panel_padding_px: int = 10
+    title_font_size: int = 16
+    text_font_size: int = 15
+    small_font_size: int = 13
+    background_color: ColorRGB = (10, 12, 16)
+    panel_background_color: ColorRGB = (19, 22, 28)
+    panel_inner_color: ColorRGB = (13, 16, 21)
+    panel_border_color: ColorRGB = (82, 91, 108)
+    title_color: ColorRGB = (235, 238, 244)
+    text_color: ColorRGB = (224, 229, 237)
+    muted_text_color: ColorRGB = (154, 162, 176)
+    warning_color: ColorRGB = (255, 196, 87)
+    success_color: ColorRGB = (84, 222, 132)
+
+
+@dataclass(frozen=True)
 class TopDownMapSettings:
-    panel_width: int = 430
-    panel_height: int = 430
+    panel_width: int = 420
+    panel_height: int = 353
     margin_px: int = 14
     world_margin_m: float = 20.0
     min_zoom: float = 0.35
@@ -118,13 +183,33 @@ class TopDownMapSettings:
     muted_text_color: ColorRGB = (170, 174, 180)
 
 
+@dataclass(frozen=True)
+class LidarPanelSettings:
+    range_m: float = 50.0
+    max_points: int = 4500
+    point_radius_px: int = 1
+    ring_count: int = 4
+    background_color: ColorRGB = (8, 11, 15)
+    grid_color: ColorRGB = (45, 54, 68)
+    axis_color: ColorRGB = (85, 96, 115)
+    near_point_color: ColorRGB = (101, 235, 188)
+    far_point_color: ColorRGB = (75, 145, 255)
+    ego_color: ColorRGB = (255, 255, 255)
+
+
 CARLA = CarlaSettings()
 DISPLAY = DisplaySettings()
+SIMULATION = SimulationSettings()
 VEHICLE = VehicleSettings()
 CAMERA = CameraSettings()
+GNSS = GnssSettings()
+IMU = ImuSettings()
+LIDAR = LidarSettings()
 WAYPOINT = WaypointOverlaySettings()
 MANUAL_CONTROL = ManualControlSettings()
 ROUTE_PLANNER = RoutePlannerSettings()
 WAYPOINT_TRACKER = WaypointTrackerSettings()
 AUTONOMOUS_CONTROL = AutonomousControlSettings()
+DASHBOARD = DashboardSettings()
 TOPDOWN_MAP = TopDownMapSettings()
+LIDAR_PANEL = LidarPanelSettings()

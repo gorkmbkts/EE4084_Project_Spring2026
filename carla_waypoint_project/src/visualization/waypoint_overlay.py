@@ -68,6 +68,7 @@ def draw_waypoints_on_image(
     vehicle: "carla.Vehicle",
     target_waypoint: Optional["carla.Waypoint"] = None,
     intrinsics_cache: Optional[IntrinsicsCache] = None,
+    surface_offset: tuple[int, int] = (0, 0),
 ) -> None:
     """Draw projected waypoints on top of camera image."""
     _ = vehicle  # Vehicle kept in signature for future camera/pose-dependent extensions.
@@ -94,7 +95,12 @@ def draw_waypoints_on_image(
 
         u, v, _ = projected
         if 0 <= u < image_w and 0 <= v < image_h:
-            pygame.draw.circle(surface, WAYPOINT.full_path_color, (u, v), WAYPOINT.full_path_radius_px)
+            pygame.draw.circle(
+                surface,
+                WAYPOINT.full_path_color,
+                (u + surface_offset[0], v + surface_offset[1]),
+                WAYPOINT.full_path_radius_px,
+            )
 
     if target_waypoint is None:
         target_idx = min(WAYPOINT.target_index, len(waypoints) - 1)
@@ -107,7 +113,12 @@ def draw_waypoints_on_image(
 
     target_u, target_v, _ = target_pixel
     if 0 <= target_u < image_w and 0 <= target_v < image_h:
-        pygame.draw.circle(surface, WAYPOINT.target_color, (target_u, target_v), WAYPOINT.target_radius_px)
+        pygame.draw.circle(
+            surface,
+            WAYPOINT.target_color,
+            (target_u + surface_offset[0], target_v + surface_offset[1]),
+            WAYPOINT.target_radius_px,
+        )
 
 
 class WaypointOverlayRenderer:
@@ -123,6 +134,7 @@ class WaypointOverlayRenderer:
         camera: "carla.Sensor",
         vehicle: "carla.Vehicle",
         target_waypoint: Optional["carla.Waypoint"] = None,
+        surface_offset: tuple[int, int] = (0, 0),
     ) -> None:
         draw_waypoints_on_image(
             surface=surface,
@@ -131,4 +143,5 @@ class WaypointOverlayRenderer:
             vehicle=vehicle,
             target_waypoint=target_waypoint,
             intrinsics_cache=self._intrinsics_cache,
+            surface_offset=surface_offset,
         )
