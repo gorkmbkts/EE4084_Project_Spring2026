@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from collections import deque
 from enum import Enum
 from typing import Optional
 
 import pygame
 
+from config.settings import TOPDOWN_MAP
 from src.control.vehicle_controller import VehicleController
 from src.control.waypoint_tracker import TrackingStatus, WaypointTracker
 from src.core.carla_client import CarlaClientManager
 from src.core.simulation import SimulationClock
+from src.localization.gnss_projection import GnssDiagnostics, GnssLocalProjector
 from src.localization.state_estimator import EgoState, GroundTruthStateProvider
 from src.planning.map_selector import MapSelector
 from src.planning.route_planner import RoutePlanner
@@ -61,6 +64,7 @@ class SimulationApp:
         self._lidar_renderer = LidarPanelRenderer()
         self._sensor_panel_renderer = SensorPanelRenderer()
         self._state_provider: Optional[GroundTruthStateProvider] = None
+        self._gnss_projector: Optional[GnssLocalProjector] = None
         self._map_selector: Optional[MapSelector] = None
         self._topdown_renderer: Optional[TopDownMapRenderer] = None
         self.route_planner: Optional[RoutePlanner] = None
@@ -80,6 +84,9 @@ class SimulationApp:
             completed=False,
         )
         self._planner_status = ""
+        self._latest_gnss_diagnostics: Optional[GnssDiagnostics] = None
+        self._latest_gnss_frame: Optional[int] = None
+        self._gnss_trail_xy: deque[tuple[float, float]] = deque(maxlen=TOPDOWN_MAP.gnss_trail_length)
 
     def _setup(self) -> None:
         """Initialize CARLA world, vehicle, sensors, route tools, and visualization."""
@@ -105,6 +112,7 @@ class SimulationApp:
         self._waypoint_manager = WaypointManager(world_map=world_map)
         self._manual_controller = ManualController(vehicle=self._vehicle)
         self._state_provider = GroundTruthStateProvider(vehicle=self._vehicle)
+        self._gnss_projector = GnssLocalProjector(world_map=world_map)
         self._map_selector = MapSelector(world_map=world_map)
         self.route_planner = RoutePlanner(world_map=world_map)
         self._topdown_renderer = TopDownMapRenderer(world_map=world_map)
@@ -124,6 +132,7 @@ class SimulationApp:
             "waypoint manager": self._waypoint_manager,
             "manual controller": self._manual_controller,
             "state provider": self._state_provider,
+            "GNSS projector": self._gnss_projector,
             "map selector": self._map_selector,
             "route planner": self.route_planner,
             "top-down renderer": self._topdown_renderer,
@@ -158,6 +167,7 @@ class SimulationApp:
                 self._client_manager.tick()
                 self._latest_state = state_provider.get_state()
                 self._latest_tracking = self.waypoint_tracker.update(self._latest_state)
+                self._update_sensor_diagnostics()
 
                 if self._drive_mode == DriveMode.AUTONOMOUS:
                     control = self.autonomous_controller.compute_control(
@@ -354,6 +364,7 @@ class SimulationApp:
     def _draw_topdown_map(self) -> None:
         if self._topdown_renderer is None:
             return
+        self._update_sensor_diagnostics()
 
         route = self.route_planner.get_route() if self.route_planner is not None else []
         start = self._map_selector.start if self._map_selector is not None else None
@@ -378,6 +389,8 @@ class SimulationApp:
             route=route,
             target_waypoint=self._latest_tracking.target_waypoint,
             panel_rect=self._display.map_rect,
+            gnss_position_xy=self._latest_gnss_position_xy(),
+            gnss_trail_xy=tuple(self._gnss_trail_xy),
         )
 
     def _draw_lidar_panel(self) -> None:
@@ -406,6 +419,7 @@ class SimulationApp:
             ego_state=self._latest_state,
             tracking=self._latest_tracking,
             gnss=gnss,
+            gnss_diagnostics=self._latest_gnss_diagnostics,
             imu=imu,
             lidar=lidar,
         )
@@ -414,6 +428,26 @@ class SimulationApp:
             rect=self._display.sensor_panel_rect,
             data=data,
         )
+
+    def _update_sensor_diagnostics(self) -> None:
+        gnss = self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None
+        if self._gnss_projector is None:
+            self._latest_gnss_diagnostics = None
+            return
+
+        diagnostics = self._gnss_projector.diagnostics(gnss, self._latest_state)
+        self._latest_gnss_diagnostics = diagnostics
+        if gnss is None or diagnostics is None:
+            return
+        if self._latest_gnss_frame == gnss.frame:
+            return
+        self._latest_gnss_frame = gnss.frame
+        self._gnss_trail_xy.append((diagnostics.local_x, diagnostics.local_y))
+
+    def _latest_gnss_position_xy(self) -> Optional[tuple[float, float]]:
+        if self._latest_gnss_diagnostics is None:
+            return None
+        return self._latest_gnss_diagnostics.local_x, self._latest_gnss_diagnostics.local_y
 
     def shutdown(self) -> None:
         """Destroy actors and close pygame resources."""

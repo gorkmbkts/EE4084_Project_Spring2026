@@ -42,8 +42,22 @@ class ImuSensor:
     def spawn(self, attach_to: "carla.Actor") -> None:
         """Spawn the IMU sensor and start listening for measurements."""
         imu_bp = self._blueprint_library.find(IMU.blueprint_id)
-        if imu_bp.has_attribute("sensor_tick"):
-            imu_bp.set_attribute("sensor_tick", str(IMU.sensor_tick))
+        attributes = {
+            "sensor_tick": IMU.sensor_tick,
+            "noise_accel_stddev_x": IMU.noise_accel_stddev_x,
+            "noise_accel_stddev_y": IMU.noise_accel_stddev_y,
+            "noise_accel_stddev_z": IMU.noise_accel_stddev_z,
+            "noise_gyro_stddev_x": IMU.noise_gyro_stddev_x,
+            "noise_gyro_stddev_y": IMU.noise_gyro_stddev_y,
+            "noise_gyro_stddev_z": IMU.noise_gyro_stddev_z,
+            "noise_gyro_bias_x": IMU.noise_gyro_bias_x,
+            "noise_gyro_bias_y": IMU.noise_gyro_bias_y,
+            "noise_gyro_bias_z": IMU.noise_gyro_bias_z,
+            "noise_seed": IMU.noise_seed,
+        }
+        for name, value in attributes.items():
+            if imu_bp.has_attribute(name):
+                imu_bp.set_attribute(name, str(value))
 
         transform = carla.Transform(
             carla.Location(

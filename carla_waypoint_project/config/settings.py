@@ -20,7 +20,7 @@ class CarlaSettings:
 @dataclass(frozen=True)
 class DisplaySettings:
     width: int = 1742
-    height: int = 982
+    height: int = 1022
     fps: int = 30
     title: str = "CARLA Phase 1-3 Dashboard"
     clear_color: ColorRGB = (10, 12, 16)
@@ -58,6 +58,13 @@ class CameraSettings:
 class GnssSettings:
     blueprint_id: str = "sensor.other.gnss"
     sensor_tick: float = 0.05
+    noise_lat_stddev_deg: float = 0.000004
+    noise_lon_stddev_deg: float = 0.000004
+    noise_alt_stddev_m: float = 0.45
+    noise_lat_bias_deg: float = 0.0
+    noise_lon_bias_deg: float = 0.0
+    noise_alt_bias_m: float = 0.0
+    noise_seed: int = 4084
     relative_x: float = 0.0
     relative_y: float = 0.0
     relative_z: float = 2.2
@@ -67,6 +74,16 @@ class GnssSettings:
 class ImuSettings:
     blueprint_id: str = "sensor.other.imu"
     sensor_tick: float = 0.05
+    noise_accel_stddev_x: float = 0.08
+    noise_accel_stddev_y: float = 0.08
+    noise_accel_stddev_z: float = 0.10
+    noise_gyro_stddev_x: float = 0.004
+    noise_gyro_stddev_y: float = 0.004
+    noise_gyro_stddev_z: float = 0.006
+    noise_gyro_bias_x: float = 0.0005
+    noise_gyro_bias_y: float = -0.0005
+    noise_gyro_bias_z: float = 0.0008
+    noise_seed: int = 8408
     relative_x: float = 0.0
     relative_y: float = 0.0
     relative_z: float = 2.0
@@ -144,7 +161,7 @@ class DashboardSettings:
     margin_px: int = 14
     gap_px: int = 14
     right_column_width: int = 420
-    bottom_panel_height: int = 220
+    bottom_panel_height: int = 260
     panel_radius_px: int = 4
     panel_border_width_px: int = 1
     panel_padding_px: int = 10
@@ -179,6 +196,9 @@ class TopDownMapSettings:
     goal_color: ColorRGB = (50, 145, 255)
     vehicle_color: ColorRGB = (0, 230, 230)
     target_color: ColorRGB = (255, 64, 220)
+    gnss_color: ColorRGB = (255, 145, 64)
+    gnss_trail_color: ColorRGB = (255, 145, 64)
+    gnss_trail_length: int = 45
     text_color: ColorRGB = (235, 235, 235)
     muted_text_color: ColorRGB = (170, 174, 180)
 

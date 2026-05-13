@@ -155,6 +155,8 @@ class TopDownMapRenderer:
         route: Sequence["carla.Waypoint"],
         target_waypoint: Optional["carla.Waypoint"],
         panel_rect: Optional[pygame.Rect] = None,
+        gnss_position_xy: Optional[tuple[float, float]] = None,
+        gnss_trail_xy: Sequence[tuple[float, float]] = (),
     ) -> None:
         """Draw the complete top-down map panel."""
         rect = panel_rect if panel_rect is not None else self.get_panel_rect(surface)
@@ -172,6 +174,7 @@ class TopDownMapRenderer:
         self._draw_endpoint(surface, rect, start_waypoint, TOPDOWN_MAP.start_color, "A")
         self._draw_endpoint(surface, rect, goal_waypoint, TOPDOWN_MAP.goal_color, "B")
         self._draw_target(surface, rect, target_waypoint)
+        self._draw_gnss(surface, rect, gnss_position_xy, gnss_trail_xy)
         self._draw_vehicle(surface, rect, ego_state)
         self._draw_hud(surface, rect, hud, start_waypoint, goal_waypoint)
         surface.set_clip(old_clip)
@@ -276,6 +279,28 @@ class TopDownMapRenderer:
         location = waypoint.transform.location
         position = self._world_to_screen(rect, location.x, location.y)
         pygame.draw.circle(surface, TOPDOWN_MAP.target_color, position, 6, width=2)
+
+    def _draw_gnss(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        gnss_position_xy: Optional[tuple[float, float]],
+        gnss_trail_xy: Sequence[tuple[float, float]],
+    ) -> None:
+        trail_points = [
+            self._world_to_screen(rect, point[0], point[1])
+            for point in gnss_trail_xy
+        ]
+        if len(trail_points) >= 2:
+            pygame.draw.lines(surface, TOPDOWN_MAP.gnss_trail_color, False, trail_points, 1)
+
+        if gnss_position_xy is None:
+            return
+
+        position = self._world_to_screen(rect, gnss_position_xy[0], gnss_position_xy[1])
+        pygame.draw.circle(surface, TOPDOWN_MAP.gnss_color, position, 5, width=2)
+        pygame.draw.line(surface, TOPDOWN_MAP.gnss_color, (position[0] - 6, position[1]), (position[0] + 6, position[1]), 1)
+        pygame.draw.line(surface, TOPDOWN_MAP.gnss_color, (position[0], position[1] - 6), (position[0], position[1] + 6), 1)
 
     def _draw_vehicle(
         self,

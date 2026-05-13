@@ -42,8 +42,19 @@ class GnssSensor:
     def spawn(self, attach_to: "carla.Actor") -> None:
         """Spawn the GNSS sensor and start listening for measurements."""
         gnss_bp = self._blueprint_library.find(GNSS.blueprint_id)
-        if gnss_bp.has_attribute("sensor_tick"):
-            gnss_bp.set_attribute("sensor_tick", str(GNSS.sensor_tick))
+        attributes = {
+            "sensor_tick": GNSS.sensor_tick,
+            "noise_lat_stddev": GNSS.noise_lat_stddev_deg,
+            "noise_lon_stddev": GNSS.noise_lon_stddev_deg,
+            "noise_alt_stddev": GNSS.noise_alt_stddev_m,
+            "noise_lat_bias": GNSS.noise_lat_bias_deg,
+            "noise_lon_bias": GNSS.noise_lon_bias_deg,
+            "noise_alt_bias": GNSS.noise_alt_bias_m,
+            "noise_seed": GNSS.noise_seed,
+        }
+        for name, value in attributes.items():
+            if gnss_bp.has_attribute(name):
+                gnss_bp.set_attribute(name, str(value))
 
         transform = carla.Transform(
             carla.Location(
