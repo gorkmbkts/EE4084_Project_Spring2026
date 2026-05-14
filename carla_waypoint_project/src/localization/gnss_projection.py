@@ -1,18 +1,34 @@
-"""Helpers for comparing GNSS geodetic readings with CARLA local coordinates."""
+"""GNSS geodetic-to-local conversion and diagnostics."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from src.localization.state_estimator import EgoState
 from src.sensors.gnss_sensor import GnssMeasurement
 from src.utils.carla_import import ensure_carla_import
 
 carla = ensure_carla_import()
 
+if TYPE_CHECKING:
+    from src.localization.state_estimator import EgoState
+
 METERS_PER_DEGREE_LAT = 111_320.0
+
+
+@dataclass(frozen=True)
+class LocalGnssMeasurement:
+    """GNSS fix projected into the CARLA local map frame."""
+
+    x: float
+    y: float
+    z: float
+    latitude: float
+    longitude: float
+    altitude: float
+    frame: int
+    timestamp: float
 
 
 @dataclass(frozen=True)
@@ -44,6 +60,28 @@ class GnssLocalProjector:
             self._basis_x[0] * self._basis_y[1] - self._basis_y[0] * self._basis_x[1]
         )
 
+    def project(self, gnss: Optional[GnssMeasurement]) -> Optional[LocalGnssMeasurement]:
+        """Convert a raw GNSS reading to local map x/y/z coordinates."""
+        if gnss is None:
+            return None
+
+        local_xy = self.to_local_xy(gnss.latitude, gnss.longitude)
+        if local_xy is None:
+            return None
+
+        local_x, local_y = local_xy
+        local_z = float(gnss.altitude) - float(self._origin_geo.altitude)
+        return LocalGnssMeasurement(
+            x=float(local_x),
+            y=float(local_y),
+            z=float(local_z),
+            latitude=float(gnss.latitude),
+            longitude=float(gnss.longitude),
+            altitude=float(gnss.altitude),
+            frame=int(gnss.frame),
+            timestamp=float(gnss.timestamp),
+        )
+
     def to_local_xy(self, latitude: float, longitude: float) -> Optional[tuple[float, float]]:
         """Convert geodetic lat/lon to approximate CARLA local x/y meters."""
         if abs(self._determinant) < 1.0e-9:
@@ -63,19 +101,18 @@ class GnssLocalProjector:
         if gnss is None or state is None:
             return None
 
-        local_xy = self.to_local_xy(gnss.latitude, gnss.longitude)
-        if local_xy is None:
+        local = self.project(gnss)
+        if local is None:
             return None
 
-        local_x, local_y = local_xy
         gt_location = carla.Location(x=state.x, y=state.y, z=state.z)
         gt_geo = self._world_map.transform_to_geolocation(gt_location)
-        dx_m = local_x - state.x
-        dy_m = local_y - state.y
+        dx_m = local.x - state.x
+        dy_m = local.y - state.y
         dz_m = gnss.altitude - float(gt_geo.altitude)
         return GnssDiagnostics(
-            local_x=float(local_x),
-            local_y=float(local_y),
+            local_x=float(local.x),
+            local_y=float(local.y),
             dx_m=float(dx_m),
             dy_m=float(dy_m),
             dz_m=float(dz_m),

@@ -150,6 +150,7 @@ class TopDownMapRenderer:
         surface: pygame.Surface,
         hud: TopDownHudData,
         ego_state: Optional[EgoState],
+        estimated_state: Optional[EgoState],
         start_waypoint: Optional["carla.Waypoint"],
         goal_waypoint: Optional["carla.Waypoint"],
         route: Sequence["carla.Waypoint"],
@@ -175,7 +176,8 @@ class TopDownMapRenderer:
         self._draw_endpoint(surface, rect, goal_waypoint, TOPDOWN_MAP.goal_color, "B")
         self._draw_target(surface, rect, target_waypoint)
         self._draw_gnss(surface, rect, gnss_position_xy, gnss_trail_xy)
-        self._draw_vehicle(surface, rect, ego_state)
+        self._draw_vehicle(surface, rect, ego_state, TOPDOWN_MAP.vehicle_color, fill=True)
+        self._draw_vehicle(surface, rect, estimated_state, TOPDOWN_MAP.estimated_vehicle_color, fill=False)
         self._draw_hud(surface, rect, hud, start_waypoint, goal_waypoint)
         surface.set_clip(old_clip)
 
@@ -307,6 +309,8 @@ class TopDownMapRenderer:
         surface: pygame.Surface,
         rect: pygame.Rect,
         ego_state: Optional[EgoState],
+        color: tuple[int, int, int],
+        fill: bool,
     ) -> None:
         if ego_state is None:
             return
@@ -326,7 +330,7 @@ class TopDownMapRenderer:
             ),
         ]
         points = [self._world_to_screen(rect, x, y) for x, y in points_world]
-        pygame.draw.polygon(surface, TOPDOWN_MAP.vehicle_color, points)
+        pygame.draw.polygon(surface, color, points, width=0 if fill else 2)
 
     def _draw_hud(
         self,

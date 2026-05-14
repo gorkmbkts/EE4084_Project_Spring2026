@@ -1,4 +1,4 @@
-"""Ground-truth route-following vehicle controller."""
+"""Route-following vehicle controller for an abstract ego state."""
 
 from __future__ import annotations
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 import math
 from typing import List, Optional, Sequence
@@ -24,6 +25,9 @@ class TrackingStatus:
     distance_to_goal_m: float
     heading_error_deg: Optional[float]
     completed: bool
+    route_size: int = 0
+    search_start_index: int = 0
+    search_end_index: int = 0
 
 
 class WaypointTracker:
@@ -35,6 +39,8 @@ class WaypointTracker:
         lookahead_gain_s: float = WAYPOINT_TRACKER.lookahead_gain_s,
         search_backtrack_count: int = WAYPOINT_TRACKER.search_backtrack_count,
         search_forward_count: int = WAYPOINT_TRACKER.search_forward_count,
+        max_closest_index_advance_per_update: int = WAYPOINT_TRACKER.max_closest_index_advance_per_update,
+        max_target_index_ahead_of_closest: int = WAYPOINT_TRACKER.max_target_index_ahead_of_closest,
         completion_distance_m: float = WAYPOINT_TRACKER.completion_distance_m,
         completion_index_window: int = WAYPOINT_TRACKER.completion_index_window,
     ) -> None:
@@ -42,6 +48,8 @@ class WaypointTracker:
         self._lookahead_gain_s = lookahead_gain_s
         self._search_backtrack_count = search_backtrack_count
         self._search_forward_count = search_forward_count
+        self._max_closest_index_advance_per_update = max(1, int(max_closest_index_advance_per_update))
+        self._max_target_index_ahead_of_closest = max(1, int(max_target_index_ahead_of_closest))
         self._completion_distance_m = completion_distance_m
         self._completion_index_window = completion_index_window
         self._route: List["carla.Waypoint"] = []
@@ -49,9 +57,12 @@ class WaypointTracker:
         self._target_index = 0
         self._completed = False
         self._current_target: Optional["carla.Waypoint"] = None
+        self._route_distances_m: List[float] = []
         self._cross_track_error_m = float("inf")
         self._distance_to_goal_m = float("inf")
         self._heading_error_deg: Optional[float] = None
+        self._search_start_index = 0
+        self._search_end_index = 0
 
     @property
     def closest_index(self) -> int:
@@ -68,6 +79,7 @@ class WaypointTracker:
     def set_route(self, route: Sequence["carla.Waypoint"]) -> None:
         """Set a new global route and reset tracking progress."""
         self._route = list(route)
+        self._route_distances_m = self._compute_route_distances(self._route)
         self._closest_index = 0
         self._target_index = 0
         self._completed = False
@@ -75,6 +87,9 @@ class WaypointTracker:
         self._cross_track_error_m = float("inf")
         self._distance_to_goal_m = float("inf")
         self._heading_error_deg = None
+        self._search_start_index = 0
+        initial_window_end = min(len(self._route), self._search_forward_count + 1)
+        self._search_end_index = max(0, initial_window_end - 1)
 
     def clear_route(self) -> None:
         """Clear route and tracking state."""
@@ -92,7 +107,7 @@ class WaypointTracker:
 
         self._closest_index, self._cross_track_error_m = self._find_closest_index(state)
         candidate_target_index = self._find_target_index(state)
-        self._target_index = max(self._target_index, candidate_target_index)
+        self._target_index = self._bounded_target_index(candidate_target_index)
         self._current_target = self._route[self._target_index]
         self._distance_to_goal_m = self._compute_distance_to_goal(state)
         self._heading_error_deg = self._compute_heading_error(state, self._current_target)
@@ -118,17 +133,12 @@ class WaypointTracker:
         return self._route[self._closest_index:end_index]
 
     def _find_closest_index(self, state: EgoState) -> tuple[int, float]:
-        if self._closest_index == 0:
-            search_start = 0
-        else:
-            search_start = max(0, self._closest_index - self._search_backtrack_count)
-        search_end = min(len(self._route), self._closest_index + self._search_forward_count)
-        if search_start >= search_end:
-            search_start = 0
-            search_end = len(self._route)
-
         best_index = self._closest_index
         best_distance = float("inf")
+        search_start, search_end = self._search_window()
+        self._search_start_index = search_start
+        self._search_end_index = max(search_start, search_end - 1)
+
         for index in range(search_start, search_end):
             location = self._route[index].transform.location
             distance = math.hypot(location.x - state.x, location.y - state.y)
@@ -136,7 +146,19 @@ class WaypointTracker:
                 best_distance = distance
                 best_index = index
 
-        return best_index, best_distance
+        # Route progress is monotonic. A nearby future road can move progress
+        # forward only if it lies inside the bounded search window; a later
+        # localization correction cannot move progress backward.
+        max_progress_index = min(
+            len(self._route) - 1,
+            self._closest_index + self._max_closest_index_advance_per_update,
+        )
+        progress_index = min(max(self._closest_index, best_index), max_progress_index)
+        if progress_index != best_index:
+            location = self._route[progress_index].transform.location
+            best_distance = math.hypot(location.x - state.x, location.y - state.y)
+
+        return progress_index, best_distance
 
     def _find_target_index(self, state: EgoState) -> int:
         lookahead_m = max(
@@ -144,14 +166,38 @@ class WaypointTracker:
             self._lookahead_base_m + self._lookahead_gain_s * state.speed,
         )
 
-        accumulated = 0.0
-        index = self._closest_index
-        while index < len(self._route) - 1 and accumulated < lookahead_m:
-            current = self._route[index].transform.location
-            following = self._route[index + 1].transform.location
-            accumulated += current.distance(following)
-            index += 1
-        return index
+        if not self._route_distances_m:
+            return 0
+
+        start_index = min(self._closest_index, len(self._route_distances_m) - 1)
+        target_distance_m = self._route_distances_m[start_index] + lookahead_m
+        target_index = bisect_left(self._route_distances_m, target_distance_m, lo=start_index)
+        return min(target_index, len(self._route) - 1)
+
+    def _bounded_target_index(self, candidate_target_index: int) -> int:
+        if not self._route:
+            return 0
+
+        if self._closest_index >= len(self._route) - 1:
+            return len(self._route) - 1
+
+        first_forward_index = self._closest_index + 1
+        farthest_allowed_index = min(
+            len(self._route) - 1,
+            self._closest_index + self._max_target_index_ahead_of_closest,
+        )
+        target_index = max(first_forward_index, int(candidate_target_index))
+        return min(target_index, farthest_allowed_index)
+
+    def _search_window(self) -> tuple[int, int]:
+        if not self._route:
+            return 0, 0
+
+        search_start = max(0, self._closest_index - self._search_backtrack_count)
+        search_end = min(len(self._route), self._closest_index + self._search_forward_count + 1)
+        if search_end <= search_start:
+            search_end = min(len(self._route), search_start + 1)
+        return search_start, search_end
 
     def _compute_distance_to_goal(self, state: EgoState) -> float:
         goal_location = self._route[-1].transform.location
@@ -189,6 +235,14 @@ class WaypointTracker:
             angle_deg += 360.0
         return angle_deg
 
+    @staticmethod
+    def _compute_route_distances(route: Sequence["carla.Waypoint"]) -> List[float]:
+        distances = [0.0]
+        for previous, current in zip(route, route[1:]):
+            step = previous.transform.location.distance(current.transform.location)
+            distances.append(distances[-1] + float(step))
+        return distances if route else []
+
     def _status(self) -> TrackingStatus:
         return TrackingStatus(
             target_waypoint=self._current_target,
@@ -198,4 +252,7 @@ class WaypointTracker:
             distance_to_goal_m=self._distance_to_goal_m,
             heading_error_deg=self._heading_error_deg,
             completed=self._completed,
+            route_size=len(self._route),
+            search_start_index=self._search_start_index,
+            search_end_index=self._search_end_index,
         )

@@ -1,4 +1,4 @@
-"""Text diagnostics panel for live simulation and sensor data."""
+"""Text diagnostics panel for live simulation, localization, and sensors."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pygame
 from config.settings import DASHBOARD, GNSS, IMU
 from src.control.waypoint_tracker import TrackingStatus
 from src.localization.gnss_projection import GnssDiagnostics
-from src.localization.state_estimator import EgoState
+from src.localization.state_estimator import EgoState, LocalizationStatus
 from src.sensors.gnss_sensor import GnssMeasurement
 from src.sensors.imu_sensor import ImuMeasurement
 from src.sensors.lidar_sensor import LidarMeasurement
@@ -29,6 +29,17 @@ class SensorPanelData:
     planner_status: str
     route_size: int
     ego_state: Optional[EgoState]
+    ground_truth_state: Optional[EgoState]
+    estimated_state: Optional[EgoState]
+    localization_status: Optional[LocalizationStatus]
+    route_activation_state: str
+    stabilization_active: bool
+    stabilization_error_m: Optional[float]
+    stabilization_stable_ticks: int
+    stabilization_required_ticks: int
+    stabilization_elapsed_seconds: float
+    stabilization_timeout_seconds: float
+    route_generation_blocked: bool
     tracking: TrackingStatus
     gnss: Optional[GnssMeasurement]
     gnss_diagnostics: Optional[GnssDiagnostics]
@@ -64,9 +75,9 @@ class SensorPanelRenderer:
             for index in range(4)
         ]
 
-        self._draw_section(surface, columns[0], "Simulation / State", self._simulation_rows(data))
-        self._draw_section(surface, columns[1], "GNSS Raw / Error", self._gnss_rows(data.gnss, data.gnss_diagnostics))
-        self._draw_section(surface, columns[2], "IMU Raw / Error", self._imu_rows(data.imu, data.ego_state))
+        self._draw_section(surface, columns[0], "Simulation / GT", self._simulation_rows(data))
+        self._draw_section(surface, columns[1], "KF Estimate", self._estimate_rows(data))
+        self._draw_section(surface, columns[2], "GNSS / IMU", self._gnss_imu_rows(data))
         self._draw_section(surface, columns[3], "LiDAR / Route", self._lidar_route_rows(data))
 
     def _draw_section(
@@ -87,93 +98,113 @@ class SensorPanelRenderer:
                 break
 
     def _simulation_rows(self, data: SensorPanelData) -> list[tuple[str, tuple[int, int, int]]]:
-        state = data.ego_state
+        gt = data.ground_truth_state
+        control_source = "Estimate" if data.drive_mode == "AUTO" else "Ground truth"
         rows = [
             (f"Mode: {data.drive_mode}", DASHBOARD.text_color),
+            (f"Control state: {control_source}", DASHBOARD.text_color),
             (f"Map select: {'ON' if data.map_selection_active else 'OFF'}", DASHBOARD.text_color),
-            (data.sync_status[:46], DASHBOARD.success_color if "ON" in data.sync_status else DASHBOARD.warning_color),
-            (f"Sim dt: {data.fixed_delta_seconds:.3f} s", DASHBOARD.text_color),
-            (f"Pygame dt: {data.pygame_frame_dt_seconds:.3f} s", DASHBOARD.muted_text_color),
+            (data.sync_status[:44], DASHBOARD.success_color if "ON" in data.sync_status else DASHBOARD.warning_color),
+            (f"Sim/Pygame dt: {data.fixed_delta_seconds:.3f}/{data.pygame_frame_dt_seconds:.3f}", DASHBOARD.text_color),
         ]
-        if state is None:
+        if gt is None:
             rows.append(("GT pose: waiting", DASHBOARD.warning_color))
             return rows
 
         rows.extend(
             [
-                (f"GT x/y/z: {state.x:7.2f} {state.y:7.2f} {state.z:5.2f}", DASHBOARD.text_color),
-                (f"GT yaw: {state.yaw:7.2f} deg", DASHBOARD.text_color),
-                (f"Speed: {state.speed:5.2f} m/s ({state.speed * 3.6:5.1f} km/h)", DASHBOARD.text_color),
+                (f"GT x/y/z: {gt.x:7.2f} {gt.y:7.2f} {gt.z:5.2f}", DASHBOARD.text_color),
+                (f"GT yaw: {gt.yaw:7.2f} deg", DASHBOARD.text_color),
+                (f"GT speed: {gt.speed:5.2f} m/s", DASHBOARD.text_color),
             ]
         )
+        if data.ego_state is None:
+            rows.append(("Route state: waiting", DASHBOARD.warning_color))
+        else:
+            rows.append((f"Route state t: {data.ego_state.timestamp:7.2f}", DASHBOARD.muted_text_color))
         return rows
 
-    def _gnss_rows(
-        self,
-        gnss: Optional[GnssMeasurement],
-        diagnostics: Optional[GnssDiagnostics],
-    ) -> list[tuple[str, tuple[int, int, int]]]:
-        if gnss is None:
-            return [("Waiting for GNSS frame", DASHBOARD.warning_color)]
+    def _estimate_rows(self, data: SensorPanelData) -> list[tuple[str, tuple[int, int, int]]]:
+        status = data.localization_status
+        estimate = data.estimated_state
+        if status is None:
+            return [("Estimator: waiting", DASHBOARD.warning_color)]
+
         rows = [
-            (f"Lat: {gnss.latitude:.8f}", DASHBOARD.text_color),
-            (f"Lon: {gnss.longitude:.8f}", DASHBOARD.text_color),
-            (f"Alt: {gnss.altitude:.3f} m", DASHBOARD.text_color),
+            (f"Filter: {status.filter_name}", DASHBOARD.text_color),
+            (
+                f"Initialized: {'YES' if status.initialized else 'NO'}",
+                DASHBOARD.success_color if status.initialized else DASHBOARD.warning_color,
+            ),
         ]
-        if diagnostics is None:
-            rows.append(("Local/error: waiting", DASHBOARD.warning_color))
+
+        if estimate is None:
+            rows.append(("Est pose: waiting for GNSS", DASHBOARD.warning_color))
         else:
             rows.extend(
                 [
-                    (f"Local x/y: {diagnostics.local_x:7.2f} {diagnostics.local_y:7.2f}", DASHBOARD.text_color),
-                    (f"Err dx/dy: {diagnostics.dx_m:+5.2f} {diagnostics.dy_m:+5.2f} m", DASHBOARD.warning_color),
-                    (f"Err horiz/z: {diagnostics.horizontal_error_m:5.2f} {diagnostics.dz_m:+5.2f} m", DASHBOARD.warning_color),
+                    (f"Est x/y: {estimate.x:7.2f} {estimate.y:7.2f}", DASHBOARD.text_color),
+                    (f"Est yaw: {estimate.yaw:7.2f} deg", DASHBOARD.text_color),
+                    (f"Est speed: {estimate.speed:5.2f} m/s", DASHBOARD.text_color),
                 ]
             )
 
+        if status.gnss_local is None:
+            rows.append(("GNSS local: waiting", DASHBOARD.warning_color))
+        else:
+            rows.append((f"GNSS x/y: {status.gnss_local.x:7.2f} {status.gnss_local.y:7.2f}", DASHBOARD.text_color))
+
         rows.extend(
             [
-                (f"Noise lat/lon: {GNSS.noise_lat_stddev_deg:.1e} {GNSS.noise_lon_stddev_deg:.1e} deg", DASHBOARD.muted_text_color),
-                (f"Noise alt: {GNSS.noise_alt_stddev_m:.2f} m", DASHBOARD.muted_text_color),
-                (f"Bias lat/lon/alt: {GNSS.noise_lat_bias_deg:.1e} {GNSS.noise_lon_bias_deg:.1e} {GNSS.noise_alt_bias_m:.2f}", DASHBOARD.muted_text_color),
-                (f"Frame: {gnss.frame}", DASHBOARD.muted_text_color),
+                (f"Pos err GT: {self._format_optional_float(status.position_error_m, 'm')}", DASHBOARD.warning_color),
+                (f"GNSS frame: {self._format_optional_int(status.last_gnss_frame)}", DASHBOARD.muted_text_color),
+                (f"IMU frame:  {self._format_optional_int(status.last_imu_frame)}", DASHBOARD.muted_text_color),
             ]
         )
         return rows
 
-    def _imu_rows(
-        self,
-        imu: Optional[ImuMeasurement],
-        state: Optional[EgoState],
-    ) -> list[tuple[str, tuple[int, int, int]]]:
+    def _gnss_imu_rows(self, data: SensorPanelData) -> list[tuple[str, tuple[int, int, int]]]:
+        rows: list[tuple[str, tuple[int, int, int]]] = []
+        gnss = data.gnss
+        diagnostics = data.gnss_diagnostics
+        if gnss is None:
+            rows.append(("GNSS: waiting", DASHBOARD.warning_color))
+        else:
+            rows.extend(
+                [
+                    (f"Lat: {gnss.latitude:.8f}", DASHBOARD.text_color),
+                    (f"Lon: {gnss.longitude:.8f}", DASHBOARD.text_color),
+                    (f"Alt: {gnss.altitude:.2f} m", DASHBOARD.text_color),
+                ]
+            )
+            if diagnostics is not None:
+                rows.extend(
+                    [
+                        (f"GNSS dx/dy: {diagnostics.dx_m:+5.2f} {diagnostics.dy_m:+5.2f}", DASHBOARD.warning_color),
+                        (f"GNSS horiz: {diagnostics.horizontal_error_m:5.2f} m", DASHBOARD.warning_color),
+                    ]
+                )
+            rows.append((f"Noise ll: {GNSS.noise_lat_stddev_deg:.1e}/{GNSS.noise_lon_stddev_deg:.1e}", DASHBOARD.muted_text_color))
+
+        imu = data.imu
         if imu is None:
-            return [("Waiting for IMU frame", DASHBOARD.warning_color)]
+            rows.append(("IMU: waiting", DASHBOARD.warning_color))
+            return rows
 
         ax, ay, az = imu.accelerometer
         gx, gy, gz = imu.gyroscope
-        gt_compass = self._gt_compass_deg(state)
+        gt_compass = self._gt_compass_deg(data.ground_truth_state)
         compass_deg = math.degrees(imu.compass)
         compass_error = self._angle_error_deg(compass_deg, gt_compass) if gt_compass is not None else None
-        rows = [
-            (f"Acc:  {ax:+6.2f} {ay:+6.2f} {az:+6.2f}", DASHBOARD.text_color),
-            (f"Gyro: {gx:+6.3f} {gy:+6.3f} {gz:+6.3f}", DASHBOARD.text_color),
-            (f"Compass raw: {compass_deg:7.2f} deg", DASHBOARD.text_color),
-            (f"GT compass: {self._format_optional_float(gt_compass, 'deg')}", DASHBOARD.text_color),
-            (f"Compass err: {self._format_optional_float(compass_error, 'deg')}", DASHBOARD.warning_color),
-            (
-                f"Acc noise: {IMU.noise_accel_stddev_x:.2f}/{IMU.noise_accel_stddev_y:.2f}/{IMU.noise_accel_stddev_z:.2f}",
-                DASHBOARD.muted_text_color,
-            ),
-            (
-                f"Gyro noise: {IMU.noise_gyro_stddev_x:.3f}/{IMU.noise_gyro_stddev_y:.3f}/{IMU.noise_gyro_stddev_z:.3f}",
-                DASHBOARD.muted_text_color,
-            ),
-            (
-                f"Gyro bias: {IMU.noise_gyro_bias_x:+.4f}/{IMU.noise_gyro_bias_y:+.4f}/{IMU.noise_gyro_bias_z:+.4f}",
-                DASHBOARD.muted_text_color,
-            ),
-            (f"IMU frame: {imu.frame}", DASHBOARD.muted_text_color),
-        ]
+        rows.extend(
+            [
+                (f"Acc:  {ax:+6.2f} {ay:+6.2f} {az:+6.2f}", DASHBOARD.text_color),
+                (f"Gyro: {gx:+6.3f} {gy:+6.3f} {gz:+6.3f}", DASHBOARD.text_color),
+                (f"Compass: {compass_deg:7.2f} deg", DASHBOARD.text_color),
+                (f"Comp err: {self._format_optional_float(compass_error, 'deg')}", DASHBOARD.warning_color),
+                (f"Acc noise: {IMU.noise_accel_stddev_x:.2f}/{IMU.noise_accel_stddev_y:.2f}", DASHBOARD.muted_text_color),
+            ]
+        )
         return rows
 
     def _lidar_route_rows(self, data: SensorPanelData) -> list[tuple[str, tuple[int, int, int]]]:
@@ -195,9 +226,27 @@ class SensorPanelRenderer:
         rows.extend(
             [
                 (f"Route: {data.route_size} wp", DASHBOARD.text_color),
+                (f"Init: {data.route_activation_state[:22]}", DASHBOARD.text_color),
+                (
+                    f"Route blocked: {'YES' if data.route_generation_blocked else 'NO'}",
+                    DASHBOARD.warning_color if data.route_generation_blocked else DASHBOARD.success_color,
+                ),
+                (
+                    f"Stable ticks: {data.stabilization_stable_ticks}/{data.stabilization_required_ticks}",
+                    DASHBOARD.warning_color if data.stabilization_active else DASHBOARD.muted_text_color,
+                ),
+                (
+                    f"Init err: {self._format_optional_float(data.stabilization_error_m, 'm')}",
+                    DASHBOARD.warning_color if data.stabilization_active else DASHBOARD.muted_text_color,
+                ),
+                (
+                    f"Init t: {data.stabilization_elapsed_seconds:.1f}/{data.stabilization_timeout_seconds:.1f}s",
+                    DASHBOARD.warning_color if data.stabilization_active else DASHBOARD.muted_text_color,
+                ),
                 (f"Done: {'YES' if tracking.completed else 'NO'}", DASHBOARD.success_color if tracking.completed else DASHBOARD.text_color),
                 (f"Closest: {tracking.closest_index}", DASHBOARD.text_color),
                 (f"Target:  {tracking.target_index}", DASHBOARD.text_color),
+                (f"Search:  {tracking.search_start_index}-{tracking.search_end_index}", DASHBOARD.muted_text_color),
                 (f"CTE: {self._format_float(tracking.cross_track_error_m, 'm')}", DASHBOARD.text_color),
                 (f"Goal dist: {self._format_float(tracking.distance_to_goal_m, 'm')}", DASHBOARD.text_color),
                 (f"Heading err: {heading}", DASHBOARD.text_color),
@@ -234,3 +283,9 @@ class SensorPanelRenderer:
         if value is None or not math.isfinite(value):
             return "n/a"
         return f"{value:.2f} {suffix}"
+
+    @staticmethod
+    def _format_optional_int(value: Optional[int]) -> str:
+        if value is None:
+            return "n/a"
+        return str(value)

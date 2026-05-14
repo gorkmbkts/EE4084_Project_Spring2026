@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import heapq
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from config.settings import ROUTE_PLANNER
@@ -66,7 +67,7 @@ class RoutePlanner:
         if not route:
             route = self._generate_with_fallback_graph(start, goal)
 
-        self._route = self._deduplicate_route(route)
+        self._route = self._densify_route(self._deduplicate_route(route))
         return self.get_route()
 
     def clear_route(self) -> None:
@@ -274,6 +275,37 @@ class RoutePlanner:
             total += first.transform.location.distance(second.transform.location)
         return total
 
+    def _densify_route(self, route: Sequence["carla.Waypoint"]) -> List["carla.Waypoint"]:
+        if len(route) < 2:
+            return list(route)
+
+        dense_route: List["carla.Waypoint"] = [route[0]]
+        max_step_m = max(0.5, self._sampling_resolution_m * 1.25)
+        for next_trace_wp in route[1:]:
+            current_wp = dense_route[-1]
+            distance_to_next = current_wp.transform.location.distance(next_trace_wp.transform.location)
+            if distance_to_next <= max_step_m:
+                dense_route.append(next_trace_wp)
+                continue
+
+            max_steps = max(1, int(math.ceil(distance_to_next / self._sampling_resolution_m)) + 20)
+            for _ in range(max_steps):
+                current_location = current_wp.transform.location
+                if current_location.distance(next_trace_wp.transform.location) <= max_step_m:
+                    break
+
+                next_candidates = current_wp.next(self._sampling_resolution_m)
+                if not next_candidates:
+                    break
+
+                current_wp = self._choose_next_waypoint_toward(next_candidates, next_trace_wp)
+                dense_route.append(current_wp)
+
+            if dense_route[-1].transform.location.distance(next_trace_wp.transform.location) > 0.2:
+                dense_route.append(next_trace_wp)
+
+        return self._deduplicate_route(dense_route)
+
     @staticmethod
     def _deduplicate_route(route: Sequence["carla.Waypoint"]) -> List["carla.Waypoint"]:
         deduped: List["carla.Waypoint"] = []
@@ -282,3 +314,20 @@ class RoutePlanner:
                 continue
             deduped.append(waypoint)
         return deduped
+
+    @staticmethod
+    def _choose_next_waypoint_toward(
+        candidates: Sequence["carla.Waypoint"],
+        target: "carla.Waypoint",
+    ) -> "carla.Waypoint":
+        def score(candidate: "carla.Waypoint") -> float:
+            distance = candidate.transform.location.distance(target.transform.location)
+            if (
+                candidate.road_id == target.road_id
+                and candidate.section_id == target.section_id
+                and candidate.lane_id == target.lane_id
+            ):
+                distance *= 0.5
+            return float(distance)
+
+        return min(candidates, key=score)

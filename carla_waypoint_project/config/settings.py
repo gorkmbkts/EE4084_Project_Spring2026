@@ -22,7 +22,7 @@ class DisplaySettings:
     width: int = 1742
     height: int = 1022
     fps: int = 30
-    title: str = "CARLA Phase 1-3 Dashboard"
+    title: str = "CARLA KF Localization Dashboard"
     clear_color: ColorRGB = (10, 12, 16)
 
 
@@ -58,7 +58,7 @@ class CameraSettings:
 class GnssSettings:
     blueprint_id: str = "sensor.other.gnss"
     sensor_tick: float = 0.05
-    noise_lat_stddev_deg: float = 0.000004
+    noise_lat_stddev_deg: float = 0.000004 #TODO: 0.000004 normalde ama too good to be true
     noise_lon_stddev_deg: float = 0.000004
     noise_alt_stddev_m: float = 0.45
     noise_lat_bias_deg: float = 0.0
@@ -133,16 +133,28 @@ class RoutePlannerSettings:
 class WaypointTrackerSettings:
     lookahead_base_m: float = 3.0
     lookahead_gain_s: float = 0.35
-    search_backtrack_count: int = 10
-    search_forward_count: int = 120
+    search_backtrack_count: int = 4
+    search_forward_count: int = 12
+    max_closest_index_advance_per_update: int = 3
+    max_target_index_ahead_of_closest: int = 6
     completion_distance_m: float = 4.0
     completion_index_window: int = 5
 
 
 @dataclass(frozen=True)
+class RouteInitializationSettings:
+    position_error_threshold_m: float = 2.5
+    timeout_position_error_threshold_m: float = 6.0
+    estimated_speed_threshold_mps: float = 0.8
+    stable_ticks_required: int = 8
+    max_wait_seconds: float = 20.0
+    hold_brake: float = 1.0
+
+
+@dataclass(frozen=True)
 class AutonomousControlSettings:
     target_speed_mps: float = 4.8
-    turn_speed_mps: float = 2.6
+    turn_speed_mps: float = 2.6 #TODO: tune this better 2.6->0.6
     wheel_base_m: float = 2.8
     max_steer: float = 1.0
     max_steer_angle_deg: float = 55.0
@@ -154,6 +166,20 @@ class AutonomousControlSettings:
     speed_kp: float = 0.25
     brake_kp: float = 0.35
     stop_distance_m: float = 3.0
+
+
+@dataclass(frozen=True)
+class LocalizationSettings:
+    estimator_name: str = "KF-CA" #TODO: !!!!!!!!!!! we will tune this later, maybe even compare multiple estimators
+    min_prediction_dt_s: float = 1.0e-4
+    max_prediction_dt_s: float = 0.20
+    process_jerk_stddev_mps3: float = 1.20
+    gnss_position_stddev_m: float = 1.25
+    imu_accel_stddev_mps2: float = 0.45
+    initial_position_stddev_m: float = 4.0
+    initial_velocity_stddev_mps: float = 3.0
+    initial_accel_stddev_mps2: float = 1.5
+    yaw_from_velocity_min_speed_mps: float = 0.35
 
 
 @dataclass(frozen=True)
@@ -195,6 +221,7 @@ class TopDownMapSettings:
     start_color: ColorRGB = (0, 220, 95)
     goal_color: ColorRGB = (50, 145, 255)
     vehicle_color: ColorRGB = (0, 230, 230)
+    estimated_vehicle_color: ColorRGB = (84, 222, 132)
     target_color: ColorRGB = (255, 64, 220)
     gnss_color: ColorRGB = (255, 145, 64)
     gnss_trail_color: ColorRGB = (255, 145, 64)
@@ -229,7 +256,9 @@ WAYPOINT = WaypointOverlaySettings()
 MANUAL_CONTROL = ManualControlSettings()
 ROUTE_PLANNER = RoutePlannerSettings()
 WAYPOINT_TRACKER = WaypointTrackerSettings()
+ROUTE_INITIALIZATION = RouteInitializationSettings()
 AUTONOMOUS_CONTROL = AutonomousControlSettings()
+LOCALIZATION = LocalizationSettings()
 DASHBOARD = DashboardSettings()
 TOPDOWN_MAP = TopDownMapSettings()
 LIDAR_PANEL = LidarPanelSettings()

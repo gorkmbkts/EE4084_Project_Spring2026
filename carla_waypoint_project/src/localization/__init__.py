@@ -1,6 +1,24 @@
 """Localization interfaces and providers."""
 
-from .kalman_filter import KalmanFilter
-from .state_estimator import EgoState, EgoStateProvider, GroundTruthStateProvider
+from .kalman_filter import ConstantAccelerationKalmanFilter, KalmanFilter
+from .state_estimator import (
+    EgoState,
+    EgoStateProvider,
+    EstimatedStateProvider,
+    GroundTruthStateProvider,
+    KalmanStateEstimator,
+    LocalizationStatus,
+    StateEstimator,
+)
 
-__all__ = ["KalmanFilter", "EgoState", "EgoStateProvider", "GroundTruthStateProvider"]
+__all__ = [
+    "ConstantAccelerationKalmanFilter",
+    "KalmanFilter",
+    "EgoState",
+    "EgoStateProvider",
+    "EstimatedStateProvider",
+    "GroundTruthStateProvider",
+    "KalmanStateEstimator",
+    "LocalizationStatus",
+    "StateEstimator",
+]

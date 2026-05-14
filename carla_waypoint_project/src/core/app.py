@@ -4,17 +4,24 @@ from __future__ import annotations
 
 from collections import deque
 from enum import Enum
+import time
 from typing import Optional
 
 import pygame
 
-from config.settings import TOPDOWN_MAP
+from config.settings import ROUTE_INITIALIZATION, TOPDOWN_MAP
 from src.control.vehicle_controller import VehicleController
 from src.control.waypoint_tracker import TrackingStatus, WaypointTracker
 from src.core.carla_client import CarlaClientManager
 from src.core.simulation import SimulationClock
 from src.localization.gnss_projection import GnssDiagnostics, GnssLocalProjector
-from src.localization.state_estimator import EgoState, GroundTruthStateProvider
+from src.localization.state_estimator import (
+    EgoState,
+    EstimatedStateProvider,
+    GroundTruthStateProvider,
+    KalmanStateEstimator,
+    LocalizationStatus,
+)
 from src.planning.map_selector import MapSelector
 from src.planning.route_planner import RoutePlanner
 from src.planning.waypoint_manager import WaypointManager
@@ -42,6 +49,14 @@ class DriveMode(Enum):
     AUTONOMOUS = "AUTO"
 
 
+class RouteActivationState(Enum):
+    """Lifecycle state for route creation after A/B selection."""
+
+    IDLE = "IDLE"
+    WAITING_FOR_LOCALIZATION_STABILITY = "WAITING_FOR_LOCALIZATION_STABILITY"
+    ROUTE_ACTIVE = "ROUTE_ACTIVE"
+
+
 class SimulationApp:
     """Coordinate CARLA, sensors, display, route selection, and control."""
 
@@ -63,7 +78,8 @@ class SimulationApp:
         self._overlay_renderer = WaypointOverlayRenderer()
         self._lidar_renderer = LidarPanelRenderer()
         self._sensor_panel_renderer = SensorPanelRenderer()
-        self._state_provider: Optional[GroundTruthStateProvider] = None
+        self._ground_truth_provider: Optional[GroundTruthStateProvider] = None
+        self._estimated_state_provider: Optional[EstimatedStateProvider] = None
         self._gnss_projector: Optional[GnssLocalProjector] = None
         self._map_selector: Optional[MapSelector] = None
         self._topdown_renderer: Optional[TopDownMapRenderer] = None
@@ -74,19 +90,24 @@ class SimulationApp:
         self._drive_mode = DriveMode.MANUAL
         self._map_selection_active = False
         self._latest_state: Optional[EgoState] = None
-        self._latest_tracking = TrackingStatus(
-            target_waypoint=None,
-            closest_index=0,
-            target_index=0,
-            cross_track_error_m=float("inf"),
-            distance_to_goal_m=float("inf"),
-            heading_error_deg=None,
-            completed=False,
-        )
+        self._latest_ground_truth_state: Optional[EgoState] = None
+        self._latest_estimated_state: Optional[EgoState] = None
+        self._latest_localization_status: Optional[LocalizationStatus] = None
+        self._latest_tracking = self._empty_tracking_status()
         self._planner_status = ""
         self._latest_gnss_diagnostics: Optional[GnssDiagnostics] = None
         self._latest_gnss_frame: Optional[int] = None
         self._gnss_trail_xy: deque[tuple[float, float]] = deque(maxlen=TOPDOWN_MAP.gnss_trail_length)
+        self._route_activation_state = RouteActivationState.IDLE
+        self._pending_start_waypoint: Optional["carla.Waypoint"] = None
+        self._pending_goal_waypoint: Optional["carla.Waypoint"] = None
+        self._pending_start_autonomous = False
+        self._stabilization_started_monotonic: Optional[float] = None
+        self._stabilization_elapsed_seconds = 0.0
+        self._stabilization_stable_ticks = 0
+        self._stabilization_error_m: Optional[float] = None
+        self._stabilization_timed_out = False
+        self._route_generation_blocked = False
 
     def _setup(self) -> None:
         """Initialize CARLA world, vehicle, sensors, route tools, and visualization."""
@@ -111,8 +132,13 @@ class SimulationApp:
         world_map = self._client_manager.world_map
         self._waypoint_manager = WaypointManager(world_map=world_map)
         self._manual_controller = ManualController(vehicle=self._vehicle)
-        self._state_provider = GroundTruthStateProvider(vehicle=self._vehicle)
+        self._ground_truth_provider = GroundTruthStateProvider(vehicle=self._vehicle)
         self._gnss_projector = GnssLocalProjector(world_map=world_map)
+        self._estimated_state_provider = EstimatedStateProvider(
+            estimator=KalmanStateEstimator(gnss_projector=self._gnss_projector),
+            gnss_sensor=self._gnss_sensor,
+            imu_sensor=self._imu_sensor,
+        )
         self._map_selector = MapSelector(world_map=world_map)
         self.route_planner = RoutePlanner(world_map=world_map)
         self._topdown_renderer = TopDownMapRenderer(world_map=world_map)
@@ -131,7 +157,8 @@ class SimulationApp:
             "LiDAR sensor": self._lidar_sensor,
             "waypoint manager": self._waypoint_manager,
             "manual controller": self._manual_controller,
-            "state provider": self._state_provider,
+            "ground-truth provider": self._ground_truth_provider,
+            "estimated-state provider": self._estimated_state_provider,
             "GNSS projector": self._gnss_projector,
             "map selector": self._map_selector,
             "route planner": self.route_planner,
@@ -151,13 +178,15 @@ class SimulationApp:
             camera_sensor = self._camera_sensor
             waypoint_manager = self._waypoint_manager
             vehicle = self._vehicle
-            state_provider = self._state_provider
+            ground_truth_provider = self._ground_truth_provider
+            estimated_state_provider = self._estimated_state_provider
 
             assert manual_controller is not None
             assert camera_sensor is not None
             assert waypoint_manager is not None
             assert vehicle is not None
-            assert state_provider is not None
+            assert ground_truth_provider is not None
+            assert estimated_state_provider is not None
 
             running = True
             while running:
@@ -165,16 +194,34 @@ class SimulationApp:
                 if not running:
                     break
                 self._client_manager.tick()
-                self._latest_state = state_provider.get_state()
-                self._latest_tracking = self.waypoint_tracker.update(self._latest_state)
+                self._latest_ground_truth_state = ground_truth_provider.get_state()
+                self._latest_estimated_state = estimated_state_provider.update()
+                self._latest_localization_status = estimated_state_provider.build_status(
+                    self._latest_ground_truth_state
+                )
+                self._update_route_activation_state()
+                self._latest_state = self._state_for_tracking_and_control()
+                if self._can_update_route_tracking() and self._latest_state is not None:
+                    self._latest_tracking = self.waypoint_tracker.update(self._latest_state)
                 self._update_sensor_diagnostics()
 
-                if self._drive_mode == DriveMode.AUTONOMOUS:
-                    control = self.autonomous_controller.compute_control(
-                        state=self._latest_state,
-                        target_waypoint=self._latest_tracking.target_waypoint,
-                        route_completed=self._latest_tracking.completed,
+                if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
+                    control = carla.VehicleControl(
+                        throttle=0.0,
+                        steer=0.0,
+                        brake=ROUTE_INITIALIZATION.hold_brake,
+                        hand_brake=False,
                     )
+                    vehicle.apply_control(control)
+                elif self._drive_mode == DriveMode.AUTONOMOUS:
+                    if self._latest_estimated_state is None:
+                        control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+                    else:
+                        control = self.autonomous_controller.compute_control(
+                            state=self._latest_estimated_state,
+                            target_waypoint=self._latest_tracking.target_waypoint,
+                            route_completed=self._latest_tracking.completed,
+                        )
                     vehicle.apply_control(control)
                 else:
                     manual_controller.apply_control()
@@ -189,6 +236,17 @@ class SimulationApp:
                 self._clock.tick_pygame()
         finally:
             self.shutdown()
+
+    def _state_for_tracking_and_control(self) -> Optional[EgoState]:
+        """Return GT in manual mode and estimated state in autonomous mode."""
+        if self._drive_mode == DriveMode.AUTONOMOUS:
+            return self._latest_estimated_state
+        return self._latest_ground_truth_state
+
+    def _can_update_route_tracking(self) -> bool:
+        if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
+            return False
+        return self.route_planner is not None and bool(self.route_planner.get_route())
 
     def _process_events(self) -> bool:
         for event in pygame.event.get():
@@ -211,6 +269,7 @@ class SimulationApp:
         if event.key == pygame.K_ESCAPE:
             return False
         if event.key == pygame.K_m:
+            self._cancel_route_activation()
             self._drive_mode = DriveMode.MANUAL
             return True
         if event.key == pygame.K_p:
@@ -259,7 +318,7 @@ class SimulationApp:
         self._drive_mode = DriveMode.MANUAL
         self._clear_route()
         if self._map_selector.endpoints is not None:
-            self._generate_route_from_selection(teleport_to_start=True, start_autonomous=True)
+            self._begin_route_initialization_from_selection(start_autonomous=True)
 
     def _handle_mouse_button_up(self, event: pygame.event.Event) -> None:
         if self._topdown_renderer is not None:
@@ -286,18 +345,66 @@ class SimulationApp:
     def _try_enable_autonomous_mode(self) -> None:
         if self.route_planner is None:
             return
+        if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
+            self._pending_start_autonomous = True
+            self._drive_mode = DriveMode.AUTONOMOUS
+            return
         if not self.route_planner.get_route():
-            self._generate_route_from_selection(teleport_to_start=True, start_autonomous=False)
+            self._begin_route_initialization_from_selection(start_autonomous=True)
+            return
         if self.route_planner.get_route():
             self._drive_mode = DriveMode.AUTONOMOUS
             if self._vehicle is not None:
                 self._vehicle.set_autopilot(False)
+
+    def _begin_route_initialization_from_selection(self, start_autonomous: bool) -> None:
+        if self._map_selector is None:
+            return
+
+        endpoints = self._map_selector.endpoints
+        if endpoints is None:
+            self._planner_status = "Planner: select A/B"
+            return
+
+        self._begin_route_initialization(
+            start_waypoint=endpoints.start,
+            goal_waypoint=endpoints.goal,
+            start_autonomous=start_autonomous,
+        )
+
+    def _begin_route_initialization(
+        self,
+        start_waypoint: "carla.Waypoint",
+        goal_waypoint: "carla.Waypoint",
+        start_autonomous: bool,
+    ) -> None:
+        if self.route_planner is not None:
+            self.route_planner.clear_route()
+        self.waypoint_tracker.clear_route()
+        self._latest_tracking = self._empty_tracking_status()
+
+        self._pending_start_waypoint = start_waypoint
+        self._pending_goal_waypoint = goal_waypoint
+        self._pending_start_autonomous = start_autonomous
+        self._route_activation_state = RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY
+        self._drive_mode = DriveMode.AUTONOMOUS if start_autonomous else DriveMode.MANUAL
+        self._stabilization_started_monotonic = time.monotonic()
+        self._stabilization_elapsed_seconds = 0.0
+        self._stabilization_stable_ticks = 0
+        self._stabilization_error_m = None
+        self._stabilization_timed_out = False
+        self._route_generation_blocked = True
+        self._planner_status = "Planner: waiting localization stability"
+        self._teleport_vehicle_to_route_start(start_waypoint)
 
     def _generate_route_from_selection(
         self,
         teleport_to_start: bool = True,
         start_autonomous: bool = False,
     ) -> None:
+        if teleport_to_start:
+            self._begin_route_initialization_from_selection(start_autonomous=start_autonomous)
+            return
         if self._map_selector is None or self.route_planner is None:
             return
 
@@ -309,8 +416,6 @@ class SimulationApp:
         route = self.route_planner.generate_route(endpoints.start, endpoints.goal)
         self.waypoint_tracker.set_route(route)
         if route:
-            if teleport_to_start:
-                self._teleport_vehicle_to_route_start(endpoints.start)
             if start_autonomous:
                 self._drive_mode = DriveMode.AUTONOMOUS
             self._planner_status = f"Planner: {len(route)} wp, driving A->B"
@@ -319,13 +424,122 @@ class SimulationApp:
         else:
             self._planner_status = "Planner: no route"
 
+    def _update_route_activation_state(self) -> None:
+        if self._route_activation_state != RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
+            self._route_generation_blocked = False
+            return
+
+        self._route_generation_blocked = True
+        self._stabilization_elapsed_seconds = self._elapsed_stabilization_seconds()
+        self._stabilization_error_m = self._latest_position_error_m()
+
+        stable_now = self._localization_is_stable_for_route_start()
+        if stable_now:
+            self._stabilization_stable_ticks += 1
+        else:
+            self._stabilization_stable_ticks = 0
+
+        stable_enough = self._stabilization_stable_ticks >= ROUTE_INITIALIZATION.stable_ticks_required
+        timeout_ready = self._stabilization_timeout_ready()
+        if stable_enough or timeout_ready:
+            self._stabilization_timed_out = timeout_ready and not stable_enough
+            self._activate_pending_route_after_stabilization()
+
+    def _activate_pending_route_after_stabilization(self) -> None:
+        if (
+            self.route_planner is None
+            or self._pending_start_waypoint is None
+            or self._pending_goal_waypoint is None
+        ):
+            self._planner_status = "Planner: stabilization missing endpoints"
+            self._route_activation_state = RouteActivationState.IDLE
+            self._route_generation_blocked = False
+            return
+
+        route = self.route_planner.generate_route(
+            self._pending_start_waypoint,
+            self._pending_goal_waypoint,
+        )
+        self.waypoint_tracker.set_route(route)
+        self._route_generation_blocked = False
+        if route:
+            self._route_activation_state = RouteActivationState.ROUTE_ACTIVE
+            if self._pending_start_autonomous:
+                self._drive_mode = DriveMode.AUTONOMOUS
+                if self._vehicle is not None:
+                    self._vehicle.set_autopilot(False)
+            status_suffix = "timeout" if self._stabilization_timed_out else "stable"
+            self._planner_status = f"Planner: {len(route)} wp, {status_suffix}, driving A->B"
+        elif self.route_planner.planner_error:
+            self._route_activation_state = RouteActivationState.IDLE
+            self._planner_status = self.route_planner.planner_error
+        else:
+            self._route_activation_state = RouteActivationState.IDLE
+            self._planner_status = "Planner: no route"
+
+        self._pending_start_waypoint = None
+        self._pending_goal_waypoint = None
+
+    def _localization_is_stable_for_route_start(self) -> bool:
+        error = self._latest_position_error_m()
+        estimate = self._latest_estimated_state
+        status = self._latest_localization_status
+        if error is None or estimate is None or status is None or not status.initialized:
+            return False
+        return (
+            error <= ROUTE_INITIALIZATION.position_error_threshold_m
+            and estimate.speed <= ROUTE_INITIALIZATION.estimated_speed_threshold_mps
+        )
+
+    def _stabilization_timeout_ready(self) -> bool:
+        error = self._latest_position_error_m()
+        estimate = self._latest_estimated_state
+        if error is None or estimate is None:
+            return False
+        return (
+            self._stabilization_elapsed_seconds >= ROUTE_INITIALIZATION.max_wait_seconds
+            and error <= ROUTE_INITIALIZATION.timeout_position_error_threshold_m
+        )
+
+    def _elapsed_stabilization_seconds(self) -> float:
+        if self._stabilization_started_monotonic is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._stabilization_started_monotonic)
+
+    def _latest_position_error_m(self) -> Optional[float]:
+        if self._latest_localization_status is None:
+            return None
+        return self._latest_localization_status.position_error_m
+
+    def _cancel_route_activation(self) -> None:
+        self._route_activation_state = RouteActivationState.IDLE
+        self._pending_start_waypoint = None
+        self._pending_goal_waypoint = None
+        self._pending_start_autonomous = False
+        self._stabilization_started_monotonic = None
+        self._stabilization_elapsed_seconds = 0.0
+        self._stabilization_stable_ticks = 0
+        self._stabilization_error_m = None
+        self._stabilization_timed_out = False
+        self._route_generation_blocked = False
+
     def _teleport_vehicle_to_route_start(self, start_waypoint: "carla.Waypoint") -> None:
         if self._vehicle_manager is None:
             return
         self._vehicle_manager.teleport_to_waypoint(start_waypoint)
-        if self._state_provider is not None:
-            self._latest_state = self._state_provider.get_state()
-            self._latest_tracking = self.waypoint_tracker.update(self._latest_state)
+        if self._estimated_state_provider is not None:
+            self._estimated_state_provider.reset(skip_current_sensor_frames=True)
+            self._latest_estimated_state = None
+            self._latest_gnss_diagnostics = None
+            self._latest_gnss_frame = None
+            self._gnss_trail_xy.clear()
+        if self._ground_truth_provider is not None:
+            self._latest_ground_truth_state = self._ground_truth_provider.get_state()
+            self._latest_state = self._latest_ground_truth_state
+        if self._estimated_state_provider is not None:
+            self._latest_localization_status = self._estimated_state_provider.build_status(
+                self._latest_ground_truth_state
+            )
 
     def _reset_selection_and_route(self) -> None:
         if self._map_selector is not None:
@@ -334,10 +548,24 @@ class SimulationApp:
         self._planner_status = "Planner: reset"
 
     def _clear_route(self) -> None:
+        self._cancel_route_activation()
         if self.route_planner is not None:
             self.route_planner.clear_route()
         self.waypoint_tracker.clear_route()
+        self._latest_tracking = self._empty_tracking_status()
         self._drive_mode = DriveMode.MANUAL
+
+    @staticmethod
+    def _empty_tracking_status() -> TrackingStatus:
+        return TrackingStatus(
+            target_waypoint=None,
+            closest_index=0,
+            target_index=0,
+            cross_track_error_m=float("inf"),
+            distance_to_goal_m=float("inf"),
+            heading_error_deg=None,
+            completed=False,
+        )
 
     def _draw_camera_waypoints(
         self,
@@ -383,7 +611,8 @@ class SimulationApp:
         self._topdown_renderer.draw(
             surface=self._display.surface,
             hud=hud,
-            ego_state=self._latest_state,
+            ego_state=self._latest_ground_truth_state,
+            estimated_state=self._latest_estimated_state,
             start_waypoint=start,
             goal_waypoint=goal,
             route=route,
@@ -417,6 +646,19 @@ class SimulationApp:
             planner_status=self._planner_status,
             route_size=len(route),
             ego_state=self._latest_state,
+            ground_truth_state=self._latest_ground_truth_state,
+            estimated_state=self._latest_estimated_state,
+            localization_status=self._latest_localization_status,
+            route_activation_state=self._route_activation_state.value,
+            stabilization_active=(
+                self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY
+            ),
+            stabilization_error_m=self._stabilization_error_m,
+            stabilization_stable_ticks=self._stabilization_stable_ticks,
+            stabilization_required_ticks=ROUTE_INITIALIZATION.stable_ticks_required,
+            stabilization_elapsed_seconds=self._stabilization_elapsed_seconds,
+            stabilization_timeout_seconds=ROUTE_INITIALIZATION.max_wait_seconds,
+            route_generation_blocked=self._route_generation_blocked,
             tracking=self._latest_tracking,
             gnss=gnss,
             gnss_diagnostics=self._latest_gnss_diagnostics,
@@ -435,7 +677,7 @@ class SimulationApp:
             self._latest_gnss_diagnostics = None
             return
 
-        diagnostics = self._gnss_projector.diagnostics(gnss, self._latest_state)
+        diagnostics = self._gnss_projector.diagnostics(gnss, self._latest_ground_truth_state)
         self._latest_gnss_diagnostics = diagnostics
         if gnss is None or diagnostics is None:
             return
