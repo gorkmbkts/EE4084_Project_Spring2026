@@ -14,6 +14,9 @@ from src.control.vehicle_controller import VehicleController
 from src.control.waypoint_tracker import TrackingStatus, WaypointTracker
 from src.core.carla_client import CarlaClientManager
 from src.core.simulation import SimulationClock
+from src.evaluation.filter_performance import FilterPerformanceLogger
+from src.evaluation.route_test_runner import RouteTestRunner
+from src.evaluation.test_route_store import TestRouteStore
 from src.localization.gnss_projection import GnssDiagnostics, GnssLocalProjector
 from src.localization.state_estimator import (
     EgoState,
@@ -36,6 +39,7 @@ from src.visualization.lidar_panel import LidarPanelRenderer
 from src.visualization.pygame_display import PygameDisplay
 from src.visualization.sensor_panel import SensorPanelData, SensorPanelRenderer
 from src.visualization.topdown_map import TopDownHudData, TopDownMapRenderer
+from src.visualization.ui.control_panel import ControlPanel
 from src.visualization.waypoint_overlay import WaypointOverlayRenderer
 from src.utils.carla_import import ensure_carla_import
 
@@ -61,9 +65,11 @@ class SimulationApp:
     """Coordinate CARLA, sensors, display, route selection, and control."""
 
     def __init__(self) -> None:
+        pygame.init()
         self._client_manager = CarlaClientManager()
-        self._display = PygameDisplay()
         self._clock = SimulationClock()
+        self._display: Optional[PygameDisplay] = None
+        self._control_panel: Optional[ControlPanel] = None
 
         self._vehicle_manager: Optional[VehicleManager] = None
         self._sensor_manager: Optional[SensorManager] = None
@@ -83,12 +89,16 @@ class SimulationApp:
         self._gnss_projector: Optional[GnssLocalProjector] = None
         self._map_selector: Optional[MapSelector] = None
         self._topdown_renderer: Optional[TopDownMapRenderer] = None
+        self._test_route_store: Optional[TestRouteStore] = None
+        self._test_runner: Optional[RouteTestRunner] = None
+        self._performance_logger = FilterPerformanceLogger()
         self.route_planner: Optional[RoutePlanner] = None
         self.waypoint_tracker = WaypointTracker()
         self.autonomous_controller = VehicleController()
 
         self._drive_mode = DriveMode.MANUAL
         self._map_selection_active = False
+        self._test_route_authoring_active = False
         self._latest_state: Optional[EgoState] = None
         self._latest_ground_truth_state: Optional[EgoState] = None
         self._latest_estimated_state: Optional[EgoState] = None
@@ -108,6 +118,7 @@ class SimulationApp:
         self._stabilization_error_m: Optional[float] = None
         self._stabilization_timed_out = False
         self._route_generation_blocked = False
+        self._control_status_text = "Test idle"
 
     def _setup(self) -> None:
         """Initialize CARLA world, vehicle, sensors, route tools, and visualization."""
@@ -142,14 +153,30 @@ class SimulationApp:
         self._map_selector = MapSelector(world_map=world_map)
         self.route_planner = RoutePlanner(world_map=world_map)
         self._topdown_renderer = TopDownMapRenderer(world_map=world_map)
+        self._test_route_store = TestRouteStore(map_name=getattr(world_map, "name", None))
+        self._test_runner = RouteTestRunner(
+            world_map=world_map,
+            route_store=self._test_route_store,
+            performance_logger=self._performance_logger,
+            begin_route_callback=lambda start, goal: self._begin_route_initialization(
+                start_waypoint=start,
+                goal_waypoint=goal,
+                start_autonomous=True,
+            ),
+            reset_estimator_callback=self._reset_estimator,
+        )
 
         if self.route_planner.planner_error:
             self._planner_status = "Planner: fallback"
         else:
             self._planner_status = "Planner: CARLA"
 
+        self._initialize_display()
+
     def _ensure_ready(self) -> None:
         required = {
+            "display": self._display,
+            "control panel": self._control_panel,
             "vehicle": self._vehicle,
             "camera sensor": self._camera_sensor,
             "GNSS sensor": self._gnss_sensor,
@@ -163,16 +190,102 @@ class SimulationApp:
             "map selector": self._map_selector,
             "route planner": self.route_planner,
             "top-down renderer": self._topdown_renderer,
+            "test route store": self._test_route_store,
+            "test runner": self._test_runner,
         }
         missing = [name for name, value in required.items() if value is None]
         if missing:
             raise RuntimeError(f"Application is not initialized: {', '.join(missing)}.")
+
+    def _initialize_display(self) -> None:
+        self._display = PygameDisplay()
+        self._control_panel = ControlPanel(self._display.control_panel_rect)
+        self._build_control_panel()
+        self._control_status_text = "Dashboard ready"
+        self._draw_startup_frame()
+
+    def _draw_startup_frame(self) -> None:
+        if self._display is None or self._control_panel is None:
+            return
+        self._display.begin_frame(None)
+        self._update_control_panel_state()
+        self._control_panel.draw(self._display.surface)
+        self._display.end_frame()
+
+    def _build_control_panel(self) -> None:
+        assert self._control_panel is not None
+        button_specs = [
+            ("Manual Mode", self._set_manual_mode),
+            ("Autonomous Mode", self._try_enable_autonomous_mode),
+            ("Map Select ON/OFF", self._toggle_map_selection),
+            ("Test Route Mode ON/OFF", self._toggle_test_route_authoring),
+            ("Save A/B as Test Route", self._save_current_ab_as_test_route),
+            ("Previous Test Route", self._select_previous_test_route),
+            ("Next Test Route", self._select_next_test_route),
+            ("Load Selected Test Route", self._load_selected_test_route),
+            ("Start Test Run", self._start_test_run),
+            ("Stop Test Run", self._stop_test_run),
+            ("Reset Selection", self._reset_selection_and_route),
+            ("Clear Route", self._clear_route),
+            ("Reset Estimator", self._reset_estimator),
+            ("Emergency Brake", self._emergency_brake),
+            ("Save Test Report", self._save_test_report),
+        ]
+        for label, callback in button_specs:
+            self._control_panel.add_button(label, callback)
+
+    def _update_control_panel_state(self) -> None:
+        assert self._display is not None
+        assert self._control_panel is not None
+        store = self._test_route_store
+        runner = self._test_runner
+        route_count = store.route_count() if store is not None else 0
+        current_route = store.get_current_route() if store is not None else None
+        test_active = runner.is_active if runner is not None else False
+        endpoints_ready = self._map_selector is not None and self._map_selector.endpoints is not None
+
+        self._control_panel.set_rect(self._display.control_panel_rect)
+        self._control_panel.set_button_state("Manual Mode", active=self._drive_mode == DriveMode.MANUAL)
+        self._control_panel.set_button_state("Autonomous Mode", active=self._drive_mode == DriveMode.AUTONOMOUS)
+        self._control_panel.set_button_state("Map Select ON/OFF", active=self._map_selection_active)
+        self._control_panel.set_button_state("Test Route Mode ON/OFF", active=self._test_route_authoring_active)
+        self._control_panel.set_button_state("Save A/B as Test Route", active=endpoints_ready)
+        self._control_panel.set_button_state("Start Test Run", enabled=not test_active)
+        self._control_panel.set_button_state("Stop Test Run", enabled=test_active, active=test_active)
+        self._control_panel.set_button_state("Save Test Report", enabled=bool(self._performance_logger.samples))
+
+        route_label = "none"
+        if current_route is not None and store is not None:
+            route_label = f"{store.current_index + 1}/{route_count} {current_route.name}"
+
+        status_lines = [
+            (
+                f"Map: {'ON' if self._map_selection_active else 'OFF'}  "
+                f"Author: {'ON' if self._test_route_authoring_active else 'OFF'}"
+            ),
+            f"A/B: {'READY' if endpoints_ready else 'not set'}  Saved: {route_count}",
+            f"Selected: {route_label}",
+            runner.status_text if runner is not None else "Test idle",
+            (
+                f"KF/GNSS: {self._format_optional_metric(self._performance_logger.current_position_error_m, 'm')} / "
+                f"{self._format_optional_metric(self._performance_logger.current_raw_gnss_error_m, 'm')}"
+            ),
+            (
+                f"CTE/RMSE: {self._format_optional_metric(self._performance_logger.current_cross_track_error_m, 'm')} / "
+                f"{self._format_optional_metric(self._performance_logger.running_rmse_m(), 'm')}"
+            ),
+            self._control_status_text,
+        ]
+        self._control_panel.set_status_lines(status_lines)
 
     def run(self) -> None:
         """Run the camera, route-selection, and route-following application loop."""
         try:
             self._setup()
             self._ensure_ready()
+
+            display = self._display
+            assert display is not None
 
             manual_controller = self._manual_controller
             camera_sensor = self._camera_sensor
@@ -204,6 +317,7 @@ class SimulationApp:
                 if self._can_update_route_tracking() and self._latest_state is not None:
                     self._latest_tracking = self.waypoint_tracker.update(self._latest_state)
                 self._update_sensor_diagnostics()
+                self._update_test_performance()
 
                 if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
                     control = carla.VehicleControl(
@@ -227,12 +341,13 @@ class SimulationApp:
                     manual_controller.apply_control()
 
                 camera_surface = camera_sensor.get_latest_surface()
-                self._display.begin_frame(camera_surface)
+                display.begin_frame(camera_surface)
                 self._draw_camera_waypoints(waypoint_manager, camera_sensor, vehicle)
                 self._draw_topdown_map()
                 self._draw_lidar_panel()
                 self._draw_sensor_panel()
-                self._display.end_frame()
+                self._draw_control_panel()
+                display.end_frame()
                 self._clock.tick_pygame()
         finally:
             self.shutdown()
@@ -249,12 +364,18 @@ class SimulationApp:
         return self.route_planner is not None and bool(self.route_planner.get_route())
 
     def _process_events(self) -> bool:
+        assert self._control_panel is not None
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
+            if event.type == pygame.VIDEORESIZE:
+                self._handle_video_resize(event)
+                continue
             if event.type == pygame.KEYDOWN:
                 if not self._handle_key_down(event):
                     return False
+            elif self._control_panel.handle_event(event):
+                continue
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 self._handle_mouse_button_down(event)
             elif event.type == pygame.MOUSEBUTTONUP:
@@ -265,18 +386,23 @@ class SimulationApp:
                 self._handle_mouse_wheel(event)
         return True
 
+    def _handle_video_resize(self, event: pygame.event.Event) -> None:
+        assert self._display is not None
+        assert self._control_panel is not None
+        self._display.resize(event.w, event.h)
+        self._control_panel.set_rect(self._display.control_panel_rect)
+
     def _handle_key_down(self, event: pygame.event.Event) -> bool:
         if event.key == pygame.K_ESCAPE:
             return False
         if event.key == pygame.K_m:
-            self._cancel_route_activation()
-            self._drive_mode = DriveMode.MANUAL
+            self._set_manual_mode()
             return True
         if event.key == pygame.K_p:
             self._try_enable_autonomous_mode()
             return True
         if event.key == pygame.K_t:
-            self._map_selection_active = not self._map_selection_active
+            self._toggle_map_selection()
             return True
         if event.key == pygame.K_r:
             self._reset_selection_and_route()
@@ -289,7 +415,174 @@ class SimulationApp:
             return True
         return True
 
+    def _set_manual_mode(self) -> None:
+        if self._test_runner is not None and self._test_runner.is_active:
+            self._test_runner.stop(aborted=True, reason="Test aborted: manual mode")
+        self._cancel_route_activation()
+        self._drive_mode = DriveMode.MANUAL
+        if self._vehicle is not None:
+            self._vehicle.set_autopilot(False)
+        self._planner_status = "Mode: manual"
+        self._control_status_text = "Manual mode"
+
+    def _toggle_map_selection(self) -> None:
+        self._map_selection_active = not self._map_selection_active
+        self._control_status_text = f"Map select {'ON' if self._map_selection_active else 'OFF'}"
+
+    def _toggle_test_route_authoring(self) -> None:
+        self._test_route_authoring_active = not self._test_route_authoring_active
+        if self._test_route_authoring_active:
+            self._map_selection_active = True
+            self._clear_route()
+            self._planner_status = "Test route mode: select A/B"
+            self._control_status_text = "Test route mode: select A/B"
+        else:
+            self._planner_status = "Test route mode off"
+            self._control_status_text = "Test route mode off"
+
+    def _save_current_ab_as_test_route(self) -> None:
+        if self._map_selector is None or self._test_route_store is None:
+            self._planner_status = "Test route store unavailable"
+            self._control_status_text = self._planner_status
+            return
+
+        endpoints = self._map_selector.endpoints
+        if endpoints is None:
+            self._planner_status = "Select A/B before saving test route"
+            self._control_status_text = self._planner_status
+            return
+
+        route = self._test_route_store.add_route_from_endpoints(None, endpoints)
+        self._planner_status = f"Saved test route: {route.name}"
+        self._control_status_text = self._planner_status
+
+    def _select_next_test_route(self) -> None:
+        if self._test_route_store is None:
+            self._control_status_text = "Test route store unavailable"
+            return
+        route = self._test_route_store.next_route()
+        if route is None:
+            self._planner_status = "No saved test routes"
+            self._control_status_text = self._planner_status
+            return
+        self._planner_status = f"Selected test route: {route.name}"
+        self._control_status_text = self._planner_status
+
+    def _select_previous_test_route(self) -> None:
+        if self._test_route_store is None:
+            self._control_status_text = "Test route store unavailable"
+            return
+        route = self._test_route_store.previous_route()
+        if route is None:
+            self._planner_status = "No saved test routes"
+            self._control_status_text = self._planner_status
+            return
+        self._planner_status = f"Selected test route: {route.name}"
+        self._control_status_text = self._planner_status
+
+    def _load_selected_test_route(self) -> None:
+        if self._test_route_store is None or self._map_selector is None:
+            self._planner_status = "Test route tools unavailable"
+            self._control_status_text = self._planner_status
+            return
+
+        route = self._test_route_store.get_current_route()
+        if route is None:
+            self._planner_status = "No saved test routes"
+            self._control_status_text = self._planner_status
+            return
+
+        resolved = self._test_route_store.resolve_route_to_waypoints(
+            self._client_manager.world_map,
+            route,
+        )
+        if resolved is None:
+            self._planner_status = "Failed to resolve saved test route"
+            self._control_status_text = self._planner_status
+            return
+
+        start_waypoint, goal_waypoint = resolved
+        self._clear_route()
+        self._map_selector.set_endpoints(start_waypoint, goal_waypoint)
+        self._map_selection_active = True
+        self._planner_status = f"Loaded test route: {route.name}"
+        self._control_status_text = self._planner_status
+
+    def _start_test_run(self) -> None:
+        if self._test_route_store is None or self._test_runner is None:
+            self._planner_status = "Test runner unavailable"
+            self._control_status_text = self._planner_status
+            return
+
+        route = self._test_route_store.get_current_route()
+        if route is None:
+            self._planner_status = "Select or create a test route first"
+            self._control_status_text = self._planner_status
+            return
+
+        self._test_route_authoring_active = False
+        self._map_selection_active = False
+        started = self._test_runner.start_selected_route(route)
+        self._planner_status = self._test_runner.status_text
+        self._control_status_text = self._test_runner.status_text
+        if not started:
+            self._drive_mode = DriveMode.MANUAL
+
+    def _stop_test_run(self) -> None:
+        if self._test_runner is None or not self._test_runner.is_active:
+            self._planner_status = "No active test run"
+            self._control_status_text = self._planner_status
+            return
+
+        self._test_runner.stop(aborted=True, reason="Test stopped")
+        self._clear_route(stop_test=False)
+        self._planner_status = "Test stopped"
+        self._control_status_text = "Test stopped"
+
+    def _reset_estimator(self) -> None:
+        if self._estimated_state_provider is None:
+            self._control_status_text = "Estimator not initialized"
+            return
+
+        self._estimated_state_provider.reset(skip_current_sensor_frames=True)
+        self._latest_estimated_state = None
+        self._latest_localization_status = None
+        self._latest_gnss_diagnostics = None
+        self._latest_gnss_frame = None
+        self._gnss_trail_xy.clear()
+        self._planner_status = "Estimator reset"
+        self._control_status_text = "Estimator reset"
+
+    def _emergency_brake(self) -> None:
+        if self._test_runner is not None and self._test_runner.is_active:
+            self._test_runner.stop(aborted=True, reason="Test aborted: emergency brake")
+        self._cancel_route_activation()
+        self._drive_mode = DriveMode.MANUAL
+        if self._vehicle is not None:
+            self._vehicle.set_autopilot(False)
+            self._vehicle.apply_control(
+                carla.VehicleControl(
+                    throttle=0.0,
+                    steer=0.0,
+                    brake=1.0,
+                    hand_brake=True,
+                )
+            )
+        self._planner_status = "Emergency brake"
+        self._control_status_text = "Emergency brake"
+
+    def _save_test_report(self) -> None:
+        if not self._performance_logger.samples:
+            self._planner_status = "No test samples to export"
+            self._control_status_text = self._planner_status
+            return
+
+        _csv_path, json_path = self._performance_logger.export()
+        self._planner_status = f"Saved test report: {json_path.name}"
+        self._control_status_text = self._planner_status
+
     def _handle_mouse_button_down(self, event: pygame.event.Event) -> None:
+        assert self._display is not None
         renderer = self._topdown_renderer
         if renderer is None or not self._map_selection_active:
             return
@@ -317,6 +610,14 @@ class SimulationApp:
         self._map_selector.select_world_location(world_location)
         self._drive_mode = DriveMode.MANUAL
         self._clear_route()
+        if self._test_route_authoring_active:
+            if self._map_selector.endpoints is not None:
+                self._planner_status = "Test route ready: click Save A/B"
+                self._control_status_text = "Test route ready: click Save A/B"
+            else:
+                self._planner_status = "Test route mode: select A/B"
+                self._control_status_text = "Test route mode: select A/B"
+            return
         if self._map_selector.endpoints is not None:
             self._begin_route_initialization_from_selection(start_autonomous=True)
 
@@ -325,6 +626,7 @@ class SimulationApp:
             self._topdown_renderer.handle_mouse_button_up(event)
 
     def _handle_mouse_motion(self, event: pygame.event.Event) -> None:
+        assert self._display is not None
         if self._topdown_renderer is not None and self._map_selection_active:
             self._topdown_renderer.handle_mouse_motion(
                 self._display.surface,
@@ -333,6 +635,7 @@ class SimulationApp:
             )
 
     def _handle_mouse_wheel(self, event: pygame.event.Event) -> None:
+        assert self._display is not None
         if self._topdown_renderer is None or not self._map_selection_active:
             return
         self._topdown_renderer.handle_mouse_wheel(
@@ -547,7 +850,9 @@ class SimulationApp:
         self._clear_route()
         self._planner_status = "Planner: reset"
 
-    def _clear_route(self) -> None:
+    def _clear_route(self, stop_test: bool = True) -> None:
+        if stop_test and self._test_runner is not None and self._test_runner.is_active:
+            self._test_runner.stop(aborted=True, reason="Test aborted: route cleared")
         self._cancel_route_activation()
         if self.route_planner is not None:
             self.route_planner.clear_route()
@@ -590,6 +895,7 @@ class SimulationApp:
         )
 
     def _draw_topdown_map(self) -> None:
+        assert self._display is not None
         if self._topdown_renderer is None:
             return
         self._update_sensor_diagnostics()
@@ -623,6 +929,7 @@ class SimulationApp:
         )
 
     def _draw_lidar_panel(self) -> None:
+        assert self._display is not None
         measurement = None
         if self._lidar_sensor is not None:
             measurement = self._lidar_sensor.get_latest_measurement()
@@ -633,6 +940,7 @@ class SimulationApp:
         )
 
     def _draw_sensor_panel(self) -> None:
+        assert self._display is not None
         route = self.route_planner.get_route() if self.route_planner is not None else []
         gnss = self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None
         imu = self._imu_sensor.get_latest_measurement() if self._imu_sensor is not None else None
@@ -671,6 +979,41 @@ class SimulationApp:
             data=data,
         )
 
+    def _draw_control_panel(self) -> None:
+        assert self._display is not None
+        assert self._control_panel is not None
+        self._update_control_panel_state()
+        self._control_panel.draw(self._display.surface)
+
+    def _update_test_performance(self) -> None:
+        runner = self._test_runner
+        if runner is None or not runner.is_active:
+            return
+
+        route_name = runner.current_route_name or "test_route"
+        self._performance_logger.collect_sample(
+            route_name=route_name,
+            ground_truth_state=self._latest_ground_truth_state,
+            estimated_state=self._latest_estimated_state,
+            gnss_diagnostics=self._latest_gnss_diagnostics,
+            tracking=self._latest_tracking,
+            route_completed=self._latest_tracking.completed,
+        )
+
+        route = self.route_planner.get_route() if self.route_planner is not None else []
+        route_failed = (
+            self._route_activation_state == RouteActivationState.IDLE
+            and not route
+            and not self._latest_tracking.completed
+        )
+        paths = runner.update(
+            route_completed=self._latest_tracking.completed,
+            route_failed=route_failed,
+        )
+        if paths is not None:
+            self._control_status_text = runner.status_text
+            self._planner_status = runner.status_text
+
     def _update_sensor_diagnostics(self) -> None:
         gnss = self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None
         if self._gnss_projector is None:
@@ -691,6 +1034,14 @@ class SimulationApp:
             return None
         return self._latest_gnss_diagnostics.local_x, self._latest_gnss_diagnostics.local_y
 
+    @staticmethod
+    def _format_optional_metric(value: Optional[float], suffix: str) -> str:
+        if value is None or not isinstance(value, (int, float)):
+            return "n/a"
+        if value != value or value in (float("inf"), float("-inf")):
+            return "n/a"
+        return f"{value:.2f} {suffix}"
+
     def shutdown(self) -> None:
         """Destroy actors and close pygame resources."""
         if self._vehicle is not None:
@@ -709,4 +1060,8 @@ class SimulationApp:
             self._vehicle_manager = None
 
         self._client_manager.restore_world_settings()
-        self._display.shutdown()
+        if self._display is not None:
+            self._display.shutdown()
+            self._display = None
+        else:
+            pygame.quit()

@@ -1,0 +1,18 @@
+{
+  "route_name": "test_route_001",
+  "sample_count": 2391,
+  "position_rmse_m": 4.549727178376951,
+  "position_mae_m": 0.8470936108318052,
+  "max_position_error_m": 61.798342276753864,
+  "p95_position_error_m": 0.9957253448448956,
+  "raw_gnss_rmse_m": 0.8733557696667803,
+  "raw_gnss_mae_m": 0.5919506763242233,
+  "kf_improvement_ratio": 0.19195783294820268,
+  "mean_cross_track_error_m": 0.5540349640861232,
+  "max_cross_track_error_m": 1.5788953739678082,
+  "p95_cross_track_error_m": 0.9947227012492643,
+  "mean_heading_error_deg": 2.542032102799236,
+  "route_completion_success": true,
+  "route_aborted": false,
+  "completion_time_s": 119.50000178068876
+}

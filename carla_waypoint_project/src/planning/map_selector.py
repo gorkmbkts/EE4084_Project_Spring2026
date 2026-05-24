@@ -45,6 +45,11 @@ class MapSelector:
         self._start = None
         self._goal = None
 
+    def set_endpoints(self, start: "carla.Waypoint", goal: "carla.Waypoint") -> None:
+        """Replace A and B selections with already-resolved waypoints."""
+        self._start = start
+        self._goal = goal
+
     def select_world_location(self, location: "carla.Location") -> Optional["carla.Waypoint"]:
         """Snap a clicked world location and store it as A or B.
 

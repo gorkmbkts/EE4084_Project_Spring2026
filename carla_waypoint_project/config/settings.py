@@ -24,6 +24,10 @@ class DisplaySettings:
     fps: int = 30
     title: str = "CARLA KF Localization Dashboard"
     clear_color: ColorRGB = (10, 12, 16)
+    fullscreen: bool = False
+    resizable: bool = True
+    maximized: bool = True
+    borderless: bool = True
 
 
 @dataclass(frozen=True)
