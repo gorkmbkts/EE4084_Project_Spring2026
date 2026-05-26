@@ -162,6 +162,10 @@ class BenchmarkSettings:
     generate_plots_on_completion: bool = True
     collect_stabilization_samples: bool = True
     route_completion_required: bool = True
+    max_kalman_plot_error_m: float = 10.0
+    max_trajectory_jump_m: float = 8.0
+    route_bounds_margin_m: float = 20.0
+    metrics_use_driving_phase_only: bool = True
 
 
 @dataclass(frozen=True)

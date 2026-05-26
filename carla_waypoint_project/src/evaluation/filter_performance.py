@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 from typing import Optional
 
+from config.settings import BENCHMARK
 from src.control.waypoint_tracker import TrackingStatus
 from src.localization.gnss_projection import GnssDiagnostics
 from src.localization.state_estimator import EgoState
@@ -152,16 +153,17 @@ class FilterPerformanceLogger:
         return self._rmse(self._finite_values(sample.kalman_position_error_m for sample in self._samples))
 
     def build_summary(self) -> dict[str, object]:
-        kalman_errors = self._finite_values(sample.kalman_position_error_m for sample in self._samples)
-        raw_gnss_errors = self._finite_values(sample.raw_gnss_error_m for sample in self._samples)
-        cross_track_errors = self._finite_values(sample.cross_track_error_m for sample in self._samples)
-        heading_errors = [abs(value) for value in self._finite_values(sample.heading_error_deg for sample in self._samples)]
+        overall_metrics = self._metrics_for_samples(self._samples)
+        driving_samples = [sample for sample in self._samples if sample.phase in ("driving", "completed")]
+        driving_metrics = self._metrics_for_samples(driving_samples)
 
-        kalman_rmse = self._rmse(kalman_errors)
-        raw_gnss_rmse = self._rmse(raw_gnss_errors)
-        improvement_ratio = None
-        if kalman_rmse is not None and kalman_rmse > 0.0 and raw_gnss_rmse is not None:
-            improvement_ratio = raw_gnss_rmse / kalman_rmse
+        kalman_rmse = overall_metrics["kalman_rmse_m"]
+        raw_gnss_rmse = overall_metrics["raw_gnss_rmse_m"]
+        improvement_ratio = self._ratio(raw_gnss_rmse, kalman_rmse)
+
+        driving_kalman_rmse = driving_metrics["kalman_rmse_m"]
+        driving_raw_gnss_rmse = driving_metrics["raw_gnss_rmse_m"]
+        driving_improvement_ratio = self._ratio(driving_raw_gnss_rmse, driving_kalman_rmse)
 
         completion_time = None
         if len(self._samples) >= 2:
@@ -177,18 +179,33 @@ class FilterPerformanceLogger:
             "abort_reason": self._abort_reason,
             "completion_time_s": completion_time,
             "kalman_rmse_m": kalman_rmse,
-            "kalman_mae_m": self._mean(kalman_errors),
-            "kalman_max_error_m": max(kalman_errors) if kalman_errors else None,
-            "kalman_p95_error_m": self._percentile(kalman_errors, 95.0),
+            "kalman_mae_m": overall_metrics["kalman_mae_m"],
+            "kalman_max_error_m": overall_metrics["kalman_max_error_m"],
+            "kalman_p95_error_m": overall_metrics["kalman_p95_error_m"],
             "raw_gnss_rmse_m": raw_gnss_rmse,
-            "raw_gnss_mae_m": self._mean(raw_gnss_errors),
-            "raw_gnss_max_error_m": max(raw_gnss_errors) if raw_gnss_errors else None,
-            "raw_gnss_p95_error_m": self._percentile(raw_gnss_errors, 95.0),
+            "raw_gnss_mae_m": overall_metrics["raw_gnss_mae_m"],
+            "raw_gnss_max_error_m": overall_metrics["raw_gnss_max_error_m"],
+            "raw_gnss_p95_error_m": overall_metrics["raw_gnss_p95_error_m"],
             "kalman_improvement_ratio": improvement_ratio,
-            "mean_cross_track_error_m": self._mean(cross_track_errors),
-            "max_cross_track_error_m": max(cross_track_errors) if cross_track_errors else None,
-            "p95_cross_track_error_m": self._percentile(cross_track_errors, 95.0),
-            "mean_heading_error_deg": self._mean(heading_errors),
+            "mean_cross_track_error_m": overall_metrics["mean_cross_track_error_m"],
+            "max_cross_track_error_m": overall_metrics["max_cross_track_error_m"],
+            "p95_cross_track_error_m": overall_metrics["p95_cross_track_error_m"],
+            "mean_heading_error_deg": overall_metrics["mean_heading_error_deg"],
+            "driving_sample_count": len(driving_samples),
+            "driving_kalman_rmse_m": driving_kalman_rmse,
+            "driving_kalman_mae_m": driving_metrics["kalman_mae_m"],
+            "driving_kalman_max_error_m": driving_metrics["kalman_max_error_m"],
+            "driving_kalman_p95_error_m": driving_metrics["kalman_p95_error_m"],
+            "driving_raw_gnss_rmse_m": driving_raw_gnss_rmse,
+            "driving_raw_gnss_mae_m": driving_metrics["raw_gnss_mae_m"],
+            "driving_raw_gnss_max_error_m": driving_metrics["raw_gnss_max_error_m"],
+            "driving_raw_gnss_p95_error_m": driving_metrics["raw_gnss_p95_error_m"],
+            "driving_kalman_improvement_ratio": driving_improvement_ratio,
+            "driving_mean_cross_track_error_m": driving_metrics["mean_cross_track_error_m"],
+            "driving_max_cross_track_error_m": driving_metrics["max_cross_track_error_m"],
+            "driving_p95_cross_track_error_m": driving_metrics["p95_cross_track_error_m"],
+            "driving_mean_heading_error_deg": driving_metrics["mean_heading_error_deg"],
+            "excluded_kalman_plot_sample_count": self._excluded_kalman_plot_sample_count(driving_samples),
         }
 
     def export(self) -> tuple[Path, Path]:
@@ -244,6 +261,73 @@ class FilterPerformanceLogger:
     @staticmethod
     def _finite_values(values: Iterable[Optional[float]]) -> list[float]:
         return [float(value) for value in values if value is not None and math.isfinite(value)]
+
+    @classmethod
+    def _metrics_for_samples(cls, samples: Iterable[FilterPerformanceSample]) -> dict[str, Optional[float]]:
+        sample_list = list(samples)
+        kalman_errors = cls._finite_values(sample.kalman_position_error_m for sample in sample_list)
+        raw_gnss_errors = cls._finite_values(sample.raw_gnss_error_m for sample in sample_list)
+        cross_track_errors = cls._finite_values(sample.cross_track_error_m for sample in sample_list)
+        heading_errors = [
+            abs(value)
+            for value in cls._finite_values(sample.heading_error_deg for sample in sample_list)
+        ]
+        return {
+            "kalman_rmse_m": cls._rmse(kalman_errors),
+            "kalman_mae_m": cls._mean(kalman_errors),
+            "kalman_max_error_m": max(kalman_errors) if kalman_errors else None,
+            "kalman_p95_error_m": cls._percentile(kalman_errors, 95.0),
+            "raw_gnss_rmse_m": cls._rmse(raw_gnss_errors),
+            "raw_gnss_mae_m": cls._mean(raw_gnss_errors),
+            "raw_gnss_max_error_m": max(raw_gnss_errors) if raw_gnss_errors else None,
+            "raw_gnss_p95_error_m": cls._percentile(raw_gnss_errors, 95.0),
+            "mean_cross_track_error_m": cls._mean(cross_track_errors),
+            "max_cross_track_error_m": max(cross_track_errors) if cross_track_errors else None,
+            "p95_cross_track_error_m": cls._percentile(cross_track_errors, 95.0),
+            "mean_heading_error_deg": cls._mean(heading_errors),
+        }
+
+    @classmethod
+    def _excluded_kalman_plot_sample_count(cls, samples: Iterable[FilterPerformanceSample]) -> int:
+        candidates = 0
+        kept = 0
+        previous_xy: Optional[tuple[float, float]] = None
+        for sample in samples:
+            if not cls._finite_pair(sample.kalman_x, sample.kalman_y):
+                continue
+            candidates += 1
+            if not cls._finite_pair(sample.ground_truth_x, sample.ground_truth_y):
+                continue
+            if sample.kalman_position_error_m is None or not math.isfinite(sample.kalman_position_error_m):
+                continue
+            if sample.kalman_position_error_m > BENCHMARK.max_kalman_plot_error_m:
+                continue
+
+            current_xy = (float(sample.kalman_x), float(sample.kalman_y))
+            if previous_xy is not None and math.hypot(
+                current_xy[0] - previous_xy[0],
+                current_xy[1] - previous_xy[1],
+            ) > BENCHMARK.max_trajectory_jump_m:
+                continue
+
+            kept += 1
+            previous_xy = current_xy
+        return max(0, candidates - kept)
+
+    @staticmethod
+    def _finite_pair(x_value: Optional[float], y_value: Optional[float]) -> bool:
+        return (
+            x_value is not None
+            and y_value is not None
+            and math.isfinite(x_value)
+            and math.isfinite(y_value)
+        )
+
+    @staticmethod
+    def _ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+        if numerator is None or denominator is None or denominator <= 0.0:
+            return None
+        return numerator / denominator
 
     @staticmethod
     def _rmse(values: list[float]) -> Optional[float]:

@@ -52,6 +52,10 @@ def build_benchmark_metadata(
                 "generate_plots_on_completion": BENCHMARK.generate_plots_on_completion,
                 "collect_stabilization_samples": BENCHMARK.collect_stabilization_samples,
                 "route_completion_required": BENCHMARK.route_completion_required,
+                "max_kalman_plot_error_m": BENCHMARK.max_kalman_plot_error_m,
+                "max_trajectory_jump_m": BENCHMARK.max_trajectory_jump_m,
+                "route_bounds_margin_m": BENCHMARK.route_bounds_margin_m,
+                "metrics_use_driving_phase_only": BENCHMARK.metrics_use_driving_phase_only,
             },
         },
         "kalman_filter": {
