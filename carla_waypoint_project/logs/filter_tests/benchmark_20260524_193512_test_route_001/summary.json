@@ -1,0 +1,101 @@
+{
+  "benchmark_id": "benchmark_20260524_193512_test_route_001",
+  "route_name": "test_route_001",
+  "aborted": true,
+  "abort_reason": "aborted",
+  "passes": {
+    "ground_truth": {
+      "benchmark_id": "benchmark_20260524_193512_test_route_001",
+      "route_name": "test_route_001",
+      "pass_mode": "ground_truth",
+      "sample_count": 253,
+      "route_completion_success": true,
+      "route_aborted": false,
+      "abort_reason": null,
+      "completion_time_s": 12.600000187754631,
+      "position_rmse_m": 0.0,
+      "position_mae_m": 0.0,
+      "max_position_error_m": 0.0,
+      "p95_position_error_m": 0.0,
+      "mean_cross_track_error_m": 0.6434399718102776,
+      "max_cross_track_error_m": 1.3580634182632643,
+      "p95_cross_track_error_m": 1.185220382241849,
+      "mean_heading_error_deg": 5.463042130888328,
+      "raw_gnss_rmse_m": 2.3532023386855703,
+      "raw_gnss_mae_m": 0.712967496518513,
+      "kalman_rmse_m": 18.008491372559845,
+      "kalman_mae_m": 7.80016005419818,
+      "no_filter_rmse_m": 0.6446620878924498,
+      "no_filter_mae_m": 0.5736503330906841
+    },
+    "kalman_filter": {
+      "benchmark_id": "benchmark_20260524_193512_test_route_001",
+      "route_name": "test_route_001",
+      "pass_mode": "kalman_filter",
+      "sample_count": 354,
+      "route_completion_success": true,
+      "route_aborted": false,
+      "abort_reason": null,
+      "completion_time_s": 17.650000263005495,
+      "position_rmse_m": 14.742405579935744,
+      "position_mae_m": 5.4831306583752095,
+      "max_position_error_m": 77.32398055944446,
+      "p95_position_error_m": 35.639642062339284,
+      "mean_cross_track_error_m": 0.6453778687142013,
+      "max_cross_track_error_m": 1.243552617749435,
+      "p95_cross_track_error_m": 1.1088265956988617,
+      "mean_heading_error_deg": 7.822714106551924,
+      "raw_gnss_rmse_m": 1.994346722074108,
+      "raw_gnss_mae_m": 0.6995021690143707,
+      "kalman_rmse_m": 14.742405579935744,
+      "kalman_mae_m": 5.4831306583752095,
+      "no_filter_rmse_m": 0.6721968348107902,
+      "no_filter_mae_m": 0.6006553258613448
+    },
+    "no_filter": {
+      "benchmark_id": "benchmark_20260524_193512_test_route_001",
+      "route_name": "test_route_001",
+      "pass_mode": "no_filter",
+      "sample_count": 1774,
+      "route_completion_success": false,
+      "route_aborted": true,
+      "abort_reason": "Test stopped",
+      "completion_time_s": 88.65000132098794,
+      "position_rmse_m": 0.6249257428501596,
+      "position_mae_m": 0.5495981502815986,
+      "max_position_error_m": 1.9265040786854097,
+      "p95_position_error_m": 1.0834834690165,
+      "mean_cross_track_error_m": 1.5192380390000104,
+      "max_cross_track_error_m": 2.9721737182240555,
+      "p95_cross_track_error_m": 2.1983541888389877,
+      "mean_heading_error_deg": 91.81773180363062,
+      "raw_gnss_rmse_m": 1.0580511068812057,
+      "raw_gnss_mae_m": 0.5696281174778394,
+      "kalman_rmse_m": 6.675184666208134,
+      "kalman_mae_m": 1.1823900177582747,
+      "no_filter_rmse_m": 0.6249257428501596,
+      "no_filter_mae_m": 0.5495981502815986
+    }
+  },
+  "comparison": {
+    "kalman_over_no_filter_rmse_ratio": 0.0423896723951671,
+    "kalman_over_no_filter_cross_track_ratio": 2.354028721230893,
+    "completion_time_s": {
+      "ground_truth": 12.600000187754631,
+      "kalman_filter": 17.650000263005495,
+      "no_filter": 88.65000132098794
+    },
+    "route_completion_success": {
+      "ground_truth": true,
+      "kalman_filter": true,
+      "no_filter": false
+    }
+  },
+  "plot_files": [
+    "plots\\trajectory_comparison.png",
+    "plots\\localization_error_over_time.png",
+    "plots\\cross_track_error_over_time.png",
+    "plots\\heading_error_over_time.png",
+    "plots\\summary_dashboard.png"
+  ]
+}

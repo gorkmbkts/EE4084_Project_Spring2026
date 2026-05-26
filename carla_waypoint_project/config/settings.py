@@ -156,6 +156,15 @@ class RouteInitializationSettings:
 
 
 @dataclass(frozen=True)
+class BenchmarkSettings:
+    max_pass_duration_s: float = 180.0
+    output_root: str = "logs/filter_tests"
+    generate_plots_on_completion: bool = True
+    collect_stabilization_samples: bool = True
+    route_completion_required: bool = True
+
+
+@dataclass(frozen=True)
 class AutonomousControlSettings:
     target_speed_mps: float = 4.8
     turn_speed_mps: float = 2.6 #TODO: tune this better 2.6->0.6
@@ -261,6 +270,7 @@ MANUAL_CONTROL = ManualControlSettings()
 ROUTE_PLANNER = RoutePlannerSettings()
 WAYPOINT_TRACKER = WaypointTrackerSettings()
 ROUTE_INITIALIZATION = RouteInitializationSettings()
+BENCHMARK = BenchmarkSettings()
 AUTONOMOUS_CONTROL = AutonomousControlSettings()
 LOCALIZATION = LocalizationSettings()
 DASHBOARD = DashboardSettings()

@@ -1,0 +1,23 @@
+{
+  "benchmark_id": "benchmark_20260524_200353_test_route_004",
+  "route_name": "test_route_004",
+  "sample_count": 4415,
+  "route_completion_success": true,
+  "route_aborted": false,
+  "timeout": false,
+  "abort_reason": null,
+  "completion_time_s": 220.70000328868628,
+  "kalman_rmse_m": 5.845961266066899,
+  "kalman_mae_m": 0.8140752687318292,
+  "kalman_max_error_m": 108.07926643589511,
+  "kalman_p95_error_m": 0.43425168546262066,
+  "raw_gnss_rmse_m": 0.9926288175908069,
+  "raw_gnss_mae_m": 0.5984088289887226,
+  "raw_gnss_max_error_m": 49.11252424873627,
+  "raw_gnss_p95_error_m": 1.1477934679805541,
+  "kalman_improvement_ratio": 0.16979736478114524,
+  "mean_cross_track_error_m": 0.5417601365282709,
+  "max_cross_track_error_m": 1.310382769596843,
+  "p95_cross_track_error_m": 0.9694455182583744,
+  "mean_heading_error_deg": 2.1910631762470327
+}

@@ -9,7 +9,7 @@ from typing import Optional
 
 import pygame
 
-from config.settings import ROUTE_INITIALIZATION, TOPDOWN_MAP
+from config.settings import BENCHMARK, ROUTE_INITIALIZATION, TOPDOWN_MAP
 from src.control.vehicle_controller import VehicleController
 from src.control.waypoint_tracker import TrackingStatus, WaypointTracker
 from src.core.carla_client import CarlaClientManager
@@ -157,13 +157,15 @@ class SimulationApp:
         self._test_runner = RouteTestRunner(
             world_map=world_map,
             route_store=self._test_route_store,
-            performance_logger=self._performance_logger,
             begin_route_callback=lambda start, goal: self._begin_route_initialization(
                 start_waypoint=start,
                 goal_waypoint=goal,
                 start_autonomous=True,
             ),
             reset_estimator_callback=self._reset_estimator,
+            plan_route_callback=self._planned_route_for_metadata,
+            weather_callback=self._weather_metadata,
+            vehicle_blueprint_callback=self._vehicle_blueprint_metadata,
         )
 
         if self.route_planner.planner_error:
@@ -212,6 +214,58 @@ class SimulationApp:
         self._control_panel.draw(self._display.surface)
         self._display.end_frame()
 
+    def _planned_route_for_metadata(
+        self,
+        start_waypoint: "carla.Waypoint",
+        goal_waypoint: "carla.Waypoint",
+    ) -> list["carla.Waypoint"]:
+        if self.route_planner is None:
+            return []
+        route = self.route_planner.generate_route(start_waypoint, goal_waypoint)
+        planned_route = list(route)
+        self.route_planner.clear_route()
+        self.waypoint_tracker.clear_route()
+        self._latest_tracking = self._empty_tracking_status()
+        return planned_route
+
+    def _weather_metadata(self) -> Optional[dict[str, object]]:
+        try:
+            weather = self._client_manager.world.get_weather()
+        except RuntimeError:
+            return None
+        keys = [
+            "cloudiness",
+            "precipitation",
+            "precipitation_deposits",
+            "wind_intensity",
+            "sun_azimuth_angle",
+            "sun_altitude_angle",
+            "fog_density",
+            "fog_distance",
+            "wetness",
+        ]
+        return {
+            key: getattr(weather, key)
+            for key in keys
+            if hasattr(weather, key)
+        }
+
+    def _vehicle_blueprint_metadata(self) -> Optional[str]:
+        if self._vehicle is None:
+            return None
+        return getattr(self._vehicle, "type_id", None)
+
+    def _benchmark_output_status(self) -> str:
+        runner = self._test_runner
+        if runner is None or runner.benchmark_folder is None:
+            return "Output: none"
+        return f"Output: {runner.benchmark_folder.name}"
+
+    def _active_performance_logger(self) -> FilterPerformanceLogger:
+        if self._test_runner is not None and self._test_runner.current_logger is not None:
+            return self._test_runner.current_logger
+        return self._performance_logger
+
     def _build_control_panel(self) -> None:
         assert self._control_panel is not None
         button_specs = [
@@ -239,6 +293,7 @@ class SimulationApp:
         assert self._control_panel is not None
         store = self._test_route_store
         runner = self._test_runner
+        logger = self._active_performance_logger()
         route_count = store.route_count() if store is not None else 0
         current_route = store.get_current_route() if store is not None else None
         test_active = runner.is_active if runner is not None else False
@@ -252,7 +307,10 @@ class SimulationApp:
         self._control_panel.set_button_state("Save A/B as Test Route", active=endpoints_ready)
         self._control_panel.set_button_state("Start Test Run", enabled=not test_active)
         self._control_panel.set_button_state("Stop Test Run", enabled=test_active, active=test_active)
-        self._control_panel.set_button_state("Save Test Report", enabled=bool(self._performance_logger.samples))
+        self._control_panel.set_button_state(
+            "Save Test Report",
+            enabled=bool(logger.samples) or (runner is not None and runner.benchmark_folder is not None),
+        )
 
         route_label = "none"
         if current_route is not None and store is not None:
@@ -265,15 +323,17 @@ class SimulationApp:
             ),
             f"A/B: {'READY' if endpoints_ready else 'not set'}  Saved: {route_count}",
             f"Selected: {route_label}",
+            f"Benchmark: {'ACTIVE' if test_active else 'inactive'}",
             runner.status_text if runner is not None else "Test idle",
             (
-                f"KF/GNSS: {self._format_optional_metric(self._performance_logger.current_position_error_m, 'm')} / "
-                f"{self._format_optional_metric(self._performance_logger.current_raw_gnss_error_m, 'm')}"
+                f"Err/GNSS: {self._format_optional_metric(logger.current_position_error_m, 'm')} / "
+                f"{self._format_optional_metric(logger.current_raw_gnss_error_m, 'm')}"
             ),
             (
-                f"CTE/RMSE: {self._format_optional_metric(self._performance_logger.current_cross_track_error_m, 'm')} / "
-                f"{self._format_optional_metric(self._performance_logger.running_rmse_m(), 'm')}"
+                f"CTE/RMSE: {self._format_optional_metric(logger.current_cross_track_error_m, 'm')} / "
+                f"{self._format_optional_metric(logger.running_rmse_m(), 'm')}"
             ),
+            self._benchmark_output_status(),
             self._control_status_text,
         ]
         self._control_panel.set_status_lines(status_lines)
@@ -328,11 +388,12 @@ class SimulationApp:
                     )
                     vehicle.apply_control(control)
                 elif self._drive_mode == DriveMode.AUTONOMOUS:
-                    if self._latest_estimated_state is None:
+                    control_state = self._state_for_tracking_and_control()
+                    if control_state is None:
                         control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
                     else:
                         control = self.autonomous_controller.compute_control(
-                            state=self._latest_estimated_state,
+                            state=control_state,
                             target_waypoint=self._latest_tracking.target_waypoint,
                             route_completed=self._latest_tracking.completed,
                         )
@@ -353,7 +414,7 @@ class SimulationApp:
             self.shutdown()
 
     def _state_for_tracking_and_control(self) -> Optional[EgoState]:
-        """Return GT in manual mode and estimated state in autonomous mode."""
+        """Return GT in manual mode and Kalman state in autonomous mode."""
         if self._drive_mode == DriveMode.AUTONOMOUS:
             return self._latest_estimated_state
         return self._latest_ground_truth_state
@@ -572,12 +633,25 @@ class SimulationApp:
         self._control_status_text = "Emergency brake"
 
     def _save_test_report(self) -> None:
-        if not self._performance_logger.samples:
+        if self._test_runner is not None and self._test_runner.benchmark_folder is not None:
+            try:
+                from src.evaluation.benchmark_plotter import generate_benchmark_plots
+
+                paths = generate_benchmark_plots(self._test_runner.benchmark_folder)
+                self._planner_status = f"Regenerated plots: {len(paths)} files"
+                self._control_status_text = self._planner_status
+            except Exception as exc:
+                self._planner_status = f"Plot generation failed: {exc}"
+                self._control_status_text = self._planner_status
+            return
+
+        logger = self._active_performance_logger()
+        if not logger.samples:
             self._planner_status = "No test samples to export"
             self._control_status_text = self._planner_status
             return
 
-        _csv_path, json_path = self._performance_logger.export()
+        _csv_path, json_path = logger.export()
         self._planner_status = f"Saved test report: {json_path.name}"
         self._control_status_text = self._planner_status
 
@@ -989,16 +1063,22 @@ class SimulationApp:
         runner = self._test_runner
         if runner is None or not runner.is_active:
             return
+        logger = runner.current_logger
+        if logger is None:
+            return
 
         route_name = runner.current_route_name or "test_route"
-        self._performance_logger.collect_sample(
-            route_name=route_name,
-            ground_truth_state=self._latest_ground_truth_state,
-            estimated_state=self._latest_estimated_state,
-            gnss_diagnostics=self._latest_gnss_diagnostics,
-            tracking=self._latest_tracking,
-            route_completed=self._latest_tracking.completed,
-        )
+        phase = self._benchmark_phase()
+        if BENCHMARK.collect_stabilization_samples or phase != "stabilization":
+            logger.collect_sample(
+                phase=phase,
+                route_name=route_name,
+                ground_truth_state=self._latest_ground_truth_state,
+                kalman_state=self._latest_estimated_state,
+                gnss_diagnostics=self._latest_gnss_diagnostics,
+                tracking=self._latest_tracking,
+                route_completed=self._latest_tracking.completed,
+            )
 
         route = self.route_planner.get_route() if self.route_planner is not None else []
         route_failed = (
@@ -1013,6 +1093,15 @@ class SimulationApp:
         if paths is not None:
             self._control_status_text = runner.status_text
             self._planner_status = runner.status_text
+
+    def _benchmark_phase(self) -> str:
+        if self._latest_tracking.completed:
+            return "completed"
+        if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
+            return "stabilization"
+        if self._route_activation_state == RouteActivationState.ROUTE_ACTIVE:
+            return "driving"
+        return "idle"
 
     def _update_sensor_diagnostics(self) -> None:
         gnss = self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None
@@ -1044,6 +1133,9 @@ class SimulationApp:
 
     def shutdown(self) -> None:
         """Destroy actors and close pygame resources."""
+        if self._test_runner is not None and self._test_runner.is_active:
+            self._test_runner.stop(aborted=True, reason="Application shutdown")
+
         if self._vehicle is not None:
             self._vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
 
