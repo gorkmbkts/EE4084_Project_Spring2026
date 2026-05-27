@@ -48,21 +48,41 @@ class GnssLocalProjector:
 
     def __init__(self, world_map: "carla.Map") -> None:
         self._world_map = world_map
-        self._origin_geo = world_map.transform_to_geolocation(carla.Location(x=0.0, y=0.0, z=0.0))
-        self._meters_per_degree_lon = METERS_PER_DEGREE_LAT * math.cos(math.radians(self._origin_geo.latitude))
+        self._origin_geo = None
+        self._meters_per_degree_lon = 0.0
+        self._basis_x = (0.0, 0.0)
+        self._basis_y = (0.0, 0.0)
+        self._determinant = 0.0
+        self._projection_error: Optional[str] = None
 
-        x_geo = world_map.transform_to_geolocation(carla.Location(x=1.0, y=0.0, z=0.0))
-        y_geo = world_map.transform_to_geolocation(carla.Location(x=0.0, y=1.0, z=0.0))
-        self._basis_x = self._geo_meter_delta(x_geo.latitude, x_geo.longitude)
-        self._basis_y = self._geo_meter_delta(y_geo.latitude, y_geo.longitude)
+        try:
+            self._origin_geo = world_map.transform_to_geolocation(carla.Location(x=0.0, y=0.0, z=0.0))
+            self._meters_per_degree_lon = METERS_PER_DEGREE_LAT * math.cos(math.radians(self._origin_geo.latitude))
 
-        self._determinant = (
-            self._basis_x[0] * self._basis_y[1] - self._basis_y[0] * self._basis_x[1]
-        )
+            x_geo = world_map.transform_to_geolocation(carla.Location(x=1.0, y=0.0, z=0.0))
+            y_geo = world_map.transform_to_geolocation(carla.Location(x=0.0, y=1.0, z=0.0))
+            self._basis_x = self._geo_meter_delta(x_geo.latitude, x_geo.longitude)
+            self._basis_y = self._geo_meter_delta(y_geo.latitude, y_geo.longitude)
+
+            self._determinant = (
+                self._basis_x[0] * self._basis_y[1] - self._basis_y[0] * self._basis_x[1]
+            )
+            if not math.isfinite(self._determinant) or abs(self._determinant) < 1.0e-9:
+                self._projection_error = "Invalid GNSS georeference basis"
+        except Exception as exc:
+            self._projection_error = f"GNSS georeference unavailable: {exc}"
+
+    @property
+    def available(self) -> bool:
+        return self._projection_error is None and self._origin_geo is not None
+
+    @property
+    def projection_error(self) -> Optional[str]:
+        return self._projection_error
 
     def project(self, gnss: Optional[GnssMeasurement]) -> Optional[LocalGnssMeasurement]:
         """Convert a raw GNSS reading to local map x/y/z coordinates."""
-        if gnss is None:
+        if gnss is None or not self.available or self._origin_geo is None:
             return None
 
         local_xy = self.to_local_xy(gnss.latitude, gnss.longitude)
@@ -84,7 +104,9 @@ class GnssLocalProjector:
 
     def to_local_xy(self, latitude: float, longitude: float) -> Optional[tuple[float, float]]:
         """Convert geodetic lat/lon to approximate CARLA local x/y meters."""
-        if abs(self._determinant) < 1.0e-9:
+        if not self.available:
+            return None
+        if not math.isfinite(self._determinant) or abs(self._determinant) < 1.0e-9:
             return None
 
         east_m, north_m = self._geo_meter_delta(latitude, longitude)
@@ -106,7 +128,10 @@ class GnssLocalProjector:
             return None
 
         gt_location = carla.Location(x=state.x, y=state.y, z=state.z)
-        gt_geo = self._world_map.transform_to_geolocation(gt_location)
+        try:
+            gt_geo = self._world_map.transform_to_geolocation(gt_location)
+        except Exception:
+            return None
         dx_m = local.x - state.x
         dy_m = local.y - state.y
         dz_m = gnss.altitude - float(gt_geo.altitude)
@@ -120,6 +145,8 @@ class GnssLocalProjector:
         )
 
     def _geo_meter_delta(self, latitude: float, longitude: float) -> tuple[float, float]:
+        if self._origin_geo is None:
+            return 0.0, 0.0
         east_m = (float(longitude) - float(self._origin_geo.longitude)) * self._meters_per_degree_lon
         north_m = (float(latitude) - float(self._origin_geo.latitude)) * METERS_PER_DEGREE_LAT
         return east_m, north_m

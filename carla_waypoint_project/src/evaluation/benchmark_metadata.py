@@ -15,6 +15,7 @@ from config.settings import (
 )
 from src.evaluation.test_route_store import SavedTestRoute
 from src.utils.carla_import import ensure_carla_import
+from src.utils.map_names import normalize_map_name
 
 carla = ensure_carla_import()
 
@@ -27,6 +28,8 @@ def build_benchmark_metadata(
     goal_waypoint: "carla.Waypoint",
     route_waypoints: Sequence["carla.Waypoint"],
     map_name: Optional[str],
+    selected_map_load_name: Optional[str] = None,
+    active_map_id: Optional[str] = None,
     weather: Optional[dict[str, object]] = None,
     vehicle_blueprint: Optional[str] = None,
     active_filter_info: Optional[dict[str, object]] = None,
@@ -43,6 +46,8 @@ def build_benchmark_metadata(
     active_filter_measurement_model = str(filter_info.get("measurement_model") or "n/a")
     active_filter_description = str(filter_info.get("description") or "")
     raw_gnss_note = "Raw noisy GNSS is logged as a localization baseline and is not the default closed-loop control filter."
+    normalized_active_map_id = active_map_id or normalize_map_name(map_name)
+    normalized_route_map_id = normalize_map_name(route.map_name)
     return {
         "active_filter_id": active_filter_id,
         "active_filter_name": active_filter_name,
@@ -69,6 +74,11 @@ def build_benchmark_metadata(
             "timestamp": timestamp,
             "route_name": route.name,
             "map_name": map_name,
+            "active_carla_map_name": map_name,
+            "normalized_active_map_id": normalized_active_map_id,
+            "selected_map_load_name": selected_map_load_name,
+            "route_map_name": route.map_name,
+            "normalized_route_map_id": normalized_route_map_id,
             "route_start": _location_dict(start_waypoint.transform.location),
             "route_goal": _location_dict(goal_waypoint.transform.location),
             "route_length_m": _route_length(route_waypoints),

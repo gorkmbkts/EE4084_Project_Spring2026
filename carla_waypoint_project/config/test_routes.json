@@ -60,6 +60,36 @@
       },
       "created_from": "2d_map",
       "map_name": "Carla/Maps/Town01_Opt"
+    },
+    {
+      "name": "test_route_005",
+      "start": {
+        "x": 141.94248962402344,
+        "y": 109.44686889648438,
+        "z": 0.0
+      },
+      "goal": {
+        "x": 189.71951293945312,
+        "y": 133.13552856445312,
+        "z": 0.0
+      },
+      "created_from": "2d_map",
+      "map_name": "Carla/Maps/Town02_Opt"
+    },
+    {
+      "name": "test_route_006",
+      "start": {
+        "x": 235.8753204345703,
+        "y": -311.1272888183594,
+        "z": 0.0043487548828125
+      },
+      "goal": {
+        "x": 333.1006164550781,
+        "y": -64.16131591796875,
+        "z": 0.0043487548828125
+      },
+      "created_from": "2d_map",
+      "map_name": "Carla/Maps/Town04_Opt"
     }
   ]
 }

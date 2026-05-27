@@ -15,6 +15,7 @@ from src.evaluation.benchmark_metadata import build_benchmark_metadata
 from src.evaluation.filter_performance import FilterPerformanceLogger
 from src.evaluation.test_route_store import SavedTestRoute, TestRouteStore
 from src.utils.carla_import import ensure_carla_import
+from src.utils.map_names import display_map_name, map_slug, normalize_map_name
 
 carla = ensure_carla_import()
 
@@ -33,6 +34,7 @@ class RouteTestRunner:
         vehicle_blueprint_callback: Callable[[], Optional[str]],
         active_filter_info_callback: Callable[[], dict[str, object]],
         active_filter_tune_callback: Callable[[], dict[str, object]],
+        selected_map_load_name: Optional[str] = None,
     ) -> None:
         self._world_map = world_map
         self._route_store = route_store
@@ -43,6 +45,7 @@ class RouteTestRunner:
         self._vehicle_blueprint_callback = vehicle_blueprint_callback
         self._active_filter_info_callback = active_filter_info_callback
         self._active_filter_tune_callback = active_filter_tune_callback
+        self._selected_map_load_name = selected_map_load_name
 
         self._active = False
         self._current_route: Optional[SavedTestRoute] = None
@@ -131,6 +134,15 @@ class RouteTestRunner:
         return True
 
     def _start_route(self, route: SavedTestRoute, route_index: int) -> bool:
+        active_map_name = getattr(self._world_map, "name", None)
+        if not self._route_store.route_is_compatible(route):
+            self._status_text = (
+                "Benchmark blocked: route map "
+                f"{display_map_name(route.map_name)} is incompatible with active map "
+                f"{display_map_name(active_map_name)}"
+            )
+            return False
+
         resolved = self._route_store.resolve_route_to_waypoints(self._world_map, route)
         if resolved is None:
             self._status_text = "Failed to resolve saved test route"
@@ -147,7 +159,7 @@ class RouteTestRunner:
         active_filter_info = self._active_filter_info_callback()
         active_filter_tune = self._active_filter_tune_callback()
         filter_slug = _slugify(str(active_filter_info.get("id") or "filter"))
-        benchmark_id = f"benchmark_{timestamp}_{route_slug}_{filter_slug}"
+        benchmark_id = f"benchmark_{timestamp}_{route_slug}_{map_slug(active_map_name)}_{filter_slug}"
         benchmark_folder = _unique_benchmark_folder(_benchmark_root(), benchmark_id)
         benchmark_id = benchmark_folder.name
         benchmark_folder.mkdir(parents=True, exist_ok=False)
@@ -160,7 +172,9 @@ class RouteTestRunner:
             start_waypoint=start_waypoint,
             goal_waypoint=goal_waypoint,
             route_waypoints=route_waypoints,
-            map_name=getattr(self._world_map, "name", route.map_name),
+            map_name=active_map_name,
+            selected_map_load_name=self._selected_map_load_name,
+            active_map_id=normalize_map_name(active_map_name),
             weather=self._weather_callback(),
             vehicle_blueprint=self._vehicle_blueprint_callback(),
             active_filter_info=active_filter_info,

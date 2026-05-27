@@ -6,6 +6,7 @@ import time
 from typing import Optional
 
 from config.settings import CARLA, SIMULATION
+from src.utils.map_names import display_map_name
 from src.utils.carla_import import ensure_carla_import
 
 carla = ensure_carla_import()
@@ -25,12 +26,14 @@ class CarlaClientManager:
         timeout_seconds: float = CARLA.timeout_seconds,
         connection_attempts: int = CARLA.connection_attempts,
         retry_delay_seconds: float = CARLA.retry_delay_seconds,
+        requested_map_name: Optional[str] = None,
     ) -> None:
         self._host = host
         self._port = port
         self._timeout_seconds = timeout_seconds
         self._connection_attempts = max(1, int(connection_attempts))
         self._retry_delay_seconds = max(0.0, float(retry_delay_seconds))
+        self._requested_map_name = requested_map_name
 
         self._client = None
         self._world = None
@@ -45,8 +48,13 @@ class CarlaClientManager:
         self._client = carla.Client(self._host, self._port)
         self._client.set_timeout(self._timeout_seconds)
 
-        self._world = self._get_world_with_retries()
+        if self._requested_map_name:
+            self._world = self._load_requested_world(self._requested_map_name)
+        else:
+            self._world = self._get_world_with_retries()
         try:
+            if self._world is None:
+                self._world = self._get_world_with_retries()
             self._world_map = self._world.get_map()
             self._blueprint_library = self._world.get_blueprint_library()
         except RuntimeError as exc:
@@ -56,6 +64,17 @@ class CarlaClientManager:
             enabled=SIMULATION.synchronous_mode,
             fixed_delta_seconds=SIMULATION.fixed_delta_seconds,
         )
+
+    def _load_requested_world(self, requested_map_name: str) -> "carla.World":
+        try:
+            world = self.client.load_world(requested_map_name)
+        except RuntimeError as exc:
+            raise CarlaConnectionError(
+                f"Failed to load CARLA map {display_map_name(requested_map_name)}: {exc}"
+            ) from exc
+        if world is None:
+            return self._get_world_with_retries()
+        return world
 
     def _get_world_with_retries(self) -> "carla.World":
         last_error: Optional[RuntimeError] = None

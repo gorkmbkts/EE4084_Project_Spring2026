@@ -42,6 +42,7 @@ from src.visualization.ui.status_bar import StatusBar
 from src.visualization.ui.tabbed_panel import TabbedPanel
 from src.visualization.waypoint_overlay import WaypointOverlayRenderer
 from src.utils.carla_import import ensure_carla_import
+from src.utils.map_names import display_map_name, normalize_map_name
 
 carla = ensure_carla_import()
 
@@ -64,9 +65,15 @@ class RouteActivationState(Enum):
 class SimulationApp:
     """Coordinate CARLA, sensors, display, route selection, and control."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        requested_map_name: Optional[str] = None,
+        selected_map_load_name: Optional[str] = None,
+    ) -> None:
         pygame.init()
-        self._client_manager = CarlaClientManager()
+        self._requested_map_name = requested_map_name
+        self._selected_map_load_name = selected_map_load_name or requested_map_name
+        self._client_manager = CarlaClientManager(requested_map_name=requested_map_name)
         self._clock = SimulationClock()
         self._display: Optional[PygameDisplay] = None
         self._control_panel: Optional[TabbedPanel] = None
@@ -108,6 +115,8 @@ class SimulationApp:
         self._latest_gnss_diagnostics: Optional[GnssDiagnostics] = None
         self._latest_gnss_frame: Optional[int] = None
         self._gnss_trail_xy: deque[tuple[float, float]] = deque(maxlen=TOPDOWN_MAP.gnss_trail_length)
+        self._active_map_name: Optional[str] = None
+        self._active_map_id: Optional[str] = None
         self._route_activation_state = RouteActivationState.IDLE
         self._pending_start_waypoint: Optional["carla.Waypoint"] = None
         self._pending_goal_waypoint: Optional["carla.Waypoint"] = None
@@ -123,6 +132,9 @@ class SimulationApp:
     def _setup(self) -> None:
         """Initialize CARLA world, vehicle, sensors, route tools, and visualization."""
         self._client_manager.connect()
+
+        self._active_map_name = getattr(self._client_manager.world_map, "name", None)
+        self._active_map_id = normalize_map_name(self._active_map_name)
 
         self._vehicle_manager = VehicleManager(
             world=self._client_manager.world,
@@ -153,7 +165,7 @@ class SimulationApp:
         self._map_selector = MapSelector(world_map=world_map)
         self.route_planner = RoutePlanner(world_map=world_map)
         self._topdown_renderer = TopDownMapRenderer(world_map=world_map)
-        self._test_route_store = TestRouteStore(map_name=getattr(world_map, "name", None))
+        self._test_route_store = TestRouteStore(map_name=self._active_map_name)
         self._test_runner = RouteTestRunner(
             world_map=world_map,
             route_store=self._test_route_store,
@@ -168,6 +180,7 @@ class SimulationApp:
             vehicle_blueprint_callback=self._vehicle_blueprint_metadata,
             active_filter_info_callback=self._active_filter_info_for_metadata,
             active_filter_tune_callback=self._active_filter_tune_for_metadata,
+            selected_map_load_name=self._selected_map_load_name,
         )
 
         if self.route_planner.planner_error:
@@ -406,21 +419,28 @@ class SimulationApp:
     def _route_tab_lines(self) -> list[str]:
         store = self._test_route_store
         route_count = store.route_count() if store is not None else 0
+        other_map_count = store.other_map_route_count() if store is not None else 0
         endpoints_ready = self._map_selector is not None and self._map_selector.endpoints is not None
         route = self.route_planner.get_route() if self.route_planner is not None else []
-        return [
+        lines = [
             "Route:",
+            f"Active map: {self._active_map_display_name()}",
             f"Mode: {self._drive_mode.value}",
             f"Map select: {'ON' if self._map_selection_active else 'OFF'}",
             f"Test route mode: {'ON' if self._test_route_authoring_active else 'OFF'}",
             f"A/B selection: {'READY' if endpoints_ready else 'not set'}",
-            f"Saved routes: {route_count}",
+            f"Compatible saved routes: {route_count}",
             f"Selected route: {self._selected_route_label()}",
             f"Active route waypoints: {len(route)}",
             f"Route activation: {self._route_activation_state.value}",
             self._planner_status,
             self._control_status_text,
         ]
+        if other_map_count > 0:
+            lines.insert(7, "Other-map routes hidden")
+        if route_count == 0:
+            lines.insert(7, "No saved routes for this map")
+        return lines
 
     def _filters_tab_lines(self) -> list[str]:
         manager = self._filter_manager
@@ -465,6 +485,7 @@ class SimulationApp:
         ratio = self._ratio(logger.current_raw_gnss_error_m, logger.current_position_error_m)
         lines = [
             "Benchmark:",
+            f"Active map: {self._active_map_display_name()}",
             f"State: {'ACTIVE' if runner is not None and runner.is_active else 'inactive'}",
             runner.status_text if runner is not None else "Benchmark idle",
             f"Output folder: {runner.benchmark_folder.name if runner is not None and runner.benchmark_folder is not None else 'none'}",
@@ -507,6 +528,8 @@ class SimulationApp:
                 diag = self._latest_gnss_diagnostics
                 lines.append(f"GNSS local x/y: {diag.local_x:.2f}, {diag.local_y:.2f}")
                 lines.append(f"Raw GNSS error: {diag.horizontal_error_m:.2f} m")
+            elif self._gnss_projector is not None and self._gnss_projector.projection_error:
+                lines.append(self._gnss_projector.projection_error)
         if imu is None:
             lines.append("IMU: waiting")
         else:
@@ -563,6 +586,7 @@ class SimulationApp:
         return (
             f"MODE {self._drive_mode.value} | "
             f"FILTER {self._active_filter_name()} | "
+            f"WORLD {self._active_map_display_name()} | "
             f"MAP {'ON' if self._map_selection_active else 'OFF'} | "
             f"ROUTE {self._selected_route_label()} | "
             f"ERR {self._format_optional_metric(logger.current_position_error_m, 'm')} | "
@@ -585,6 +609,9 @@ class SimulationApp:
         if self._filter_manager is None:
             return "none"
         return self._filter_manager.get_active_filter_name()
+
+    def _active_map_display_name(self) -> str:
+        return display_map_name(self._active_map_name)
 
     def _active_filter_safe_for_autonomous(self) -> bool:
         if self._filter_manager is None:
@@ -826,6 +853,10 @@ class SimulationApp:
             self._planner_status = "No saved test routes"
             self._control_status_text = self._planner_status
             return
+        if not self._test_route_store.route_is_compatible(route):
+            self._planner_status = "Saved route blocked: wrong map"
+            self._control_status_text = self._planner_status
+            return
 
         resolved = self._test_route_store.resolve_route_to_waypoints(
             self._client_manager.world_map,
@@ -856,6 +887,10 @@ class SimulationApp:
         route = self._test_route_store.get_current_route()
         if route is None:
             self._planner_status = "Select or create a test route first"
+            self._control_status_text = self._planner_status
+            return
+        if not self._test_route_store.route_is_compatible(route):
+            self._planner_status = "Benchmark blocked: selected route is for another map"
             self._control_status_text = self._planner_status
             return
 

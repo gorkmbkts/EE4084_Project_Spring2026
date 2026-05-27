@@ -9,6 +9,7 @@ from typing import Optional
 
 from src.planning.map_selector import RouteEndpoints
 from src.utils.carla_import import ensure_carla_import
+from src.utils.map_names import display_map_name, maps_compatible, normalize_map_name
 
 carla = ensure_carla_import()
 
@@ -87,6 +88,8 @@ class TestRouteStore:
         project_root = Path(__file__).resolve().parents[2]
         self._path = path if path is not None else project_root / "config" / "test_routes.json"
         self._map_name = map_name
+        self._file_map_name: Optional[str] = None
+        self._all_routes: list[SavedTestRoute] = []
         self._routes: list[SavedTestRoute] = []
         self._current_index = 0
         self.load_routes()
@@ -100,17 +103,42 @@ class TestRouteStore:
         return tuple(self._routes)
 
     @property
+    def all_routes(self) -> tuple[SavedTestRoute, ...]:
+        return tuple(self._all_routes)
+
+    @property
+    def active_map_name(self) -> Optional[str]:
+        return self._map_name
+
+    @property
+    def active_map_id(self) -> Optional[str]:
+        return normalize_map_name(self._map_name)
+
+    @property
     def current_index(self) -> int:
         return self._current_index
 
     def route_count(self) -> int:
         return len(self._routes)
 
+    def all_route_count(self) -> int:
+        return len(self._all_routes)
+
+    def other_map_route_count(self) -> int:
+        return max(0, len(self._all_routes) - len(self._routes))
+
     def has_routes(self) -> bool:
         return bool(self._routes)
 
+    def route_is_compatible(self, route: SavedTestRoute) -> bool:
+        return maps_compatible(self._map_name, route.map_name)
+
+    def active_map_display_name(self) -> str:
+        return display_map_name(self._map_name)
+
     def load_routes(self) -> tuple[SavedTestRoute, ...]:
         if not self._path.exists():
+            self._all_routes = []
             self._routes = []
             self._current_index = 0
             return self.routes
@@ -118,13 +146,16 @@ class TestRouteStore:
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            self._all_routes = []
             self._routes = []
             self._current_index = 0
             return self.routes
 
         top_level_map_name = data.get("map_name") if isinstance(data, dict) else None
+        self._file_map_name = str(top_level_map_name) if top_level_map_name else None
         if self._map_name is None and top_level_map_name:
             self._map_name = str(top_level_map_name)
+        fallback_route_map_name = str(top_level_map_name) if top_level_map_name else self._map_name
 
         loaded: list[SavedTestRoute] = []
         raw_routes = data.get("routes", []) if isinstance(data, dict) else []
@@ -133,19 +164,20 @@ class TestRouteStore:
                 if not isinstance(raw_route, dict):
                     continue
                 try:
-                    loaded.append(SavedTestRoute.from_dict(raw_route, self._map_name))
+                    loaded.append(SavedTestRoute.from_dict(raw_route, fallback_route_map_name))
                 except (KeyError, TypeError, ValueError):
                     continue
 
-        self._routes = loaded
+        self._all_routes = loaded
+        self._routes = self._compatible_routes(loaded)
         self._current_index = min(self._current_index, max(0, len(self._routes) - 1))
         return self.routes
 
     def save_routes(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = {
-            "map_name": self._map_name,
-            "routes": [route.to_dict() for route in self._routes],
+            "map_name": self._file_map_name or self._map_name,
+            "routes": [route.to_dict() for route in self._all_routes],
         }
         self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -162,15 +194,21 @@ class TestRouteStore:
             map_name=self._map_name,
             created_from="2d_map",
         )
-        self._routes.append(route)
-        self._current_index = len(self._routes) - 1
+        self._all_routes.append(route)
+        self._routes = self._compatible_routes(self._all_routes)
+        self._current_index = max(0, len(self._routes) - 1)
         self.save_routes()
         return route
 
     def delete_route(self, index: int) -> bool:
         if index < 0 or index >= len(self._routes):
             return False
-        del self._routes[index]
+        route = self._routes[index]
+        try:
+            self._all_routes.remove(route)
+        except ValueError:
+            return False
+        self._routes = self._compatible_routes(self._all_routes)
         self._current_index = min(self._current_index, max(0, len(self._routes) - 1))
         self.save_routes()
         return True
@@ -194,13 +232,18 @@ class TestRouteStore:
         return self._routes[self._current_index]
 
     def next_route_name(self) -> str:
-        existing = {route.name for route in self._routes}
+        existing = {route.name for route in self._all_routes}
         index = 1
         while True:
             candidate = f"test_route_{index:03d}"
             if candidate not in existing:
                 return candidate
             index += 1
+
+    def _compatible_routes(self, routes: list[SavedTestRoute]) -> list[SavedTestRoute]:
+        if self._map_name is None:
+            return list(routes)
+        return [route for route in routes if self.route_is_compatible(route)]
 
     @staticmethod
     def resolve_route_to_waypoints(
@@ -224,4 +267,3 @@ class TestRouteStore:
         if start_waypoint is None or goal_waypoint is None:
             return None
         return start_waypoint, goal_waypoint
-

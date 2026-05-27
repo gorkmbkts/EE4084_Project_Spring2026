@@ -15,6 +15,11 @@ class CarlaSettings:
     timeout_seconds: float = 20.0
     connection_attempts: int = 3
     retry_delay_seconds: float = 2.0
+    executable_path: str | None = None
+    auto_launch: bool = True
+    launch_timeout_seconds: float = 90.0
+    shutdown_launched_server_on_exit: bool = False
+    startup_quality_level: str | None = "Low"
 
 
 @dataclass(frozen=True)
