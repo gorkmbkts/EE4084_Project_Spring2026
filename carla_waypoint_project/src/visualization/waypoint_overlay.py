@@ -69,6 +69,7 @@ def draw_waypoints_on_image(
     target_waypoint: Optional["carla.Waypoint"] = None,
     intrinsics_cache: Optional[IntrinsicsCache] = None,
     surface_offset: tuple[int, int] = (0, 0),
+    camera_content_rect: Optional[pygame.Rect] = None,
 ) -> None:
     """Draw projected waypoints on top of camera image."""
     _ = vehicle  # Vehicle kept in signature for future camera/pose-dependent extensions.
@@ -86,6 +87,17 @@ def draw_waypoints_on_image(
 
     camera_intrinsics, image_w, image_h = cached_intrinsics
     world_to_camera = world_to_camera_matrix(camera.get_transform())
+    scale_x = camera_content_rect.width / image_w if camera_content_rect is not None else 1.0
+    scale_y = camera_content_rect.height / image_h if camera_content_rect is not None else 1.0
+    draw_offset = (
+        camera_content_rect.left,
+        camera_content_rect.top,
+    ) if camera_content_rect is not None else surface_offset
+    radius_scale = max(0.75, min(scale_x, scale_y))
+
+    old_clip = surface.get_clip()
+    if camera_content_rect is not None:
+        surface.set_clip(camera_content_rect)
 
     for waypoint in waypoints:
         point = with_height_offset(waypoint.transform.location, WAYPOINT.height_offset_m)
@@ -98,8 +110,8 @@ def draw_waypoints_on_image(
             pygame.draw.circle(
                 surface,
                 WAYPOINT.full_path_color,
-                (u + surface_offset[0], v + surface_offset[1]),
-                WAYPOINT.full_path_radius_px,
+                (int(draw_offset[0] + u * scale_x), int(draw_offset[1] + v * scale_y)),
+                max(1, int(WAYPOINT.full_path_radius_px * radius_scale)),
             )
 
     if target_waypoint is None:
@@ -109,6 +121,8 @@ def draw_waypoints_on_image(
     target_point = with_height_offset(target_waypoint.transform.location, WAYPOINT.height_offset_m)
     target_pixel = project_world_to_image(target_point, world_to_camera, camera_intrinsics)
     if target_pixel is None:
+        if camera_content_rect is not None:
+            surface.set_clip(old_clip)
         return
 
     target_u, target_v, _ = target_pixel
@@ -116,9 +130,11 @@ def draw_waypoints_on_image(
         pygame.draw.circle(
             surface,
             WAYPOINT.target_color,
-            (target_u + surface_offset[0], target_v + surface_offset[1]),
-            WAYPOINT.target_radius_px,
+            (int(draw_offset[0] + target_u * scale_x), int(draw_offset[1] + target_v * scale_y)),
+            max(1, int(WAYPOINT.target_radius_px * radius_scale)),
         )
+    if camera_content_rect is not None:
+        surface.set_clip(old_clip)
 
 
 class WaypointOverlayRenderer:
@@ -135,6 +151,7 @@ class WaypointOverlayRenderer:
         vehicle: "carla.Vehicle",
         target_waypoint: Optional["carla.Waypoint"] = None,
         surface_offset: tuple[int, int] = (0, 0),
+        camera_content_rect: Optional[pygame.Rect] = None,
     ) -> None:
         draw_waypoints_on_image(
             surface=surface,
@@ -144,4 +161,5 @@ class WaypointOverlayRenderer:
             target_waypoint=target_waypoint,
             intrinsics_cache=self._intrinsics_cache,
             surface_offset=surface_offset,
+            camera_content_rect=camera_content_rect,
         )

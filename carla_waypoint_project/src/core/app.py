@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections import deque
 from enum import Enum
+import math
 import time
 from typing import Optional
 
 import pygame
 
 from config.settings import BENCHMARK, ROUTE_INITIALIZATION, TOPDOWN_MAP
+from src.KalmanLab.filter_manager import FilterManager
 from src.control.vehicle_controller import VehicleController
 from src.control.waypoint_tracker import TrackingStatus, WaypointTracker
 from src.core.carla_client import CarlaClientManager
@@ -20,9 +22,7 @@ from src.evaluation.test_route_store import TestRouteStore
 from src.localization.gnss_projection import GnssDiagnostics, GnssLocalProjector
 from src.localization.state_estimator import (
     EgoState,
-    EstimatedStateProvider,
     GroundTruthStateProvider,
-    KalmanStateEstimator,
     LocalizationStatus,
 )
 from src.planning.map_selector import MapSelector
@@ -37,9 +37,9 @@ from src.vehicle.manual_controller import ManualController
 from src.vehicle.vehicle_manager import VehicleManager
 from src.visualization.lidar_panel import LidarPanelRenderer
 from src.visualization.pygame_display import PygameDisplay
-from src.visualization.sensor_panel import SensorPanelData, SensorPanelRenderer
 from src.visualization.topdown_map import TopDownHudData, TopDownMapRenderer
-from src.visualization.ui.control_panel import ControlPanel
+from src.visualization.ui.status_bar import StatusBar
+from src.visualization.ui.tabbed_panel import TabbedPanel
 from src.visualization.waypoint_overlay import WaypointOverlayRenderer
 from src.utils.carla_import import ensure_carla_import
 
@@ -69,7 +69,7 @@ class SimulationApp:
         self._client_manager = CarlaClientManager()
         self._clock = SimulationClock()
         self._display: Optional[PygameDisplay] = None
-        self._control_panel: Optional[ControlPanel] = None
+        self._control_panel: Optional[TabbedPanel] = None
 
         self._vehicle_manager: Optional[VehicleManager] = None
         self._sensor_manager: Optional[SensorManager] = None
@@ -83,9 +83,9 @@ class SimulationApp:
 
         self._overlay_renderer = WaypointOverlayRenderer()
         self._lidar_renderer = LidarPanelRenderer()
-        self._sensor_panel_renderer = SensorPanelRenderer()
+        self._status_bar = StatusBar()
         self._ground_truth_provider: Optional[GroundTruthStateProvider] = None
-        self._estimated_state_provider: Optional[EstimatedStateProvider] = None
+        self._filter_manager: Optional[FilterManager] = None
         self._gnss_projector: Optional[GnssLocalProjector] = None
         self._map_selector: Optional[MapSelector] = None
         self._topdown_renderer: Optional[TopDownMapRenderer] = None
@@ -145,8 +145,8 @@ class SimulationApp:
         self._manual_controller = ManualController(vehicle=self._vehicle)
         self._ground_truth_provider = GroundTruthStateProvider(vehicle=self._vehicle)
         self._gnss_projector = GnssLocalProjector(world_map=world_map)
-        self._estimated_state_provider = EstimatedStateProvider(
-            estimator=KalmanStateEstimator(gnss_projector=self._gnss_projector),
+        self._filter_manager = FilterManager(
+            gnss_projector=self._gnss_projector,
             gnss_sensor=self._gnss_sensor,
             imu_sensor=self._imu_sensor,
         )
@@ -166,6 +166,8 @@ class SimulationApp:
             plan_route_callback=self._planned_route_for_metadata,
             weather_callback=self._weather_metadata,
             vehicle_blueprint_callback=self._vehicle_blueprint_metadata,
+            active_filter_info_callback=self._active_filter_info_for_metadata,
+            active_filter_tune_callback=self._active_filter_tune_for_metadata,
         )
 
         if self.route_planner.planner_error:
@@ -187,7 +189,7 @@ class SimulationApp:
             "waypoint manager": self._waypoint_manager,
             "manual controller": self._manual_controller,
             "ground-truth provider": self._ground_truth_provider,
-            "estimated-state provider": self._estimated_state_provider,
+            "filter manager": self._filter_manager,
             "GNSS projector": self._gnss_projector,
             "map selector": self._map_selector,
             "route planner": self.route_planner,
@@ -201,7 +203,10 @@ class SimulationApp:
 
     def _initialize_display(self) -> None:
         self._display = PygameDisplay()
-        self._control_panel = ControlPanel(self._display.control_panel_rect)
+        self._control_panel = TabbedPanel(
+            self._display.control_panel_rect,
+            tabs=("Route", "Filters", "Benchmark", "Sensors", "Debug"),
+        )
         self._build_control_panel()
         self._control_status_text = "Dashboard ready"
         self._draw_startup_frame()
@@ -212,6 +217,7 @@ class SimulationApp:
         self._display.begin_frame(None)
         self._update_control_panel_state()
         self._control_panel.draw(self._display.surface)
+        self._draw_status_bar()
         self._display.end_frame()
 
     def _planned_route_for_metadata(
@@ -255,6 +261,16 @@ class SimulationApp:
             return None
         return getattr(self._vehicle, "type_id", None)
 
+    def _active_filter_info_for_metadata(self) -> dict[str, object]:
+        if self._filter_manager is None:
+            return {}
+        return self._filter_manager.get_active_filter_info()
+
+    def _active_filter_tune_for_metadata(self) -> dict[str, object]:
+        if self._filter_manager is None:
+            return {}
+        return self._filter_manager.get_active_filter_tune()
+
     def _benchmark_output_status(self) -> str:
         runner = self._test_runner
         if runner is None or runner.benchmark_folder is None:
@@ -268,25 +284,38 @@ class SimulationApp:
 
     def _build_control_panel(self) -> None:
         assert self._control_panel is not None
-        button_specs = [
-            ("Manual Mode", self._set_manual_mode),
-            ("Autonomous Mode", self._try_enable_autonomous_mode),
+        for label, callback in (
             ("Map Select ON/OFF", self._toggle_map_selection),
             ("Test Route Mode ON/OFF", self._toggle_test_route_authoring),
             ("Save A/B as Test Route", self._save_current_ab_as_test_route),
             ("Previous Test Route", self._select_previous_test_route),
             ("Next Test Route", self._select_next_test_route),
             ("Load Selected Test Route", self._load_selected_test_route),
-            ("Start Test Run", self._start_test_run),
-            ("Stop Test Run", self._stop_test_run),
             ("Reset Selection", self._reset_selection_and_route),
             ("Clear Route", self._clear_route),
-            ("Reset Estimator", self._reset_estimator),
+            ("Manual Mode", self._set_manual_mode),
+            ("Autonomous Mode", self._try_enable_autonomous_mode),
             ("Emergency Brake", self._emergency_brake),
+        ):
+            self._control_panel.add_button("Route", label, callback)
+
+        if self._filter_manager is not None:
+            for record in self._filter_manager.available_filters():
+                self._control_panel.add_button(
+                    "Filters",
+                    record.display_name,
+                    lambda filter_id=record.filter_id: self._select_filter(filter_id),
+                )
+
+        for label, callback in (
+            ("Start Test Run", self._start_test_run),
+            ("Stop Test Run", self._stop_test_run),
             ("Save Test Report", self._save_test_report),
-        ]
-        for label, callback in button_specs:
-            self._control_panel.add_button(label, callback)
+            ("Regenerate Plots", self._regenerate_plots),
+        ):
+            self._control_panel.add_button("Benchmark", label, callback)
+
+        self._control_panel.add_button("Debug", "Reset Estimator", self._reset_estimator)
 
     def _update_control_panel_state(self) -> None:
         assert self._display is not None
@@ -294,10 +323,13 @@ class SimulationApp:
         store = self._test_route_store
         runner = self._test_runner
         logger = self._active_performance_logger()
-        route_count = store.route_count() if store is not None else 0
-        current_route = store.get_current_route() if store is not None else None
         test_active = runner.is_active if runner is not None else False
         endpoints_ready = self._map_selector is not None and self._map_selector.endpoints is not None
+        filter_switch_enabled = (
+            not test_active
+            and self._drive_mode == DriveMode.MANUAL
+            and self._route_activation_state != RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY
+        )
 
         self._control_panel.set_rect(self._display.control_panel_rect)
         self._control_panel.set_button_state("Manual Mode", active=self._drive_mode == DriveMode.MANUAL)
@@ -305,38 +337,282 @@ class SimulationApp:
         self._control_panel.set_button_state("Map Select ON/OFF", active=self._map_selection_active)
         self._control_panel.set_button_state("Test Route Mode ON/OFF", active=self._test_route_authoring_active)
         self._control_panel.set_button_state("Save A/B as Test Route", active=endpoints_ready)
-        self._control_panel.set_button_state("Start Test Run", enabled=not test_active)
+        self._control_panel.set_button_state(
+            "Start Test Run",
+            enabled=not test_active and self._active_filter_safe_for_autonomous(),
+        )
         self._control_panel.set_button_state("Stop Test Run", enabled=test_active, active=test_active)
         self._control_panel.set_button_state(
             "Save Test Report",
             enabled=bool(logger.samples) or (runner is not None and runner.benchmark_folder is not None),
         )
+        self._control_panel.set_button_state(
+            "Regenerate Plots",
+            enabled=runner is not None and runner.benchmark_folder is not None,
+        )
 
-        route_label = "none"
-        if current_route is not None and store is not None:
-            route_label = f"{store.current_index + 1}/{route_count} {current_route.name}"
+        if self._filter_manager is not None:
+            active_id = self._filter_manager.active_filter_id
+            for record in self._filter_manager.available_filters():
+                self._control_panel.set_button_state(
+                    record.display_name,
+                    enabled=filter_switch_enabled or record.filter_id == active_id,
+                    active=record.filter_id == active_id,
+                )
 
-        status_lines = [
-            (
-                f"Map: {'ON' if self._map_selection_active else 'OFF'}  "
-                f"Author: {'ON' if self._test_route_authoring_active else 'OFF'}"
-            ),
-            f"A/B: {'READY' if endpoints_ready else 'not set'}  Saved: {route_count}",
-            f"Selected: {route_label}",
-            f"Benchmark: {'ACTIVE' if test_active else 'inactive'}",
-            runner.status_text if runner is not None else "Test idle",
-            (
-                f"Err/GNSS: {self._format_optional_metric(logger.current_position_error_m, 'm')} / "
-                f"{self._format_optional_metric(logger.current_raw_gnss_error_m, 'm')}"
-            ),
-            (
-                f"CTE/RMSE: {self._format_optional_metric(logger.current_cross_track_error_m, 'm')} / "
-                f"{self._format_optional_metric(logger.running_rmse_m(), 'm')}"
-            ),
-            self._benchmark_output_status(),
+        active_tab = self._control_panel.active_tab
+        if active_tab == "Route":
+            self._control_panel.set_text_lines("Route", self._route_tab_lines())
+        elif active_tab == "Filters":
+            self._control_panel.set_text_lines("Filters", self._filters_tab_lines())
+        elif active_tab == "Benchmark":
+            self._control_panel.set_text_lines("Benchmark", self._benchmark_tab_lines())
+        elif active_tab == "Sensors":
+            self._control_panel.set_text_lines("Sensors", self._sensors_tab_lines())
+        elif active_tab == "Debug":
+            self._control_panel.set_text_lines("Debug", self._debug_tab_lines())
+
+        self._status_bar.set_text(self._status_bar_text())
+
+    def _select_filter(self, filter_id: str) -> None:
+        if self._filter_manager is None:
+            self._control_status_text = "Filter manager unavailable"
+            return
+        if self._test_runner is not None and self._test_runner.is_active:
+            self._control_status_text = "Filter switching blocked during active benchmark"
+            self._planner_status = self._control_status_text
+            return
+        if self._drive_mode == DriveMode.AUTONOMOUS:
+            self._control_status_text = "Filter switching blocked during autonomous driving"
+            self._planner_status = self._control_status_text
+            return
+        if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
+            self._control_status_text = "Filter switching blocked during route initialization"
+            self._planner_status = self._control_status_text
+            return
+
+        ok, message = self._filter_manager.switch_filter(filter_id, skip_current_sensor_frames=True)
+        self._latest_estimated_state = None
+        self._latest_localization_status = None
+        self._latest_gnss_diagnostics = None
+        self._latest_gnss_frame = None
+        self._gnss_trail_xy.clear()
+        warning = self._active_filter_warning()
+        self._planner_status = message
+        self._control_status_text = warning or message
+        if not ok:
+            self._planner_status = message
+
+    def _route_tab_lines(self) -> list[str]:
+        store = self._test_route_store
+        route_count = store.route_count() if store is not None else 0
+        endpoints_ready = self._map_selector is not None and self._map_selector.endpoints is not None
+        route = self.route_planner.get_route() if self.route_planner is not None else []
+        return [
+            "Route:",
+            f"Mode: {self._drive_mode.value}",
+            f"Map select: {'ON' if self._map_selection_active else 'OFF'}",
+            f"Test route mode: {'ON' if self._test_route_authoring_active else 'OFF'}",
+            f"A/B selection: {'READY' if endpoints_ready else 'not set'}",
+            f"Saved routes: {route_count}",
+            f"Selected route: {self._selected_route_label()}",
+            f"Active route waypoints: {len(route)}",
+            f"Route activation: {self._route_activation_state.value}",
+            self._planner_status,
             self._control_status_text,
         ]
-        self._control_panel.set_status_lines(status_lines)
+
+    def _filters_tab_lines(self) -> list[str]:
+        manager = self._filter_manager
+        if manager is None:
+            return ["Filters:", "Filter manager unavailable"]
+        info = manager.get_active_filter_info()
+        tune = manager.get_active_filter_tune()
+        lines = [
+            "Filters:",
+            f"Active: {info.get('name', 'none')} ({info.get('id', 'n/a')})",
+            f"Type: {info.get('type', 'n/a')}",
+            f"Safe for autonomous: {'YES' if info.get('safe_for_autonomous_control', True) else 'NO'}",
+        ]
+        warning = self._active_filter_warning()
+        if warning:
+            lines.append(f"Warning: {warning}")
+        lines.extend(
+            [
+                f"State: {info.get('state_vector', 'n/a')}",
+                f"Process: {info.get('process_model', 'n/a')}",
+                f"Measurement: {info.get('measurement_model', 'n/a')}",
+                f"Description: {info.get('description', 'n/a')}",
+                "TUNE:",
+            ]
+        )
+        for key, value in tune.items():
+            lines.append(f"{key}: {value}")
+
+        invalid = manager.invalid_filters(include_templates=False)
+        if invalid:
+            lines.append("Invalid plugins:")
+            for record in invalid:
+                lines.append(f"{record.file_path.name}: {record.error}")
+        templates = [record for record in manager.all_records() if record.template]
+        for record in templates:
+            lines.append(f"Template: {record.file_path.name}")
+        return lines
+
+    def _benchmark_tab_lines(self) -> list[str]:
+        runner = self._test_runner
+        logger = self._active_performance_logger()
+        ratio = self._ratio(logger.current_raw_gnss_error_m, logger.current_position_error_m)
+        lines = [
+            "Benchmark:",
+            f"State: {'ACTIVE' if runner is not None and runner.is_active else 'inactive'}",
+            runner.status_text if runner is not None else "Benchmark idle",
+            f"Output folder: {runner.benchmark_folder.name if runner is not None and runner.benchmark_folder is not None else 'none'}",
+            f"Filtered error: {self._format_optional_metric(logger.current_position_error_m, 'm')}",
+            f"Raw GNSS error: {self._format_optional_metric(logger.current_raw_gnss_error_m, 'm')}",
+            f"Improvement ratio: {self._format_optional_metric(ratio, 'x')}",
+            f"Cross-track error: {self._format_optional_metric(logger.current_cross_track_error_m, 'm')}",
+            f"Running RMSE: {self._format_optional_metric(logger.running_rmse_m(), 'm')}",
+            f"Completion: {'YES' if self._latest_tracking.completed else 'NO'}",
+        ]
+        if not self._active_filter_safe_for_autonomous():
+            lines.append("Warning: active filter is unsafe for autonomous benchmark control")
+        return lines
+
+    def _sensors_tab_lines(self) -> list[str]:
+        gnss = self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None
+        imu = self._imu_sensor.get_latest_measurement() if self._imu_sensor is not None else None
+        lidar = self._lidar_sensor.get_latest_measurement() if self._lidar_sensor is not None else None
+        status = self._latest_localization_status
+        lines = [
+            "Sensors:",
+            self._client_manager.sync_status,
+            f"Fixed dt: {self._client_manager.fixed_delta_seconds:.3f}s",
+            f"Pygame dt: {self._clock.last_frame_dt_seconds:.3f}s",
+            f"Localization: {status.filter_name if status is not None else 'waiting'}",
+            f"Initialized: {'YES' if status is not None and status.initialized else 'NO'}",
+            f"Position error: {self._format_optional_metric(status.position_error_m if status else None, 'm')}",
+        ]
+        if gnss is None:
+            lines.append("GNSS: waiting")
+        else:
+            lines.extend(
+                [
+                    f"GNSS frame: {gnss.frame}",
+                    f"Lat/Lon: {gnss.latitude:.8f}, {gnss.longitude:.8f}",
+                    f"Alt: {gnss.altitude:.2f} m",
+                ]
+            )
+            if self._latest_gnss_diagnostics is not None:
+                diag = self._latest_gnss_diagnostics
+                lines.append(f"GNSS local x/y: {diag.local_x:.2f}, {diag.local_y:.2f}")
+                lines.append(f"Raw GNSS error: {diag.horizontal_error_m:.2f} m")
+        if imu is None:
+            lines.append("IMU: waiting")
+        else:
+            ax, ay, az = imu.accelerometer
+            gx, gy, gz = imu.gyroscope
+            lines.extend(
+                [
+                    f"IMU frame: {imu.frame}",
+                    f"Accel: {ax:+.2f}, {ay:+.2f}, {az:+.2f}",
+                    f"Gyro: {gx:+.3f}, {gy:+.3f}, {gz:+.3f}",
+                    f"Compass: {math.degrees(imu.compass):.2f} deg",
+                ]
+            )
+        if lidar is None:
+            lines.append("LiDAR: waiting")
+        else:
+            lines.extend([f"LiDAR frame: {lidar.frame}", f"LiDAR points: {lidar.point_count}"])
+        return lines
+
+    def _debug_tab_lines(self) -> list[str]:
+        diagnostics = self._filter_manager.get_diagnostics() if self._filter_manager is not None else {}
+        lines = [
+            "Debug:",
+            f"Route activation: {self._route_activation_state.value}",
+            f"Stabilization ticks: {self._stabilization_stable_ticks}/{ROUTE_INITIALIZATION.stable_ticks_required}",
+            f"Stabilization err: {self._format_optional_metric(self._stabilization_error_m, 'm')}",
+            f"Stabilization time: {self._stabilization_elapsed_seconds:.1f}/{ROUTE_INITIALIZATION.max_wait_seconds:.1f}s",
+            f"Route blocked: {'YES' if self._route_generation_blocked else 'NO'}",
+            f"Planner: {self._planner_status}",
+            f"Tracker closest/target: {self._latest_tracking.closest_index}/{self._latest_tracking.target_index}",
+            f"Tracker search: {self._latest_tracking.search_start_index}-{self._latest_tracking.search_end_index}",
+            f"Distance to goal: {self._format_optional_metric(self._latest_tracking.distance_to_goal_m, 'm')}",
+            f"Heading error: {self._format_optional_metric(self._latest_tracking.heading_error_deg, 'deg')}",
+            "Filter diagnostics:",
+        ]
+        for key, value in diagnostics.items():
+            if key == "covariance_diagonal" and isinstance(value, list):
+                shown = ", ".join(self._format_debug_value(item) for item in value[:6])
+                lines.append(f"covariance diag: {shown}")
+            elif key == "state_vector" and isinstance(value, list):
+                shown = ", ".join(self._format_debug_value(item) for item in value[:6])
+                lines.append(f"state: {shown}")
+            else:
+                lines.append(f"{key}: {self._format_debug_value(value)}")
+        return lines
+
+    def _status_bar_text(self) -> str:
+        logger = self._active_performance_logger()
+        runner = self._test_runner
+        benchmark_state = "active" if runner is not None and runner.is_active else "inactive"
+        output = ""
+        if runner is not None and runner.benchmark_folder is not None and not runner.is_active:
+            output = f" | OUTPUT {runner.benchmark_folder.name}"
+        return (
+            f"MODE {self._drive_mode.value} | "
+            f"FILTER {self._active_filter_name()} | "
+            f"MAP {'ON' if self._map_selection_active else 'OFF'} | "
+            f"ROUTE {self._selected_route_label()} | "
+            f"ERR {self._format_optional_metric(logger.current_position_error_m, 'm')} | "
+            f"GNSS {self._format_optional_metric(logger.current_raw_gnss_error_m, 'm')} | "
+            f"CTE {self._format_optional_metric(logger.current_cross_track_error_m, 'm')} | "
+            f"BENCH {benchmark_state}"
+            f"{output}"
+        )
+
+    def _selected_route_label(self) -> str:
+        store = self._test_route_store
+        if store is None:
+            return "none"
+        route = store.get_current_route()
+        if route is None:
+            return "none"
+        return f"{store.current_index + 1}/{store.route_count()} {route.name}"
+
+    def _active_filter_name(self) -> str:
+        if self._filter_manager is None:
+            return "none"
+        return self._filter_manager.get_active_filter_name()
+
+    def _active_filter_safe_for_autonomous(self) -> bool:
+        if self._filter_manager is None:
+            return False
+        return self._filter_manager.active_filter_safe_for_autonomous_control()
+
+    def _active_filter_warning(self) -> str:
+        if self._filter_manager is None or self._active_filter_safe_for_autonomous():
+            return ""
+        return "Raw GNSS is noisy and may be unsafe for closed-loop control."
+
+    @staticmethod
+    def _ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+        if numerator is None or denominator is None or denominator <= 0.0:
+            return None
+        return numerator / denominator
+
+    @staticmethod
+    def _format_debug_value(value: object) -> str:
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return "n/a"
+            return f"{value:.3g}"
+        if isinstance(value, (list, tuple)):
+            return ", ".join(SimulationApp._format_debug_value(item) for item in value[:4])
+        if value is None:
+            return "n/a"
+        return str(value)
 
     def run(self) -> None:
         """Run the camera, route-selection, and route-following application loop."""
@@ -352,14 +628,14 @@ class SimulationApp:
             waypoint_manager = self._waypoint_manager
             vehicle = self._vehicle
             ground_truth_provider = self._ground_truth_provider
-            estimated_state_provider = self._estimated_state_provider
+            filter_manager = self._filter_manager
 
             assert manual_controller is not None
             assert camera_sensor is not None
             assert waypoint_manager is not None
             assert vehicle is not None
             assert ground_truth_provider is not None
-            assert estimated_state_provider is not None
+            assert filter_manager is not None
 
             running = True
             while running:
@@ -368,10 +644,8 @@ class SimulationApp:
                     break
                 self._client_manager.tick()
                 self._latest_ground_truth_state = ground_truth_provider.get_state()
-                self._latest_estimated_state = estimated_state_provider.update()
-                self._latest_localization_status = estimated_state_provider.build_status(
-                    self._latest_ground_truth_state
-                )
+                self._latest_estimated_state = filter_manager.update()
+                self._latest_localization_status = filter_manager.get_status(self._latest_ground_truth_state)
                 self._update_route_activation_state()
                 self._latest_state = self._state_for_tracking_and_control()
                 if self._can_update_route_tracking() and self._latest_state is not None:
@@ -406,15 +680,15 @@ class SimulationApp:
                 self._draw_camera_waypoints(waypoint_manager, camera_sensor, vehicle)
                 self._draw_topdown_map()
                 self._draw_lidar_panel()
-                self._draw_sensor_panel()
                 self._draw_control_panel()
+                self._draw_status_bar()
                 display.end_frame()
                 self._clock.tick_pygame()
         finally:
             self.shutdown()
 
     def _state_for_tracking_and_control(self) -> Optional[EgoState]:
-        """Return GT in manual mode and Kalman state in autonomous mode."""
+        """Return GT in manual mode and the active filter state in autonomous mode."""
         if self._drive_mode == DriveMode.AUTONOMOUS:
             return self._latest_estimated_state
         return self._latest_ground_truth_state
@@ -574,6 +848,10 @@ class SimulationApp:
             self._planner_status = "Test runner unavailable"
             self._control_status_text = self._planner_status
             return
+        if not self._active_filter_safe_for_autonomous():
+            self._planner_status = "Active filter is unsafe for autonomous benchmark control"
+            self._control_status_text = "Raw GNSS is noisy and may be unsafe for closed-loop control."
+            return
 
         route = self._test_route_store.get_current_route()
         if route is None:
@@ -601,11 +879,11 @@ class SimulationApp:
         self._control_status_text = "Test stopped"
 
     def _reset_estimator(self) -> None:
-        if self._estimated_state_provider is None:
+        if self._filter_manager is None:
             self._control_status_text = "Estimator not initialized"
             return
 
-        self._estimated_state_provider.reset(skip_current_sensor_frames=True)
+        self._filter_manager.reset(skip_current_sensor_frames=True)
         self._latest_estimated_state = None
         self._latest_localization_status = None
         self._latest_gnss_diagnostics = None
@@ -653,6 +931,17 @@ class SimulationApp:
 
         _csv_path, json_path = logger.export()
         self._planner_status = f"Saved test report: {json_path.name}"
+        self._control_status_text = self._planner_status
+
+    def _regenerate_plots(self) -> None:
+        if self._test_runner is None:
+            self._planner_status = "Test runner unavailable"
+            self._control_status_text = self._planner_status
+            return
+        if self._test_runner.regenerate_plots():
+            self._planner_status = self._test_runner.status_text
+        else:
+            self._planner_status = self._test_runner.status_text
         self._control_status_text = self._planner_status
 
     def _handle_mouse_button_down(self, event: pygame.event.Event) -> None:
@@ -722,6 +1011,10 @@ class SimulationApp:
     def _try_enable_autonomous_mode(self) -> None:
         if self.route_planner is None:
             return
+        if not self._active_filter_safe_for_autonomous():
+            self._planner_status = "Autonomous blocked: active filter is unsafe"
+            self._control_status_text = "Raw GNSS is noisy and may be unsafe for closed-loop control."
+            return
         if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
             self._pending_start_autonomous = True
             self._drive_mode = DriveMode.AUTONOMOUS
@@ -736,6 +1029,10 @@ class SimulationApp:
 
     def _begin_route_initialization_from_selection(self, start_autonomous: bool) -> None:
         if self._map_selector is None:
+            return
+        if start_autonomous and not self._active_filter_safe_for_autonomous():
+            self._planner_status = "Autonomous blocked: active filter is unsafe"
+            self._control_status_text = "Raw GNSS is noisy and may be unsafe for closed-loop control."
             return
 
         endpoints = self._map_selector.endpoints
@@ -904,8 +1201,8 @@ class SimulationApp:
         if self._vehicle_manager is None:
             return
         self._vehicle_manager.teleport_to_waypoint(start_waypoint)
-        if self._estimated_state_provider is not None:
-            self._estimated_state_provider.reset(skip_current_sensor_frames=True)
+        if self._filter_manager is not None:
+            self._filter_manager.reset(skip_current_sensor_frames=True)
             self._latest_estimated_state = None
             self._latest_gnss_diagnostics = None
             self._latest_gnss_frame = None
@@ -913,10 +1210,8 @@ class SimulationApp:
         if self._ground_truth_provider is not None:
             self._latest_ground_truth_state = self._ground_truth_provider.get_state()
             self._latest_state = self._latest_ground_truth_state
-        if self._estimated_state_provider is not None:
-            self._latest_localization_status = self._estimated_state_provider.build_status(
-                self._latest_ground_truth_state
-            )
+        if self._filter_manager is not None:
+            self._latest_localization_status = self._filter_manager.get_status(self._latest_ground_truth_state)
 
     def _reset_selection_and_route(self) -> None:
         if self._map_selector is not None:
@@ -965,7 +1260,7 @@ class SimulationApp:
             camera=camera_sensor.actor,
             vehicle=vehicle,
             target_waypoint=target_waypoint,
-            surface_offset=self._display.main_view_rect.topleft,
+            camera_content_rect=self._display.camera_content_rect,
         )
 
     def _draw_topdown_map(self) -> None:
@@ -1013,51 +1308,15 @@ class SimulationApp:
             measurement=measurement,
         )
 
-    def _draw_sensor_panel(self) -> None:
-        assert self._display is not None
-        route = self.route_planner.get_route() if self.route_planner is not None else []
-        gnss = self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None
-        imu = self._imu_sensor.get_latest_measurement() if self._imu_sensor is not None else None
-        lidar = self._lidar_sensor.get_latest_measurement() if self._lidar_sensor is not None else None
-        data = SensorPanelData(
-            drive_mode=self._drive_mode.value,
-            map_selection_active=self._map_selection_active,
-            sync_status=self._client_manager.sync_status,
-            fixed_delta_seconds=self._client_manager.fixed_delta_seconds,
-            pygame_frame_dt_seconds=self._clock.last_frame_dt_seconds,
-            planner_status=self._planner_status,
-            route_size=len(route),
-            ego_state=self._latest_state,
-            ground_truth_state=self._latest_ground_truth_state,
-            estimated_state=self._latest_estimated_state,
-            localization_status=self._latest_localization_status,
-            route_activation_state=self._route_activation_state.value,
-            stabilization_active=(
-                self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY
-            ),
-            stabilization_error_m=self._stabilization_error_m,
-            stabilization_stable_ticks=self._stabilization_stable_ticks,
-            stabilization_required_ticks=ROUTE_INITIALIZATION.stable_ticks_required,
-            stabilization_elapsed_seconds=self._stabilization_elapsed_seconds,
-            stabilization_timeout_seconds=ROUTE_INITIALIZATION.max_wait_seconds,
-            route_generation_blocked=self._route_generation_blocked,
-            tracking=self._latest_tracking,
-            gnss=gnss,
-            gnss_diagnostics=self._latest_gnss_diagnostics,
-            imu=imu,
-            lidar=lidar,
-        )
-        self._sensor_panel_renderer.draw(
-            surface=self._display.surface,
-            rect=self._display.sensor_panel_rect,
-            data=data,
-        )
-
     def _draw_control_panel(self) -> None:
         assert self._display is not None
         assert self._control_panel is not None
         self._update_control_panel_state()
         self._control_panel.draw(self._display.surface)
+
+    def _draw_status_bar(self) -> None:
+        assert self._display is not None
+        self._status_bar.draw(self._display.surface, self._display.status_bar_rect)
 
     def _update_test_performance(self) -> None:
         runner = self._test_runner
@@ -1074,7 +1333,7 @@ class SimulationApp:
                 phase=phase,
                 route_name=route_name,
                 ground_truth_state=self._latest_ground_truth_state,
-                kalman_state=self._latest_estimated_state,
+                filtered_state=self._latest_estimated_state,
                 gnss_diagnostics=self._latest_gnss_diagnostics,
                 tracking=self._latest_tracking,
                 route_completed=self._latest_tracking.completed,

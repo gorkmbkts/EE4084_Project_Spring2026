@@ -1,4 +1,4 @@
-"""Single-run Kalman benchmark metadata construction."""
+"""Single-run localization filter benchmark metadata construction."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from config.settings import (
     DISPLAY,
     GNSS,
     IMU,
-    LOCALIZATION,
     SIMULATION,
     WAYPOINT_TRACKER,
 )
@@ -30,9 +29,41 @@ def build_benchmark_metadata(
     map_name: Optional[str],
     weather: Optional[dict[str, object]] = None,
     vehicle_blueprint: Optional[str] = None,
+    active_filter_info: Optional[dict[str, object]] = None,
+    active_filter_tune: Optional[dict[str, object]] = None,
 ) -> dict[str, object]:
     """Build benchmark-level metadata from settings and route context."""
+    filter_info = dict(active_filter_info or {})
+    filter_tune = dict(active_filter_tune or {})
+    active_filter_id = str(filter_info.get("id") or "unknown")
+    active_filter_name = str(filter_info.get("name") or active_filter_id)
+    active_filter_type = str(filter_info.get("type") or "unknown")
+    active_filter_state_vector = str(filter_info.get("state_vector") or "n/a")
+    active_filter_process_model = str(filter_info.get("process_model") or "n/a")
+    active_filter_measurement_model = str(filter_info.get("measurement_model") or "n/a")
+    active_filter_description = str(filter_info.get("description") or "")
+    raw_gnss_note = "Raw noisy GNSS is logged as a localization baseline and is not the default closed-loop control filter."
     return {
+        "active_filter_id": active_filter_id,
+        "active_filter_name": active_filter_name,
+        "active_filter_type": active_filter_type,
+        "active_filter_state_vector": active_filter_state_vector,
+        "active_filter_process_model": active_filter_process_model,
+        "active_filter_measurement_model": active_filter_measurement_model,
+        "active_filter_description": active_filter_description,
+        "active_filter_tune": filter_tune,
+        "raw_gnss_baseline_note": raw_gnss_note,
+        "active_filter": {
+            "id": active_filter_id,
+            "name": active_filter_name,
+            "type": active_filter_type,
+            "state_vector": active_filter_state_vector,
+            "process_model": active_filter_process_model,
+            "measurement_model": active_filter_measurement_model,
+            "description": active_filter_description,
+            "safe_for_autonomous_control": bool(filter_info.get("safe_for_autonomous_control", True)),
+            "tune": filter_tune,
+        },
         "general": {
             "benchmark_id": benchmark_id,
             "timestamp": timestamp,
@@ -53,34 +84,18 @@ def build_benchmark_metadata(
                 "collect_stabilization_samples": BENCHMARK.collect_stabilization_samples,
                 "route_completion_required": BENCHMARK.route_completion_required,
                 "max_kalman_plot_error_m": BENCHMARK.max_kalman_plot_error_m,
+                "max_filtered_plot_error_m": BENCHMARK.max_kalman_plot_error_m,
                 "max_trajectory_jump_m": BENCHMARK.max_trajectory_jump_m,
                 "route_bounds_margin_m": BENCHMARK.route_bounds_margin_m,
                 "metrics_use_driving_phase_only": BENCHMARK.metrics_use_driving_phase_only,
             },
         },
         "kalman_filter": {
-            "filter_type": LOCALIZATION.estimator_name,
-            "state_vector": "[px, py, vx, vy, ax, ay]^T",
-            "process_model": "Constant Acceleration",
-            "measurement_models": [
-                "GNSS position x/y",
-                "IMU acceleration ax/ay",
-            ],
-            "process_noise_parameters": {
-                "process_jerk_stddev_mps3": LOCALIZATION.process_jerk_stddev_mps3,
-            },
-            "measurement_noise_parameters": {
-                "gnss_position_stddev_m": LOCALIZATION.gnss_position_stddev_m,
-                "imu_accel_stddev_mps2": LOCALIZATION.imu_accel_stddev_mps2,
-            },
-            "initial_covariance_parameters": {
-                "initial_position_stddev_m": LOCALIZATION.initial_position_stddev_m,
-                "initial_velocity_stddev_mps": LOCALIZATION.initial_velocity_stddev_mps,
-                "initial_accel_stddev_mps2": LOCALIZATION.initial_accel_stddev_mps2,
-            },
-            "yaw_from_velocity_min_speed_mps": LOCALIZATION.yaw_from_velocity_min_speed_mps,
-            "min_prediction_dt_s": LOCALIZATION.min_prediction_dt_s,
-            "max_prediction_dt_s": LOCALIZATION.max_prediction_dt_s,
+            "filter_type": active_filter_name,
+            "state_vector": active_filter_state_vector,
+            "process_model": active_filter_process_model,
+            "measurement_models": [active_filter_measurement_model],
+            "tune": filter_tune,
         },
         "sensor_configuration": {
             "gnss": {
@@ -128,9 +143,11 @@ def build_benchmark_metadata(
             },
         },
         "notes": {
-            "raw_gnss_baseline": (
-                "Raw noisy GNSS is evaluated as a localization baseline only and is not used for closed-loop control."
-            )
+            "raw_gnss_baseline": raw_gnss_note,
+            "single_run_benchmark": (
+                "Vehicle control uses the active KalmanLab filter estimate. "
+                "Ground truth, active filter estimate, raw GNSS, and route tracking are logged in one run."
+            ),
         },
     }
 

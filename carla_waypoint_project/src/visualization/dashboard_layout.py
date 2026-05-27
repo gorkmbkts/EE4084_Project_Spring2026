@@ -14,81 +14,95 @@ class DashboardLayout:
     """Resolved dashboard panel rectangles in pygame screen coordinates."""
 
     main_view_rect: pygame.Rect
+    workspace_rect: pygame.Rect
     map_rect: pygame.Rect
     lidar_rect: pygame.Rect
-    sensor_panel_rect: pygame.Rect
-    control_panel_rect: pygame.Rect
+    tab_panel_rect: pygame.Rect
+    status_bar_rect: pygame.Rect
 
 
 def build_dashboard_layout(
     width: int = DISPLAY.width,
     height: int = DISPLAY.height,
 ) -> DashboardLayout:
-    """Build panel rectangles while keeping the camera image aspect stable."""
+    """Build panel rectangles for the KalmanLab dashboard."""
     margin = DASHBOARD.margin_px
     gap = DASHBOARD.gap_px
+    status_height = getattr(DASHBOARD, "status_bar_height_px", 34)
 
     available_width = max(320, width - 2 * margin)
     available_height = max(300, height - 2 * margin)
-    right_width = min(
-        max(DASHBOARD.right_column_width, available_width - CAMERA.image_width - gap),
-        max(DASHBOARD.right_column_width, available_width // 2),
-    )
-    left_width = max(320, available_width - right_width - gap)
+    content_height = max(240, available_height - status_height - gap)
+    min_left_width = 320 if available_width >= 780 else 240
+    min_right_width = 300 if available_width >= 780 else 220
+    desired_right_width = max(DASHBOARD.right_column_width, available_width // 4)
+    right_width = min(desired_right_width, max(min_right_width, available_width - min_left_width - gap))
+    right_width = max(min_right_width, right_width)
+    left_width = available_width - right_width - gap
+    if left_width < min_left_width:
+        left_width = max(220, available_width - min_right_width - gap)
+        right_width = max(180, available_width - left_width - gap)
+    if left_width + right_width + gap > available_width:
+        total_columns_width = max(1, available_width - gap)
+        right_width = max(140, int(total_columns_width * 0.42))
+        left_width = max(140, total_columns_width - right_width)
 
     camera_aspect = CAMERA.image_width / CAMERA.image_height
-    main_width = min(CAMERA.image_width, left_width)
-    max_main_height = max(180, available_height - DASHBOARD.bottom_panel_height - gap)
-    main_height = min(CAMERA.image_height, max_main_height)
-    if main_width / main_height > camera_aspect:
-        main_width = int(main_height * camera_aspect)
-    else:
-        main_height = int(main_width / camera_aspect)
+    desired_main_height = max(1, int(left_width / camera_aspect))
+    min_workspace_height = 160 if content_height >= 560 else 100
+    max_main_height = max(120, content_height - gap - min_workspace_height)
+    main_height = min(desired_main_height, max_main_height)
+    workspace_height = max(80, content_height - main_height - gap)
 
     main_view_rect = pygame.Rect(
         margin,
         margin,
-        main_width,
+        left_width,
         main_height,
     )
-
-    right_x = margin + left_width + gap
-    right_height = available_height
-    map_height = min(353, max(190, int(right_height * 0.36)))
-    lidar_height = min(300, max(170, int(right_height * 0.26)))
-    control_height = right_height - map_height - lidar_height - 2 * gap
-    if control_height < 180:
-        control_height = 180
-        remaining = max(240, right_height - control_height - 2 * gap)
-        map_height = max(140, remaining // 2)
-        lidar_height = max(120, remaining - map_height)
-
-    map_rect = pygame.Rect(right_x, margin, right_width, map_height)
-    lidar_rect = pygame.Rect(right_x, map_rect.bottom + gap, right_width, lidar_height)
-    control_panel_rect = pygame.Rect(
-        right_x,
-        lidar_rect.bottom + gap,
-        right_width,
-        max(120, height - margin - (lidar_rect.bottom + gap)),
-    )
-
-    bottom_height = max(120, height - margin - main_view_rect.bottom - gap)
-    sensor_panel_rect = pygame.Rect(
+    workspace_rect = pygame.Rect(
         margin,
         main_view_rect.bottom + gap,
         left_width,
-        bottom_height,
+        workspace_height,
     )
 
-    if sensor_panel_rect.bottom > height - margin:
-        sensor_panel_rect.height = max(120, height - margin - sensor_panel_rect.top)
-    if control_panel_rect.bottom > height - margin:
-        control_panel_rect.height = max(120, height - margin - control_panel_rect.top)
+    right_x = margin + left_width + gap
+    right_height = content_height
+    map_height = max(150, int(right_height * 0.34))
+    lidar_height = max(135, int(right_height * 0.27))
+    tab_height = right_height - map_height - lidar_height - 2 * gap
+    if tab_height < 190:
+        tab_height = 190
+        remaining = max(220, right_height - tab_height - 2 * gap)
+        map_height = max(110, int(remaining * 0.56))
+        lidar_height = max(100, remaining - map_height)
+
+    map_rect = pygame.Rect(right_x, margin, right_width, map_height)
+    lidar_rect = pygame.Rect(right_x, map_rect.bottom + gap, right_width, lidar_height)
+    tab_panel_rect = pygame.Rect(
+        right_x,
+        lidar_rect.bottom + gap,
+        right_width,
+        max(120, margin + content_height - (lidar_rect.bottom + gap)),
+    )
+    status_bar_rect = pygame.Rect(
+        margin,
+        margin + content_height + gap,
+        available_width,
+        status_height,
+    )
+
+    if tab_panel_rect.bottom > margin + content_height:
+        tab_panel_rect.height = max(120, margin + content_height - tab_panel_rect.top)
+    if status_bar_rect.bottom > height - margin:
+        status_bar_rect.height = max(24, height - margin - status_bar_rect.top)
 
     return DashboardLayout(
         main_view_rect=main_view_rect,
+        workspace_rect=workspace_rect,
         map_rect=map_rect,
         lidar_rect=lidar_rect,
-        sensor_panel_rect=sensor_panel_rect,
-        control_panel_rect=control_panel_rect,
+        tab_panel_rect=tab_panel_rect,
+        status_bar_rect=status_bar_rect,
     )

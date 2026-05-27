@@ -1,4 +1,4 @@
-"""Single-run Kalman benchmark logging and summary metrics."""
+"""Single-run localization filter benchmark logging and summary metrics."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from src.localization.state_estimator import EgoState
 
 @dataclass(frozen=True)
 class FilterPerformanceSample:
-    """One frame of Kalman benchmark metrics."""
+    """One frame of active-filter benchmark metrics."""
 
     timestamp: float
     route_name: str
@@ -27,12 +27,17 @@ class FilterPerformanceSample:
     ground_truth_y: Optional[float]
     ground_truth_yaw: Optional[float]
     ground_truth_speed: Optional[float]
+    filtered_x: Optional[float]
+    filtered_y: Optional[float]
+    filtered_yaw: Optional[float]
+    filtered_speed: Optional[float]
     kalman_x: Optional[float]
     kalman_y: Optional[float]
     kalman_yaw: Optional[float]
     kalman_speed: Optional[float]
     gnss_x: Optional[float]
     gnss_y: Optional[float]
+    filtered_position_error_m: Optional[float]
     kalman_position_error_m: Optional[float]
     raw_gnss_error_m: Optional[float]
     cross_track_error_m: Optional[float]
@@ -46,10 +51,18 @@ class FilterPerformanceSample:
 class FilterPerformanceLogger:
     """Collect one benchmark run in memory and export CSV plus JSON summary."""
 
-    def __init__(self, output_dir: Optional[Path] = None, benchmark_id: str = "") -> None:
+    def __init__(
+        self,
+        output_dir: Optional[Path] = None,
+        benchmark_id: str = "",
+        active_filter_id: str = "",
+        active_filter_name: str = "Active filter",
+    ) -> None:
         project_root = Path(__file__).resolve().parents[2]
         self._output_dir = output_dir if output_dir is not None else project_root / "logs" / "filter_tests"
         self._benchmark_id = benchmark_id
+        self._active_filter_id = active_filter_id
+        self._active_filter_name = active_filter_name
         self._samples: list[FilterPerformanceSample] = []
         self._route_name = ""
         self._started = False
@@ -69,7 +82,7 @@ class FilterPerformanceLogger:
 
     @property
     def current_position_error_m(self) -> Optional[float]:
-        return self._samples[-1].kalman_position_error_m if self._samples else None
+        return self._samples[-1].filtered_position_error_m if self._samples else None
 
     @property
     def current_raw_gnss_error_m(self) -> Optional[float]:
@@ -111,17 +124,20 @@ class FilterPerformanceLogger:
         self,
         route_name: str,
         ground_truth_state: Optional[EgoState],
-        kalman_state: Optional[EgoState],
-        gnss_diagnostics: Optional[GnssDiagnostics],
-        tracking: TrackingStatus,
-        route_completed: bool,
+        kalman_state: Optional[EgoState] = None,
+        gnss_diagnostics: Optional[GnssDiagnostics] = None,
+        tracking: Optional[TrackingStatus] = None,
+        route_completed: bool = False,
         phase: str = "driving",
+        filtered_state: Optional[EgoState] = None,
     ) -> Optional[FilterPerformanceSample]:
-        if not self._started:
+        if not self._started or tracking is None:
             return None
 
-        timestamp = self._sample_timestamp(ground_truth_state, kalman_state)
-        kalman_error = self._position_error(kalman_state, ground_truth_state)
+        if filtered_state is None:
+            filtered_state = kalman_state
+        timestamp = self._sample_timestamp(ground_truth_state, filtered_state)
+        filtered_error = self._position_error(filtered_state, ground_truth_state)
         raw_gnss_error = gnss_diagnostics.horizontal_error_m if gnss_diagnostics is not None else None
         sample = FilterPerformanceSample(
             timestamp=timestamp,
@@ -131,13 +147,18 @@ class FilterPerformanceLogger:
             ground_truth_y=ground_truth_state.y if ground_truth_state is not None else None,
             ground_truth_yaw=ground_truth_state.yaw if ground_truth_state is not None else None,
             ground_truth_speed=ground_truth_state.speed if ground_truth_state is not None else None,
-            kalman_x=kalman_state.x if kalman_state is not None else None,
-            kalman_y=kalman_state.y if kalman_state is not None else None,
-            kalman_yaw=kalman_state.yaw if kalman_state is not None else None,
-            kalman_speed=kalman_state.speed if kalman_state is not None else None,
+            filtered_x=filtered_state.x if filtered_state is not None else None,
+            filtered_y=filtered_state.y if filtered_state is not None else None,
+            filtered_yaw=filtered_state.yaw if filtered_state is not None else None,
+            filtered_speed=filtered_state.speed if filtered_state is not None else None,
+            kalman_x=filtered_state.x if filtered_state is not None else None,
+            kalman_y=filtered_state.y if filtered_state is not None else None,
+            kalman_yaw=filtered_state.yaw if filtered_state is not None else None,
+            kalman_speed=filtered_state.speed if filtered_state is not None else None,
             gnss_x=gnss_diagnostics.local_x if gnss_diagnostics is not None else None,
             gnss_y=gnss_diagnostics.local_y if gnss_diagnostics is not None else None,
-            kalman_position_error_m=kalman_error,
+            filtered_position_error_m=filtered_error,
+            kalman_position_error_m=filtered_error,
             raw_gnss_error_m=raw_gnss_error,
             cross_track_error_m=self._finite_or_none(tracking.cross_track_error_m),
             heading_error_deg=self._finite_or_none(tracking.heading_error_deg),
@@ -150,20 +171,20 @@ class FilterPerformanceLogger:
         return sample
 
     def running_rmse_m(self) -> Optional[float]:
-        return self._rmse(self._finite_values(sample.kalman_position_error_m for sample in self._samples))
+        return self._rmse(self._finite_values(sample.filtered_position_error_m for sample in self._samples))
 
     def build_summary(self) -> dict[str, object]:
         overall_metrics = self._metrics_for_samples(self._samples)
         driving_samples = [sample for sample in self._samples if sample.phase in ("driving", "completed")]
         driving_metrics = self._metrics_for_samples(driving_samples)
 
-        kalman_rmse = overall_metrics["kalman_rmse_m"]
+        filtered_rmse = overall_metrics["filtered_rmse_m"]
         raw_gnss_rmse = overall_metrics["raw_gnss_rmse_m"]
-        improvement_ratio = self._ratio(raw_gnss_rmse, kalman_rmse)
+        improvement_ratio = self._ratio(raw_gnss_rmse, filtered_rmse)
 
-        driving_kalman_rmse = driving_metrics["kalman_rmse_m"]
+        driving_filtered_rmse = driving_metrics["filtered_rmse_m"]
         driving_raw_gnss_rmse = driving_metrics["raw_gnss_rmse_m"]
-        driving_improvement_ratio = self._ratio(driving_raw_gnss_rmse, driving_kalman_rmse)
+        driving_improvement_ratio = self._ratio(driving_raw_gnss_rmse, driving_filtered_rmse)
 
         completion_time = None
         if len(self._samples) >= 2:
@@ -171,6 +192,8 @@ class FilterPerformanceLogger:
 
         return {
             "benchmark_id": self._benchmark_id,
+            "active_filter_id": self._active_filter_id,
+            "active_filter_name": self._active_filter_name,
             "route_name": self._route_name,
             "sample_count": len(self._samples),
             "route_completion_success": self._completed and not self._aborted,
@@ -178,34 +201,49 @@ class FilterPerformanceLogger:
             "timeout": self._timeout,
             "abort_reason": self._abort_reason,
             "completion_time_s": completion_time,
-            "kalman_rmse_m": kalman_rmse,
-            "kalman_mae_m": overall_metrics["kalman_mae_m"],
-            "kalman_max_error_m": overall_metrics["kalman_max_error_m"],
-            "kalman_p95_error_m": overall_metrics["kalman_p95_error_m"],
+            "active_filter_rmse_m": filtered_rmse,
+            "filtered_rmse_m": filtered_rmse,
+            "filtered_mae_m": overall_metrics["filtered_mae_m"],
+            "filtered_max_error_m": overall_metrics["filtered_max_error_m"],
+            "filtered_p95_error_m": overall_metrics["filtered_p95_error_m"],
+            "kalman_rmse_m": filtered_rmse,
+            "kalman_mae_m": overall_metrics["filtered_mae_m"],
+            "kalman_max_error_m": overall_metrics["filtered_max_error_m"],
+            "kalman_p95_error_m": overall_metrics["filtered_p95_error_m"],
             "raw_gnss_rmse_m": raw_gnss_rmse,
             "raw_gnss_mae_m": overall_metrics["raw_gnss_mae_m"],
             "raw_gnss_max_error_m": overall_metrics["raw_gnss_max_error_m"],
             "raw_gnss_p95_error_m": overall_metrics["raw_gnss_p95_error_m"],
+            "active_filter_improvement_ratio": improvement_ratio,
+            "filtered_improvement_ratio": improvement_ratio,
             "kalman_improvement_ratio": improvement_ratio,
             "mean_cross_track_error_m": overall_metrics["mean_cross_track_error_m"],
             "max_cross_track_error_m": overall_metrics["max_cross_track_error_m"],
             "p95_cross_track_error_m": overall_metrics["p95_cross_track_error_m"],
             "mean_heading_error_deg": overall_metrics["mean_heading_error_deg"],
             "driving_sample_count": len(driving_samples),
-            "driving_kalman_rmse_m": driving_kalman_rmse,
-            "driving_kalman_mae_m": driving_metrics["kalman_mae_m"],
-            "driving_kalman_max_error_m": driving_metrics["kalman_max_error_m"],
-            "driving_kalman_p95_error_m": driving_metrics["kalman_p95_error_m"],
+            "driving_active_filter_rmse_m": driving_filtered_rmse,
+            "driving_filtered_rmse_m": driving_filtered_rmse,
+            "driving_filtered_mae_m": driving_metrics["filtered_mae_m"],
+            "driving_filtered_max_error_m": driving_metrics["filtered_max_error_m"],
+            "driving_filtered_p95_error_m": driving_metrics["filtered_p95_error_m"],
+            "driving_kalman_rmse_m": driving_filtered_rmse,
+            "driving_kalman_mae_m": driving_metrics["filtered_mae_m"],
+            "driving_kalman_max_error_m": driving_metrics["filtered_max_error_m"],
+            "driving_kalman_p95_error_m": driving_metrics["filtered_p95_error_m"],
             "driving_raw_gnss_rmse_m": driving_raw_gnss_rmse,
             "driving_raw_gnss_mae_m": driving_metrics["raw_gnss_mae_m"],
             "driving_raw_gnss_max_error_m": driving_metrics["raw_gnss_max_error_m"],
             "driving_raw_gnss_p95_error_m": driving_metrics["raw_gnss_p95_error_m"],
+            "driving_active_filter_improvement_ratio": driving_improvement_ratio,
+            "driving_filtered_improvement_ratio": driving_improvement_ratio,
             "driving_kalman_improvement_ratio": driving_improvement_ratio,
             "driving_mean_cross_track_error_m": driving_metrics["mean_cross_track_error_m"],
             "driving_max_cross_track_error_m": driving_metrics["max_cross_track_error_m"],
             "driving_p95_cross_track_error_m": driving_metrics["p95_cross_track_error_m"],
             "driving_mean_heading_error_deg": driving_metrics["mean_heading_error_deg"],
-            "excluded_kalman_plot_sample_count": self._excluded_kalman_plot_sample_count(driving_samples),
+            "excluded_filtered_plot_sample_count": self._excluded_filtered_plot_sample_count(driving_samples),
+            "excluded_kalman_plot_sample_count": self._excluded_filtered_plot_sample_count(driving_samples),
         }
 
     def export(self) -> tuple[Path, Path]:
@@ -238,12 +276,12 @@ class FilterPerformanceLogger:
     @staticmethod
     def _sample_timestamp(
         ground_truth_state: Optional[EgoState],
-        kalman_state: Optional[EgoState],
+        filtered_state: Optional[EgoState],
     ) -> float:
         if ground_truth_state is not None:
             return float(ground_truth_state.timestamp)
-        if kalman_state is not None:
-            return float(kalman_state.timestamp)
+        if filtered_state is not None:
+            return float(filtered_state.timestamp)
         return 0.0
 
     @staticmethod
@@ -265,7 +303,7 @@ class FilterPerformanceLogger:
     @classmethod
     def _metrics_for_samples(cls, samples: Iterable[FilterPerformanceSample]) -> dict[str, Optional[float]]:
         sample_list = list(samples)
-        kalman_errors = cls._finite_values(sample.kalman_position_error_m for sample in sample_list)
+        filtered_errors = cls._finite_values(sample.filtered_position_error_m for sample in sample_list)
         raw_gnss_errors = cls._finite_values(sample.raw_gnss_error_m for sample in sample_list)
         cross_track_errors = cls._finite_values(sample.cross_track_error_m for sample in sample_list)
         heading_errors = [
@@ -273,10 +311,10 @@ class FilterPerformanceLogger:
             for value in cls._finite_values(sample.heading_error_deg for sample in sample_list)
         ]
         return {
-            "kalman_rmse_m": cls._rmse(kalman_errors),
-            "kalman_mae_m": cls._mean(kalman_errors),
-            "kalman_max_error_m": max(kalman_errors) if kalman_errors else None,
-            "kalman_p95_error_m": cls._percentile(kalman_errors, 95.0),
+            "filtered_rmse_m": cls._rmse(filtered_errors),
+            "filtered_mae_m": cls._mean(filtered_errors),
+            "filtered_max_error_m": max(filtered_errors) if filtered_errors else None,
+            "filtered_p95_error_m": cls._percentile(filtered_errors, 95.0),
             "raw_gnss_rmse_m": cls._rmse(raw_gnss_errors),
             "raw_gnss_mae_m": cls._mean(raw_gnss_errors),
             "raw_gnss_max_error_m": max(raw_gnss_errors) if raw_gnss_errors else None,
@@ -288,22 +326,22 @@ class FilterPerformanceLogger:
         }
 
     @classmethod
-    def _excluded_kalman_plot_sample_count(cls, samples: Iterable[FilterPerformanceSample]) -> int:
+    def _excluded_filtered_plot_sample_count(cls, samples: Iterable[FilterPerformanceSample]) -> int:
         candidates = 0
         kept = 0
         previous_xy: Optional[tuple[float, float]] = None
         for sample in samples:
-            if not cls._finite_pair(sample.kalman_x, sample.kalman_y):
+            if not cls._finite_pair(sample.filtered_x, sample.filtered_y):
                 continue
             candidates += 1
             if not cls._finite_pair(sample.ground_truth_x, sample.ground_truth_y):
                 continue
-            if sample.kalman_position_error_m is None or not math.isfinite(sample.kalman_position_error_m):
+            if sample.filtered_position_error_m is None or not math.isfinite(sample.filtered_position_error_m):
                 continue
-            if sample.kalman_position_error_m > BENCHMARK.max_kalman_plot_error_m:
+            if sample.filtered_position_error_m > BENCHMARK.max_kalman_plot_error_m:
                 continue
 
-            current_xy = (float(sample.kalman_x), float(sample.kalman_y))
+            current_xy = (float(sample.filtered_x), float(sample.filtered_y))
             if previous_xy is not None and math.hypot(
                 current_xy[0] - previous_xy[0],
                 current_xy[1] - previous_xy[1],

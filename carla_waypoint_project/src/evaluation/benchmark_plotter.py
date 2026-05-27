@@ -1,4 +1,4 @@
-"""Matplotlib plot generation for single-run Kalman benchmarks."""
+"""Matplotlib plot generation for single-run localization filter benchmarks."""
 
 from __future__ import annotations
 
@@ -137,18 +137,27 @@ def _draw_trajectory_panel(
 
     info = trajectory_info or _filtered_samples_for_trajectory(metadata, samples)
     ground_truth_samples = _sample_list(info.get("ground_truth"))
-    kalman_samples = _sample_list(info.get("kalman"))
+    filtered_samples = _sample_list(info.get("filtered"))
     gnss_samples = _sample_list(info.get("gnss"))
+    active_filter_name = _active_filter_name(metadata)
 
     _plot_xy(ax, ground_truth_samples, "ground_truth_x", "ground_truth_y", "Ground truth trajectory", color="tab:green")
-    _plot_xy(ax, kalman_samples, "kalman_x", "kalman_y", "Kalman estimated trajectory", color="tab:blue", linestyle=":")
-    _scatter_xy(ax, gnss_samples, "gnss_x", "gnss_y", "Raw noisy GNSS", color="tab:orange")
+    _plot_xy(
+        ax,
+        filtered_samples,
+        "filtered_x",
+        "filtered_y",
+        f"{active_filter_name} estimated trajectory",
+        color="tab:blue",
+        linestyle=":",
+    )
+    _scatter_xy(ax, gnss_samples, "gnss_x", "gnss_y", "Raw GNSS measurements", color="tab:orange")
 
-    if not kalman_samples:
+    if not filtered_samples:
         ax.text(
             0.02,
             0.03,
-            "No valid Kalman trajectory samples after filtering",
+            "No valid filtered trajectory samples after filtering",
             transform=ax.transAxes,
             va="bottom",
             ha="left",
@@ -189,8 +198,8 @@ def _draw_localization_error_panel(ax, samples: list[dict[str, object]]) -> None
             _plot_series(
                 ax,
                 stabilization_samples,
-                "kalman_position_error_m",
-                "Kalman position error (stabilization)",
+                "filtered_position_error_m",
+                "Filtered position error (stabilization)",
                 linestyle="--",
                 alpha=0.22,
                 base_time=base_time,
@@ -199,7 +208,7 @@ def _draw_localization_error_panel(ax, samples: list[dict[str, object]]) -> None
                 ax,
                 stabilization_samples,
                 "raw_gnss_error_m",
-                "Raw GNSS position error (stabilization)",
+                "Raw GNSS baseline error (stabilization)",
                 linestyle=":",
                 alpha=0.18,
                 base_time=base_time,
@@ -210,23 +219,23 @@ def _draw_localization_error_panel(ax, samples: list[dict[str, object]]) -> None
         _plot_series(
             ax,
             driving_samples,
-            "kalman_position_error_m",
-            "Kalman position error (driving)",
+            "filtered_position_error_m",
+            "Filtered position error (driving)",
             base_time=base_time,
         )
         _plot_series(
             ax,
             driving_samples,
             "raw_gnss_error_m",
-            "Raw GNSS position error (driving)",
+            "Raw GNSS baseline error (driving)",
             linestyle=":",
             base_time=base_time,
         )
         title_suffix = " (Driving Phase)"
         warning_samples = driving_samples
     else:
-        _plot_series(ax, samples, "kalman_position_error_m", "Kalman position error")
-        _plot_series(ax, samples, "raw_gnss_error_m", "Raw GNSS position error", linestyle=":")
+        _plot_series(ax, samples, "filtered_position_error_m", "Filtered position error")
+        _plot_series(ax, samples, "raw_gnss_error_m", "Raw GNSS baseline error", linestyle=":")
         title_suffix = " (All Phases)"
         warning_samples = samples
 
@@ -234,7 +243,7 @@ def _draw_localization_error_panel(ax, samples: list[dict[str, object]]) -> None
     ax.set_xlabel("Time since benchmark start (s)")
     ax.set_ylabel("Position error (m)")
     ax.grid(True, alpha=0.3)
-    _warn_if_no_series(ax, warning_samples, "kalman_position_error_m", "No Kalman error samples to plot")
+    _warn_if_no_series(ax, warning_samples, "filtered_position_error_m", "No filtered error samples to plot")
     _legend_if_labels(ax, fontsize=8)
 
 
@@ -244,27 +253,31 @@ def _summary_text(
     trajectory_info: Optional[dict[str, object]] = None,
 ) -> str:
     general = metadata.get("general", {}) if isinstance(metadata.get("general"), dict) else {}
-    kf = metadata.get("kalman_filter", {}) if isinstance(metadata.get("kalman_filter"), dict) else {}
+    active_filter = _active_filter_info(metadata)
     sensors = metadata.get("sensor_configuration", {}) if isinstance(metadata.get("sensor_configuration"), dict) else {}
     gnss = sensors.get("gnss", {}) if isinstance(sensors.get("gnss"), dict) else {}
     imu = sensors.get("imu", {}) if isinstance(sensors.get("imu"), dict) else {}
-    no_valid_kalman = bool(trajectory_info and trajectory_info.get("no_valid_kalman"))
-    excluded_plot_samples = summary.get("excluded_kalman_plot_sample_count")
-    if trajectory_info and trajectory_info.get("excluded_kalman_plot_sample_count") is not None:
-        excluded_plot_samples = trajectory_info.get("excluded_kalman_plot_sample_count")
+    no_valid_filtered = bool(trajectory_info and trajectory_info.get("no_valid_filtered"))
+    excluded_plot_samples = _primary(summary, "excluded_filtered_plot_sample_count", "excluded_kalman_plot_sample_count")
+    if trajectory_info and trajectory_info.get("excluded_filtered_plot_sample_count") is not None:
+        excluded_plot_samples = trajectory_info.get("excluded_filtered_plot_sample_count")
+    tune = active_filter.get("tune") if isinstance(active_filter.get("tune"), dict) else {}
+    tune_lines = [f"{key}: {_fmt(value)}" for key, value in list(tune.items())[:6]]
 
     lines = [
-        "Kalman Benchmark Summary",
+        "KalmanLab Benchmark Summary",
         f"Route: {general.get('route_name')}",
         f"Map: {general.get('map_name')}",
         f"Benchmark: {general.get('benchmark_id')}",
         "",
-        "Kalman Filter",
-        f"Type: {kf.get('filter_type')}",
-        f"State: {kf.get('state_vector')}",
-        f"Process jerk: {_fmt(_nested(kf, 'process_noise_parameters', 'process_jerk_stddev_mps3'))} m/s^3",
-        f"GNSS pos std: {_fmt(_nested(kf, 'measurement_noise_parameters', 'gnss_position_stddev_m'))} m",
-        f"IMU accel std: {_fmt(_nested(kf, 'measurement_noise_parameters', 'imu_accel_stddev_mps2'))} m/s^2",
+        "Active Filter",
+        f"Name: {active_filter.get('name')}",
+        f"Type: {active_filter.get('type')}",
+        f"State: {active_filter.get('state_vector')}",
+        f"Process: {active_filter.get('process_model')}",
+        f"Measurement: {active_filter.get('measurement_model')}",
+        "Tune:",
+        *(tune_lines or ["n/a"]),
         "",
         "Configured Sensor Noise",
         "GNSS lat/lon/alt std:",
@@ -275,11 +288,11 @@ def _summary_text(
         f"  {_fmt(imu.get('noise_gyro_stddev_x'))} / {_fmt(imu.get('noise_gyro_stddev_y'))} / {_fmt(imu.get('noise_gyro_stddev_z'))}",
         "",
         "Localization (Driving Phase)",
-        f"Kalman RMSE: {_fmt(_primary(summary, 'driving_kalman_rmse_m', 'kalman_rmse_m'))} m",
-        f"Raw GNSS RMSE: {_fmt(_primary(summary, 'driving_raw_gnss_rmse_m', 'raw_gnss_rmse_m'))} m",
-        f"Improvement ratio: {_fmt(_primary(summary, 'driving_kalman_improvement_ratio', 'kalman_improvement_ratio'))}x",
+        f"Filtered RMSE: {_fmt(_first(summary, 'driving_filtered_rmse_m', 'filtered_rmse_m', 'driving_kalman_rmse_m', 'kalman_rmse_m'))} m",
+        f"Raw GNSS RMSE: {_fmt(_first(summary, 'driving_raw_gnss_rmse_m', 'raw_gnss_rmse_m'))} m",
+        f"Improvement ratio: {_fmt(_first(summary, 'driving_filtered_improvement_ratio', 'filtered_improvement_ratio', 'driving_kalman_improvement_ratio', 'kalman_improvement_ratio'))}x",
         f"Driving samples: {summary.get('driving_sample_count')} / {summary.get('sample_count')}",
-        f"Kalman plot samples excluded: {excluded_plot_samples}",
+        f"Filtered plot samples excluded: {excluded_plot_samples}",
         "",
         "Route Tracking (Driving Phase)",
         f"Mean CTE: {_fmt(_primary(summary, 'driving_mean_cross_track_error_m', 'mean_cross_track_error_m'))} m",
@@ -295,10 +308,10 @@ def _summary_text(
         "Raw GNSS is evaluated as a",
         "localization baseline only.",
         "Vehicle control uses the",
-        "Kalman estimate.",
+        "active filter estimate.",
     ]
-    if no_valid_kalman:
-        lines.extend(["", "Warning:", "No valid Kalman trajectory", "samples after filtering."])
+    if no_valid_filtered:
+        lines.extend(["", "Warning:", "No valid filtered trajectory", "samples after filtering."])
     return "\n".join(lines)
 
 
@@ -322,41 +335,44 @@ def _filtered_samples_for_trajectory(
         bounds=bounds,
     )
 
-    kalman_xy_candidates = _filter_xy_by_phase(
+    filtered_xy_candidates = _filter_xy_by_phase(
         samples,
-        "kalman_x",
-        "kalman_y",
+        "filtered_x",
+        "filtered_y",
         phases=DRIVING_PHASES,
         bounds=None,
     )
-    kalman_error_candidates = []
-    for sample in kalman_xy_candidates:
+    filtered_error_candidates = []
+    for sample in filtered_xy_candidates:
         if not _finite(sample.get("ground_truth_x")) or not _finite(sample.get("ground_truth_y")):
             continue
-        if not _finite(sample.get("kalman_position_error_m")):
+        if not _finite(sample.get("filtered_position_error_m")):
             continue
-        if float(sample["kalman_position_error_m"]) > BENCHMARK.max_kalman_plot_error_m:
+        if float(sample["filtered_position_error_m"]) > BENCHMARK.max_kalman_plot_error_m:
             continue
-        if not _inside_route_bounds(sample.get("kalman_x"), sample.get("kalman_y"), bounds):
+        if not _inside_route_bounds(sample.get("filtered_x"), sample.get("filtered_y"), bounds):
             continue
         if not _inside_route_bounds(sample.get("ground_truth_x"), sample.get("ground_truth_y"), bounds):
             continue
-        kalman_error_candidates.append(sample)
+        filtered_error_candidates.append(sample)
 
-    kalman_samples = _remove_unrealistic_jumps(
-        kalman_error_candidates,
-        "kalman_x",
-        "kalman_y",
+    filtered_samples = _remove_unrealistic_jumps(
+        filtered_error_candidates,
+        "filtered_x",
+        "filtered_y",
         max_jump_m=BENCHMARK.max_trajectory_jump_m,
     )
-    excluded_count = max(0, len(kalman_xy_candidates) - len(kalman_samples))
+    excluded_count = max(0, len(filtered_xy_candidates) - len(filtered_samples))
     return {
         "ground_truth": ground_truth_samples,
-        "kalman": kalman_samples,
+        "filtered": filtered_samples,
+        "kalman": filtered_samples,
         "gnss": gnss_samples,
         "route_bounds": bounds,
+        "excluded_filtered_plot_sample_count": excluded_count,
         "excluded_kalman_plot_sample_count": excluded_count,
-        "no_valid_kalman": not kalman_samples,
+        "no_valid_filtered": not filtered_samples,
+        "no_valid_kalman": not filtered_samples,
     }
 
 
@@ -445,7 +461,7 @@ def _read_samples(path: Path) -> list[dict[str, object]]:
         return []
     with path.open("r", newline="", encoding="utf-8") as csv_file:
         reader = csv.DictReader(csv_file)
-        return [{key: _convert(value) for key, value in row.items()} for row in reader]
+        return [_normalize_sample_fields({key: _convert(value) for key, value in row.items()}) for row in reader]
 
 
 def _read_json(path: Path) -> dict[str, object]:
@@ -599,6 +615,61 @@ def _sample_list(value: object) -> list[dict[str, object]]:
 def _primary(summary: dict[str, object], primary_key: str, fallback_key: str) -> object:
     value = summary.get(primary_key)
     return value if value is not None else summary.get(fallback_key)
+
+
+def _first(data: dict[str, object], *keys: str) -> object:
+    for key in keys:
+        value = data.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _active_filter_name(metadata: dict[str, object]) -> str:
+    info = _active_filter_info(metadata)
+    return str(info.get("name") or info.get("id") or "Active filter")
+
+
+def _active_filter_info(metadata: dict[str, object]) -> dict[str, object]:
+    active_filter = metadata.get("active_filter")
+    if isinstance(active_filter, dict):
+        return active_filter
+
+    legacy = metadata.get("kalman_filter")
+    if isinstance(legacy, dict):
+        return {
+            "id": metadata.get("active_filter_id", "legacy_filter"),
+            "name": metadata.get("active_filter_name") or legacy.get("filter_type") or "Kalman filter",
+            "type": metadata.get("active_filter_type") or legacy.get("filter_type"),
+            "state_vector": metadata.get("active_filter_state_vector") or legacy.get("state_vector"),
+            "process_model": metadata.get("active_filter_process_model") or legacy.get("process_model"),
+            "measurement_model": metadata.get("active_filter_measurement_model") or legacy.get("measurement_models"),
+            "tune": legacy.get("tune", {}),
+        }
+
+    return {
+        "id": metadata.get("active_filter_id", "active_filter"),
+        "name": metadata.get("active_filter_name", "Active filter"),
+        "type": metadata.get("active_filter_type", "unknown"),
+        "state_vector": metadata.get("active_filter_state_vector", "n/a"),
+        "process_model": metadata.get("active_filter_process_model", "n/a"),
+        "measurement_model": metadata.get("active_filter_measurement_model", "n/a"),
+        "tune": metadata.get("active_filter_tune", {}),
+    }
+
+
+def _normalize_sample_fields(sample: dict[str, object]) -> dict[str, object]:
+    if "filtered_x" not in sample:
+        sample["filtered_x"] = sample.get("kalman_x")
+    if "filtered_y" not in sample:
+        sample["filtered_y"] = sample.get("kalman_y")
+    if "filtered_yaw" not in sample:
+        sample["filtered_yaw"] = sample.get("kalman_yaw")
+    if "filtered_speed" not in sample:
+        sample["filtered_speed"] = sample.get("kalman_speed")
+    if "filtered_position_error_m" not in sample:
+        sample["filtered_position_error_m"] = sample.get("kalman_position_error_m")
+    return sample
 
 
 def _convert(value: str) -> object:

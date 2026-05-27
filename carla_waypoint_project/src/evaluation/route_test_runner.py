@@ -1,4 +1,4 @@
-"""Single-run Kalman benchmark execution for saved routes."""
+"""Single-run localization filter benchmark execution for saved routes."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ carla = ensure_carla_import()
 
 
 class RouteTestRunner:
-    """Resolve one saved route and run a single Kalman-controlled benchmark."""
+    """Resolve one saved route and run one active-filter-controlled benchmark."""
 
     def __init__(
         self,
@@ -31,6 +31,8 @@ class RouteTestRunner:
         plan_route_callback: Callable[["carla.Waypoint", "carla.Waypoint"], Sequence["carla.Waypoint"]],
         weather_callback: Callable[[], Optional[dict[str, object]]],
         vehicle_blueprint_callback: Callable[[], Optional[str]],
+        active_filter_info_callback: Callable[[], dict[str, object]],
+        active_filter_tune_callback: Callable[[], dict[str, object]],
     ) -> None:
         self._world_map = world_map
         self._route_store = route_store
@@ -39,6 +41,8 @@ class RouteTestRunner:
         self._plan_route_callback = plan_route_callback
         self._weather_callback = weather_callback
         self._vehicle_blueprint_callback = vehicle_blueprint_callback
+        self._active_filter_info_callback = active_filter_info_callback
+        self._active_filter_tune_callback = active_filter_tune_callback
 
         self._active = False
         self._current_route: Optional[SavedTestRoute] = None
@@ -140,7 +144,10 @@ class RouteTestRunner:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         route_slug = _slugify(route.name)
-        benchmark_id = f"benchmark_{timestamp}_{route_slug}"
+        active_filter_info = self._active_filter_info_callback()
+        active_filter_tune = self._active_filter_tune_callback()
+        filter_slug = _slugify(str(active_filter_info.get("id") or "filter"))
+        benchmark_id = f"benchmark_{timestamp}_{route_slug}_{filter_slug}"
         benchmark_folder = _unique_benchmark_folder(_benchmark_root(), benchmark_id)
         benchmark_id = benchmark_folder.name
         benchmark_folder.mkdir(parents=True, exist_ok=False)
@@ -156,10 +163,17 @@ class RouteTestRunner:
             map_name=getattr(self._world_map, "name", route.map_name),
             weather=self._weather_callback(),
             vehicle_blueprint=self._vehicle_blueprint_callback(),
+            active_filter_info=active_filter_info,
+            active_filter_tune=active_filter_tune,
         )
         _write_json(benchmark_folder / "metadata.json", metadata)
 
-        logger = FilterPerformanceLogger(output_dir=benchmark_folder, benchmark_id=benchmark_id)
+        logger = FilterPerformanceLogger(
+            output_dir=benchmark_folder,
+            benchmark_id=benchmark_id,
+            active_filter_id=str(active_filter_info.get("id") or ""),
+            active_filter_name=str(active_filter_info.get("name") or "Active filter"),
+        )
         logger.start_route(route.name, benchmark_id=benchmark_id)
 
         self._current_route = route

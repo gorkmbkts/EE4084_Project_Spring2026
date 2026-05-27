@@ -22,7 +22,7 @@ class DisplaySettings:
     width: int = 1742
     height: int = 1022
     fps: int = 30
-    title: str = "CARLA KF Localization Dashboard"
+    title: str = "KalmanLab CARLA Localization Dashboard"
     clear_color: ColorRGB = (10, 12, 16)
     fullscreen: bool = False
     resizable: bool = True
@@ -187,16 +187,14 @@ class AutonomousControlSettings:
 
 @dataclass(frozen=True)
 class LocalizationSettings:
-    estimator_name: str = "KF-CA" #TODO: !!!!!!!!!!! we will tune this later, maybe even compare multiple estimators
-    min_prediction_dt_s: float = 1.0e-4
-    max_prediction_dt_s: float = 0.20
-    process_jerk_stddev_mps3: float = 1.20
-    gnss_position_stddev_m: float = 1.25
-    imu_accel_stddev_mps2: float = 0.45
-    initial_position_stddev_m: float = 4.0
-    initial_velocity_stddev_mps: float = 3.0
-    initial_accel_stddev_mps2: float = 1.5
-    yaw_from_velocity_min_speed_mps: float = 0.35
+    """Deprecated legacy localization defaults.
+
+    Active KalmanLab filter parameters live in each plugin module's TUNE
+    dictionary under src/KalmanLab/filters/. This class remains only so old
+    imports of LOCALIZATION do not break.
+    """
+
+    estimator_name: str = "KF-CA"
 
 
 @dataclass(frozen=True)
@@ -205,6 +203,7 @@ class DashboardSettings:
     gap_px: int = 14
     right_column_width: int = 420
     bottom_panel_height: int = 260
+    status_bar_height_px: int = 34
     panel_radius_px: int = 4
     panel_border_width_px: int = 1
     panel_padding_px: int = 10

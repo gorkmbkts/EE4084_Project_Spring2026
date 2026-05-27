@@ -1,0 +1,255 @@
+{
+  "active_filter_id": "ca_kf",
+  "active_filter_name": "CA-KF",
+  "active_filter_type": "Linear Kalman Filter",
+  "active_filter_state_vector": "[px, py, vx, vy, ax, ay]^T",
+  "active_filter_process_model": "Constant Acceleration",
+  "active_filter_measurement_model": "GNSS position x/y + IMU acceleration x/y",
+  "active_filter_description": "Linear constant-acceleration Kalman filter using noisy GNSS and IMU acceleration.",
+  "active_filter_tune": {
+    "process_jerk_stddev_mps3": 1.2,
+    "gnss_position_stddev_m": 1.25,
+    "imu_accel_stddev_mps2": 0.45,
+    "initial_position_stddev_m": 4.0,
+    "initial_velocity_stddev_mps": 3.0,
+    "initial_accel_stddev_mps2": 1.5,
+    "yaw_from_velocity_min_speed_mps": 0.35,
+    "min_prediction_dt_s": 0.0001,
+    "max_prediction_dt_s": 0.2
+  },
+  "raw_gnss_baseline_note": "Raw noisy GNSS is logged as a localization baseline and is not the default closed-loop control filter.",
+  "active_filter": {
+    "id": "ca_kf",
+    "name": "CA-KF",
+    "type": "Linear Kalman Filter",
+    "state_vector": "[px, py, vx, vy, ax, ay]^T",
+    "process_model": "Constant Acceleration",
+    "measurement_model": "GNSS position x/y + IMU acceleration x/y",
+    "description": "Linear constant-acceleration Kalman filter using noisy GNSS and IMU acceleration.",
+    "safe_for_autonomous_control": true,
+    "tune": {
+      "process_jerk_stddev_mps3": 1.2,
+      "gnss_position_stddev_m": 1.25,
+      "imu_accel_stddev_mps2": 0.45,
+      "initial_position_stddev_m": 4.0,
+      "initial_velocity_stddev_mps": 3.0,
+      "initial_accel_stddev_mps2": 1.5,
+      "yaw_from_velocity_min_speed_mps": 0.35,
+      "min_prediction_dt_s": 0.0001,
+      "max_prediction_dt_s": 0.2
+    }
+  },
+  "general": {
+    "benchmark_id": "benchmark_20260526_194249_test_route_001_ca_kf",
+    "timestamp": "20260526_194249",
+    "route_name": "test_route_001",
+    "map_name": "Carla/Maps/Town01_Opt",
+    "route_start": {
+      "x": 396.36065673828125,
+      "y": 25.98712158203125,
+      "z": 0.0
+    },
+    "route_goal": {
+      "x": 371.3489685058594,
+      "y": -1.9870344400405884,
+      "z": 0.0
+    },
+    "route_length_m": 48.86398196220398,
+    "route_waypoint_count": 25,
+    "route_points": [
+      {
+        "x": 396.3599853515625,
+        "y": 26.54242706298828
+      },
+      {
+        "x": 396.36236572265625,
+        "y": 24.54242706298828
+      },
+      {
+        "x": 396.3647766113281,
+        "y": 22.542430877685547
+      },
+      {
+        "x": 396.3671875,
+        "y": 20.542430877685547
+      },
+      {
+        "x": 396.36956787109375,
+        "y": 18.542430877685547
+      },
+      {
+        "x": 396.3719787597656,
+        "y": 16.542430877685547
+      },
+      {
+        "x": 396.3743896484375,
+        "y": 14.542439460754395
+      },
+      {
+        "x": 396.37677001953125,
+        "y": 12.542439460754395
+      },
+      {
+        "x": 396.3791809082031,
+        "y": 10.542439460754395
+      },
+      {
+        "x": 396.3800048828125,
+        "y": 9.85205078125
+      },
+      {
+        "x": 396.29864501953125,
+        "y": 7.608705997467041
+      },
+      {
+        "x": 395.7373352050781,
+        "y": 5.237888813018799
+      },
+      {
+        "x": 394.67071533203125,
+        "y": 3.047407388687134
+      },
+      {
+        "x": 393.1493835449219,
+        "y": 1.1424074172973633
+      },
+      {
+        "x": 391.2237548828125,
+        "y": -0.3839014768600464
+      },
+      {
+        "x": 388.9994812011719,
+        "y": -1.4280792474746704
+      },
+      {
+        "x": 386.5950927734375,
+        "y": -1.9345017671585083
+      },
+      {
+        "x": 384.591064453125,
+        "y": -1.9799997806549072
+      },
+      {
+        "x": 382.591064453125,
+        "y": -1.9810622930526733
+      },
+      {
+        "x": 380.591064453125,
+        "y": -1.98212468624115
+      },
+      {
+        "x": 378.591064453125,
+        "y": -1.983187198638916
+      },
+      {
+        "x": 376.591064453125,
+        "y": -1.9842497110366821
+      },
+      {
+        "x": 374.591064453125,
+        "y": -1.9853121042251587
+      },
+      {
+        "x": 372.591064453125,
+        "y": -1.9863746166229248
+      },
+      {
+        "x": 371.3489685058594,
+        "y": -1.9870344400405884
+      }
+    ],
+    "carla_fixed_delta_seconds": 0.05,
+    "pygame_fps": 30,
+    "weather": {
+      "cloudiness": 60.0,
+      "precipitation": 40.0,
+      "precipitation_deposits": 40.0,
+      "wind_intensity": 30.0,
+      "sun_azimuth_angle": 275.0,
+      "sun_altitude_angle": 20.0,
+      "fog_density": 5.0,
+      "fog_distance": 0.75,
+      "wetness": 80.0
+    },
+    "vehicle_blueprint": "vehicle.tesla.cybertruck",
+    "benchmark_settings": {
+      "max_pass_duration_s": 180.0,
+      "generate_plots_on_completion": true,
+      "collect_stabilization_samples": true,
+      "route_completion_required": true,
+      "max_kalman_plot_error_m": 10.0,
+      "max_filtered_plot_error_m": 10.0,
+      "max_trajectory_jump_m": 8.0,
+      "route_bounds_margin_m": 20.0,
+      "metrics_use_driving_phase_only": true
+    }
+  },
+  "kalman_filter": {
+    "filter_type": "CA-KF",
+    "state_vector": "[px, py, vx, vy, ax, ay]^T",
+    "process_model": "Constant Acceleration",
+    "measurement_models": [
+      "GNSS position x/y + IMU acceleration x/y"
+    ],
+    "tune": {
+      "process_jerk_stddev_mps3": 1.2,
+      "gnss_position_stddev_m": 1.25,
+      "imu_accel_stddev_mps2": 0.45,
+      "initial_position_stddev_m": 4.0,
+      "initial_velocity_stddev_mps": 3.0,
+      "initial_accel_stddev_mps2": 1.5,
+      "yaw_from_velocity_min_speed_mps": 0.35,
+      "min_prediction_dt_s": 0.0001,
+      "max_prediction_dt_s": 0.2
+    }
+  },
+  "sensor_configuration": {
+    "gnss": {
+      "sensor_tick": 0.05,
+      "noise_lat_stddev_deg": 4e-06,
+      "noise_lon_stddev_deg": 4e-06,
+      "noise_alt_stddev_m": 0.45,
+      "noise_lat_bias_deg": 0.0,
+      "noise_lon_bias_deg": 0.0,
+      "noise_alt_bias_m": 0.0,
+      "noise_seed": 4084
+    },
+    "imu": {
+      "sensor_tick": 0.05,
+      "noise_accel_stddev_x": 0.08,
+      "noise_accel_stddev_y": 0.08,
+      "noise_accel_stddev_z": 0.1,
+      "noise_gyro_stddev_x": 0.004,
+      "noise_gyro_stddev_y": 0.004,
+      "noise_gyro_stddev_z": 0.006,
+      "noise_gyro_bias_x": 0.0005,
+      "noise_gyro_bias_y": -0.0005,
+      "noise_gyro_bias_z": 0.0008,
+      "noise_seed": 8408
+    }
+  },
+  "controller_configuration": {
+    "target_speed_mps": 4.8,
+    "turn_speed_mps": 2.6,
+    "steering_gain": 1.2,
+    "max_throttle": 0.45,
+    "max_brake": 0.8,
+    "speed_kp": 0.25,
+    "brake_kp": 0.35,
+    "stop_distance_m": 3.0,
+    "waypoint_tracker": {
+      "lookahead_base_m": 3.0,
+      "lookahead_gain_s": 0.35,
+      "search_backtrack_count": 4,
+      "search_forward_count": 12,
+      "max_closest_index_advance_per_update": 3,
+      "max_target_index_ahead_of_closest": 6,
+      "completion_distance_m": 4.0,
+      "completion_index_window": 5
+    }
+  },
+  "notes": {
+    "raw_gnss_baseline": "Raw noisy GNSS is logged as a localization baseline and is not the default closed-loop control filter.",
+    "single_run_benchmark": "Vehicle control uses the active KalmanLab filter estimate. Ground truth, active filter estimate, raw GNSS, and route tracking are logged in one run."
+  }
+}

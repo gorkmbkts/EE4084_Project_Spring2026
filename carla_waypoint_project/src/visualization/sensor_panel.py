@@ -76,7 +76,7 @@ class SensorPanelRenderer:
         ]
 
         self._draw_section(surface, columns[0], "Simulation / GT", self._simulation_rows(data))
-        self._draw_section(surface, columns[1], "KF Estimate", self._estimate_rows(data))
+        self._draw_section(surface, columns[1], "Filter Estimate", self._estimate_rows(data))
         self._draw_section(surface, columns[2], "GNSS / IMU", self._gnss_imu_rows(data))
         self._draw_section(surface, columns[3], "LiDAR / Route", self._lidar_route_rows(data))
 
