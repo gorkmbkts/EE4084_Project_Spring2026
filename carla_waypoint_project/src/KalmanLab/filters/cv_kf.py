@@ -66,7 +66,7 @@ TUNE = {
 
     # If True, IMU acceleration is used as a control input during prediction.
     # If False, this becomes a pure GNSS-only CV Kalman filter.
-    "use_imu_acceleration_control": True,
+    "use_imu_acceleration_control": False,
 }
 
 
