@@ -30,6 +30,21 @@
       },
       "created_from": "2d_map",
       "map_name": "Carla/Maps/Town01_Opt"
+    },
+    {
+      "name": "test_route_003",
+      "start": {
+        "x": -44.30120086669922,
+        "y": -57.01285171508789,
+        "z": 0.055450439453125
+      },
+      "goal": {
+        "x": 13.065485000610352,
+        "y": -94.8741226196289,
+        "z": 0.0
+      },
+      "created_from": "2d_map",
+      "map_name": "Carla/Maps/Town05_Opt"
     }
   ]
 }
