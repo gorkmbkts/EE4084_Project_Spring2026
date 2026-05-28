@@ -11,7 +11,23 @@ from typing import Optional
 import pygame
 
 from config.settings import CARLA, DASHBOARD, DISPLAY
+from src.KalmanLab.registry import discover_filters
+from src.evaluation.benchmark_config import (
+    BEHAVIOR_PRESETS,
+    BEHAVIOR_SPECS,
+    BenchmarkConfig,
+    SENSOR_NOISE_PRESETS,
+    SENSOR_NOISE_SPECS,
+    behavior_values_from_config,
+    driving_behavior_from_values,
+    load_available_test_routes,
+    sensor_noise_config_from_values,
+    validate_benchmark_config,
+)
+from src.control.driving_behavior import DrivingBehaviorConfig
+from src.evaluation.test_route_store import SavedTestRoute
 from src.utils.map_names import display_map_name, maps_compatible, normalize_map_name
+from src.visualization.ui.parameter_controls import ParameterEditor
 from src.visualization.windowing import create_display_surface, display_flags_from_settings
 
 
@@ -38,6 +54,7 @@ class StartupMapSelection:
     selected_map_load_name: Optional[str]
     active_map_name: Optional[str]
     used_current_map: bool
+    benchmark_config: Optional[BenchmarkConfig] = None
 
 
 @dataclass(frozen=True)
@@ -68,11 +85,29 @@ class StartupMapSelector:
         self._scroll_offset = 0
         self._hovered_index: Optional[int] = None
         self._row_rects: dict[int, pygame.Rect] = {}
+        self._map_list_top = 0
         self._start_button_rect = pygame.Rect(0, 0, 1, 1)
         self._use_current_button_rect = pygame.Rect(0, 0, 1, 1)
         self._refresh_button_rect = pygame.Rect(0, 0, 1, 1)
         self._project_root = Path(__file__).resolve().parents[2]
         self._runtime_state_path = self._project_root / "config" / "runtime_state.json"
+        self._active_tab = "Map Selection"
+        self._tab_rects: dict[str, pygame.Rect] = {}
+        self._setup_filter_records = []
+        self._setup_filter_buttons: dict[str, pygame.Rect] = {}
+        self._selected_filter_id = ""
+        self._sensor_editor: Optional[ParameterEditor] = None
+        self._behavior_editor: Optional[ParameterEditor] = None
+        self._sensor_preset = "Medium Noise"
+        self._behavior_preset = "Balanced"
+        self._route_items = []
+        self._selected_route_indices: set[int] = set()
+        self._route_scroll = 0
+        self._route_rects: dict[int, pygame.Rect] = {}
+        self._select_all_routes_rect = pygame.Rect(0, 0, 1, 1)
+        self._clear_routes_rect = pygame.Rect(0, 0, 1, 1)
+        self._start_benchmark_rect = pygame.Rect(0, 0, 1, 1)
+        self._setup_summary_lines: list[str] = []
 
     @property
     def surface(self) -> pygame.Surface:
@@ -121,6 +156,7 @@ class StartupMapSelector:
         if executable_path is not None:
             self._executable_path = str(executable_path)
         self._refresh_options(client, preserve_selection=False)
+        self._refresh_test_setup()
 
         running = True
         while running:
@@ -129,6 +165,11 @@ class StartupMapSelector:
                     return None
                 if event.type == pygame.VIDEORESIZE:
                     self._resize(event.w, event.h)
+                    continue
+                if self._active_tab == "Test Setup":
+                    result = self._handle_test_setup_event(event, client)
+                    if result is not _NoSelection:
+                        return result
                     continue
                 if event.type == pygame.KEYDOWN:
                     result = self._handle_key_down(event, client)
@@ -151,6 +192,9 @@ class StartupMapSelector:
     def _handle_key_down(self, event: pygame.event.Event, client: object) -> object:
         if event.key == pygame.K_ESCAPE:
             return None
+        if event.key == pygame.K_TAB:
+            self._active_tab = "Test Setup" if self._active_tab == "Map Selection" else "Map Selection"
+            return _NoSelection
         if event.key == pygame.K_UP:
             self._move_selection(-1)
             return _NoSelection
@@ -358,6 +402,10 @@ class StartupMapSelector:
 
     def _handle_left_click(self, event: pygame.event.Event, client: object) -> object:
         position = event.pos
+        tab = self._tab_at_position(position)
+        if tab is not None:
+            self._active_tab = tab
+            return _NoSelection
         if self._start_button_rect.collidepoint(position):
             return self._load_selected_option(client)
         if self._use_current_button_rect.collidepoint(position):
@@ -477,10 +525,290 @@ class StartupMapSelector:
             pygame.display.flip()
             return
 
-        self._draw_selector_header(pygame.Rect(margin, status_rect.bottom + 24, width - 2 * margin, 58))
-        self._draw_map_list()
-        self._draw_controls(pygame.Rect(margin, height - 78, width - 2 * margin, 52))
+        tab_top = status_rect.bottom + 18
+        self._draw_startup_tabs(pygame.Rect(margin, tab_top, width - 2 * margin, 34))
+        if self._active_tab == "Test Setup":
+            self._draw_test_setup(pygame.Rect(margin, tab_top + 48, width - 2 * margin, height - tab_top - 70))
+        else:
+            selector_header = pygame.Rect(margin, tab_top + 48, width - 2 * margin, 58)
+            self._draw_selector_header(selector_header)
+            self._map_list_top = selector_header.bottom + 12
+            self._draw_map_list()
+            self._draw_controls(pygame.Rect(margin, height - 78, width - 2 * margin, 52))
         pygame.display.flip()
+
+    def _draw_startup_tabs(self, rect: pygame.Rect) -> None:
+        self._tab_rects.clear()
+        gap = 8
+        tab_width = min(190, max(130, (rect.width - gap) // 4))
+        x = rect.left
+        for tab in ("Map Selection", "Test Setup"):
+            tab_rect = pygame.Rect(x, rect.top, tab_width, 30)
+            self._tab_rects[tab] = tab_rect
+            active = tab == self._active_tab
+            hovered = tab_rect.collidepoint(pygame.mouse.get_pos())
+            background = (35, 73, 53) if active else ((34, 42, 54) if hovered else (24, 30, 39))
+            border = DASHBOARD.success_color if active else (DASHBOARD.panel_border_color if not hovered else (116, 188, 255))
+            pygame.draw.rect(self._surface, background, tab_rect, border_radius=5)
+            pygame.draw.rect(self._surface, border, tab_rect, width=1, border_radius=5)
+            rendered = self._button_font.render(tab, True, DASHBOARD.title_color if active else DASHBOARD.text_color)
+            self._surface.blit(rendered, rendered.get_rect(center=tab_rect.center))
+            x += tab_width + gap
+
+    def _tab_at_position(self, position: tuple[int, int]) -> Optional[str]:
+        for tab, rect in self._tab_rects.items():
+            if rect.collidepoint(position):
+                return tab
+        return None
+
+    def _refresh_test_setup(self) -> None:
+        self._setup_filter_records = [
+            record for record in discover_filters() if record.valid and record.safe_for_autonomous_control
+        ]
+        if self._setup_filter_records and not self._selected_filter_id:
+            self._selected_filter_id = self._setup_filter_records[0].filter_id
+        self._route_items = load_available_test_routes([option.load_name or option.detail for option in self._options])
+        if self._sensor_editor is None:
+            self._sensor_editor = ParameterEditor(
+                specs=SENSOR_NOISE_SPECS,
+                values=SENSOR_NOISE_PRESETS["Medium Noise"],
+                presets=SENSOR_NOISE_PRESETS,
+                active_preset="Medium Noise",
+                title="Sensor Noise/Error Settings",
+            )
+        if self._behavior_editor is None:
+            self._behavior_editor = ParameterEditor(
+                specs=BEHAVIOR_SPECS,
+                values=behavior_values_from_config(DrivingBehaviorConfig()),
+                presets=BEHAVIOR_PRESETS,
+                active_preset="Balanced",
+                title="Vehicle Behavior Settings",
+            )
+
+    def _handle_test_setup_event(self, event: pygame.event.Event, client: object) -> object:
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                return None
+            if event.key == pygame.K_TAB:
+                self._active_tab = "Map Selection"
+                return _NoSelection
+        if hasattr(event, "pos"):
+            tab = self._tab_at_position(event.pos)
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and tab is not None:
+                self._active_tab = tab
+                return _NoSelection
+
+        if self._sensor_editor is not None and self._sensor_editor.handle_event(event):
+            self._sensor_preset = self._sensor_editor.active_preset
+            return _NoSelection
+        if self._behavior_editor is not None and self._behavior_editor.handle_event(event):
+            self._behavior_preset = self._behavior_editor.active_preset
+            return _NoSelection
+
+        if event.type == pygame.MOUSEWHEEL:
+            self._route_scroll = max(0, self._route_scroll - event.y * 2)
+            return _NoSelection
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and hasattr(event, "pos"):
+            position = event.pos
+            for filter_id, rect in self._setup_filter_buttons.items():
+                if rect.collidepoint(position):
+                    self._selected_filter_id = filter_id
+                    return _NoSelection
+            if self._select_all_routes_rect.collidepoint(position):
+                self._selected_route_indices = {item.index for item in self._route_items}
+                return _NoSelection
+            if self._clear_routes_rect.collidepoint(position):
+                self._selected_route_indices.clear()
+                return _NoSelection
+            for index, rect in self._route_rects.items():
+                if rect.collidepoint(position):
+                    if index in self._selected_route_indices:
+                        self._selected_route_indices.remove(index)
+                    else:
+                        self._selected_route_indices.add(index)
+                    return _NoSelection
+            if self._start_benchmark_rect.collidepoint(position):
+                return self._start_benchmark_from_setup(client)
+        return _NoSelection
+
+    def _draw_test_setup(self, rect: pygame.Rect) -> None:
+        self._refresh_test_setup()
+        gap = 12
+        column_width = max(260, (rect.width - 2 * gap) // 3)
+        left = pygame.Rect(rect.left, rect.top, column_width, rect.height - 58)
+        middle = pygame.Rect(left.right + gap, rect.top, column_width, rect.height - 58)
+        right = pygame.Rect(middle.right + gap, rect.top, rect.right - middle.right - gap, rect.height - 58)
+        bottom = pygame.Rect(rect.left, rect.bottom - 46, rect.width, 42)
+
+        self._draw_filter_selection(left)
+        if self._sensor_editor is not None:
+            self._sensor_editor.draw(self._surface, middle)
+        if self._behavior_editor is not None:
+            behavior_rect = pygame.Rect(right.left, right.top, right.width, max(180, int(right.height * 0.56)))
+            routes_rect = pygame.Rect(right.left, behavior_rect.bottom + gap, right.width, right.bottom - behavior_rect.bottom - gap)
+            self._behavior_editor.draw(self._surface, behavior_rect)
+            self._draw_route_selection(routes_rect)
+        else:
+            self._draw_route_selection(right)
+        self._draw_test_setup_footer(bottom)
+
+    def _draw_filter_selection(self, rect: pygame.Rect) -> None:
+        pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, rect, border_radius=6)
+        pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
+        content = rect.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
+        self._draw_text("Filter Selection", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+        y = content.top + 34
+        self._setup_filter_buttons.clear()
+        if not self._setup_filter_records:
+            self._draw_text("No autonomous-safe filters found.", (content.left, y), self._font, DASHBOARD.warning_color, content.width)
+            return
+        for record in self._setup_filter_records:
+            button = pygame.Rect(content.left, y, content.width, 34)
+            self._setup_filter_buttons[record.filter_id] = button
+            active = record.filter_id == self._selected_filter_id
+            pygame.draw.rect(self._surface, (35, 73, 53) if active else (24, 30, 39), button, border_radius=5)
+            pygame.draw.rect(self._surface, DASHBOARD.success_color if active else DASHBOARD.panel_border_color, button, width=1, border_radius=5)
+            label = f"{record.display_name} ({record.filter_id})"
+            self._draw_text(label, (button.left + 10, button.top + 8), self._button_font, DASHBOARD.title_color, button.width - 20)
+            y += 42
+        y += 8
+        active = next((record for record in self._setup_filter_records if record.filter_id == self._selected_filter_id), None)
+        if active is not None:
+            lines = [
+                f"Type: {active.filter_info.get('type')}",
+                f"State: {active.filter_info.get('state_vector')}",
+                f"Model: {active.filter_info.get('process_model')}",
+                f"Measurement: {active.filter_info.get('measurement_model')}",
+            ]
+            for line in lines:
+                if y + 16 > content.bottom:
+                    break
+                self._draw_text(line, (content.left, y), self._small_font, DASHBOARD.text_color, content.width)
+                y += 18
+
+    def _draw_route_selection(self, rect: pygame.Rect) -> None:
+        pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, rect, border_radius=6)
+        pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
+        content = rect.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
+        title = f"Saved Test Routes ({len(self._selected_route_indices)} selected)"
+        self._draw_text(title, content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+        self._select_all_routes_rect = pygame.Rect(content.left, content.top + 30, 92, 24)
+        self._clear_routes_rect = pygame.Rect(self._select_all_routes_rect.right + 8, content.top + 30, 86, 24)
+        self._draw_button(self._select_all_routes_rect, "Select All")
+        self._draw_button(self._clear_routes_rect, "Clear")
+        list_rect = pygame.Rect(content.left, content.top + 62, content.width, content.height - 62)
+        pygame.draw.rect(self._surface, (14, 18, 24), list_rect, border_radius=4)
+        self._route_rects.clear()
+        if not self._route_items:
+            self._draw_text("No saved routes in config/test_routes.json.", (list_rect.left + 8, list_rect.top + 10), self._small_font, DASHBOARD.warning_color, list_rect.width - 16)
+            return
+        row_h = 56
+        visible = max(1, list_rect.height // row_h)
+        self._route_scroll = min(self._route_scroll, max(0, len(self._route_items) - visible))
+        for visible_index, item in enumerate(self._route_items[self._route_scroll : self._route_scroll + visible]):
+            row = pygame.Rect(list_rect.left + 5, list_rect.top + 5 + visible_index * row_h, list_rect.width - 10, row_h - 6)
+            self._route_rects[item.index] = row
+            selected = item.index in self._selected_route_indices
+            pygame.draw.rect(self._surface, (35, 73, 53) if selected else (24, 30, 39), row, border_radius=4)
+            pygame.draw.rect(self._surface, DASHBOARD.success_color if selected else DASHBOARD.panel_border_color, row, width=1, border_radius=4)
+            mark = "[x]" if selected else "[ ]"
+            length = f"{item.straight_line_length_m:.0f}m" if item.straight_line_length_m is not None else "n/a"
+            status = "available" if item.compatible_with_available_maps else "map not listed"
+            self._draw_text(f"{mark} {item.route.name}", (row.left + 8, row.top + 6), self._font, DASHBOARD.title_color, row.width - 16)
+            self._draw_text(f"{display_map_name(item.route.map_name)} | {length} | {status}", (row.left + 8, row.top + 29), self._small_font, DASHBOARD.muted_text_color, row.width - 16)
+
+    def _draw_test_setup_footer(self, rect: pygame.Rect) -> None:
+        self._start_benchmark_rect = pygame.Rect(rect.right - 214, rect.top + 3, 214, 34)
+        self._draw_button(self._start_benchmark_rect, "Start Benchmark Test", primary=True)
+        summary = self._setup_summary_text()
+        self._draw_text(summary, (rect.left, rect.top + 10), self._small_font, DASHBOARD.muted_text_color, self._start_benchmark_rect.left - rect.left - 12)
+
+    def _setup_summary_text(self) -> str:
+        routes = [item.route for item in self._route_items if item.index in self._selected_route_indices]
+        maps = sorted({display_map_name(route.map_name) for route in routes})
+        filter_label = self._selected_filter_id or "none"
+        map_text = ", ".join(maps[:3]) + ("..." if len(maps) > 3 else "")
+        return f"Filter {filter_label} | Routes {len(routes)} | Maps {map_text or 'none'} | Sensor {self._sensor_preset} | Behavior {self._behavior_preset}"
+
+    def _start_benchmark_from_setup(self, client: object) -> object:
+        routes = [item.route for item in self._route_items if item.index in self._selected_route_indices]
+        sensor_values = self._sensor_editor.values() if self._sensor_editor is not None else SENSOR_NOISE_PRESETS["Medium Noise"]
+        behavior_values = self._behavior_editor.values() if self._behavior_editor is not None else BEHAVIOR_PRESETS["Balanced"]
+        if self._sensor_editor is not None:
+            self._sensor_preset = self._sensor_editor.active_preset
+        if self._behavior_editor is not None:
+            self._behavior_preset = self._behavior_editor.active_preset
+        config = BenchmarkConfig(
+            selected_filter=self._selected_filter_id,
+            selected_routes=tuple(routes),
+            sensor_noise_config=sensor_noise_config_from_values(sensor_values, preset_name=self._sensor_preset),
+            vehicle_behavior_config=driving_behavior_from_values(behavior_values, preset_name=self._behavior_preset),
+            sensor_noise_preset=self._sensor_preset,
+            vehicle_behavior_preset=self._behavior_preset,
+            metadata={"startup_mode": "test_setup"},
+        )
+        errors = validate_benchmark_config(
+            config,
+            valid_filter_ids=[record.filter_id for record in self._setup_filter_records],
+            available_maps=[option.load_name or option.detail for option in self._options],
+        )
+        if errors:
+            self._error = " ".join(errors[:3])
+            return _NoSelection
+
+        first_route = routes[0]
+        return self._load_map_for_benchmark(client, first_route, config)
+
+    def _load_map_for_benchmark(
+        self,
+        client: object,
+        first_route: SavedTestRoute,
+        config: BenchmarkConfig,
+    ) -> object:
+        current_map = self._read_current_map(client)
+        if maps_compatible(current_map, first_route.map_name):
+            self._write_runtime_state(selected_load_name=None, active_map_name=current_map)
+            return StartupMapSelection(
+                selected_map_load_name=None,
+                active_map_name=current_map,
+                used_current_map=True,
+                benchmark_config=config,
+            )
+        if not first_route.map_name:
+            self._error = "First selected route has no map metadata."
+            return _NoSelection
+        load_name = self._load_name_for_map(first_route.map_name)
+        self._status = "Loading map"
+        self._detail = f"Loading {display_map_name(load_name)} for benchmark..."
+        self._error = ""
+        self._draw(status_only=False)
+        pygame.display.flip()
+        pygame.event.pump()
+        try:
+            setter = getattr(client, "set_timeout", None)
+            if setter is not None:
+                setter(max(float(CARLA.timeout_seconds), 60.0))
+            world = client.load_world(load_name)
+            world_map = world.get_map()
+            active_map_name = getattr(world_map, "name", None)
+        except Exception as exc:
+            self._status = "Connected"
+            self._detail = "Select a map before the dashboard starts."
+            self._error = f"Benchmark map load failed: {exc}"
+            return _NoSelection
+        self._write_runtime_state(selected_load_name=load_name, active_map_name=active_map_name)
+        return StartupMapSelection(
+            selected_map_load_name=load_name,
+            active_map_name=active_map_name,
+            used_current_map=False,
+            benchmark_config=config,
+        )
+
+    def _load_name_for_map(self, map_name: str) -> str:
+        for option in self._options:
+            if option.load_name and maps_compatible(option.load_name, map_name):
+                return option.load_name
+        return display_map_name(map_name)
 
     def _draw_status_panel(self, rect: pygame.Rect) -> None:
         pygame.draw.rect(self._surface, DASHBOARD.panel_background_color, rect, border_radius=6)
@@ -592,7 +920,7 @@ class StartupMapSelector:
     def _list_geometry(self) -> tuple[int, int, int, int]:
         width, height = self._surface.get_size()
         margin = max(28, min(54, width // 28))
-        top = max(330, height // 3)
+        top = max(330, height // 3, self._map_list_top)
         bottom_margin = 94
         return margin, top, width - 2 * margin, max(120, height - top - bottom_margin)
 

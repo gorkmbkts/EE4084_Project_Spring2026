@@ -22,6 +22,16 @@ from src.control.vehicle_controller import VehicleController
 from src.control.waypoint_tracker import TrackingStatus, WaypointTracker
 from src.core.carla_client import CarlaClientManager
 from src.core.simulation import SimulationClock
+from src.evaluation.benchmark_config import (
+    BEHAVIOR_PRESETS,
+    BenchmarkConfig,
+    SENSOR_NOISE_PRESETS,
+    SENSOR_NOISE_SPECS,
+    SensorNoiseConfig,
+    apply_behavior_values,
+    default_sensor_noise_values,
+    sensor_noise_config_from_values,
+)
 from src.evaluation.filter_performance import FilterPerformanceLogger
 from src.evaluation.route_test_runner import RouteTestRunner
 from src.evaluation.test_route_store import TestRouteStore
@@ -49,6 +59,8 @@ from src.visualization.ui.driving_behavior_widgets import (
     ControlVisualizationWidget,
     DrivingDiagnosticsWidget,
 )
+from src.visualization.ui.benchmark_panels import LiveEvaluationPanel, TestProgressPanel
+from src.visualization.ui.parameter_controls import ParameterEditor
 from src.visualization.ui.status_bar import StatusBar
 from src.visualization.ui.tabbed_panel import TabbedPanel
 from src.visualization.waypoint_overlay import WaypointOverlayRenderer
@@ -56,6 +68,14 @@ from src.utils.carla_import import ensure_carla_import
 from src.utils.map_names import display_map_name, normalize_map_name
 
 carla = ensure_carla_import()
+
+BENCHMARK_STUCK_SPEED_MPS = 0.15
+BENCHMARK_STUCK_SECONDS = 8.0
+BENCHMARK_NO_PROGRESS_SECONDS = 14.0
+BENCHMARK_PROGRESS_DISTANCE_M = 0.8
+BENCHMARK_GOAL_DISTANCE_PROGRESS_M = 1.0
+BENCHMARK_LATERAL_DEVIATION_M = 15.0
+BENCHMARK_LATERAL_DEVIATION_SECONDS = 3.0
 
 
 class DriveMode(Enum):
@@ -81,11 +101,13 @@ class SimulationApp:
         requested_map_name: Optional[str] = None,
         selected_map_load_name: Optional[str] = None,
         existing_display_surface: Optional[pygame.Surface] = None,
+        benchmark_config: Optional[BenchmarkConfig] = None,
     ) -> None:
         pygame.init()
         self._requested_map_name = requested_map_name
         self._selected_map_load_name = selected_map_load_name or requested_map_name
         self._existing_display_surface = existing_display_surface
+        self._startup_benchmark_config = benchmark_config
         self._client_manager = CarlaClientManager(requested_map_name=requested_map_name)
         self._clock = SimulationClock()
         self._display: Optional[PygameDisplay] = None
@@ -116,6 +138,11 @@ class SimulationApp:
         self.waypoint_tracker = WaypointTracker()
         self.autonomous_controller = VehicleController()
         self.driving_behavior_config = DrivingBehaviorConfig()
+        self.sensor_noise_config = (
+            benchmark_config.sensor_noise_config if benchmark_config is not None else SensorNoiseConfig()
+        )
+        if benchmark_config is not None:
+            apply_behavior_values(self.driving_behavior_config, benchmark_config.vehicle_behavior_config)
         self.speed_planner = CurvatureSpeedPlanner(self.driving_behavior_config)
         self.actuator_realism = ActuatorRealism(self.driving_behavior_config)
 
@@ -148,8 +175,19 @@ class SimulationApp:
         self._route_generation_blocked = False
         self._control_status_text = "Test idle"
         self._behavior_tuning_panel: Optional[BehaviorTuningPanel] = None
+        self._sensor_noise_panel: Optional[ParameterEditor] = None
+        self._test_progress_panel: Optional[TestProgressPanel] = None
+        self._live_evaluation_panel: Optional[LiveEvaluationPanel] = None
         self._control_visual_widget: Optional[ControlVisualizationWidget] = None
         self._driving_diagnostics_widget: Optional[DrivingDiagnosticsWidget] = None
+        self._benchmark_start_attempted = False
+        self._last_sensor_apply_status = "Sensor noise changes respawn GNSS/IMU safely."
+        self._failure_monitor_last_progress_time: Optional[float] = None
+        self._failure_monitor_last_position: Optional[tuple[float, float]] = None
+        self._failure_monitor_last_distance_to_goal: Optional[float] = None
+        self._failure_monitor_last_closest_index = 0
+        self._failure_monitor_deviation_started: Optional[float] = None
+        self._last_benchmark_failure_reason = ""
 
     def _setup(self) -> None:
         """Initialize CARLA world, vehicle, sensors, route tools, and visualization."""
@@ -170,8 +208,14 @@ class SimulationApp:
             blueprint_library=self._client_manager.blueprint_library,
         )
         self._camera_sensor = self._sensor_manager.create_rgb_camera(attach_to=self._vehicle)
-        self._gnss_sensor = self._sensor_manager.create_gnss(attach_to=self._vehicle)
-        self._imu_sensor = self._sensor_manager.create_imu(attach_to=self._vehicle)
+        self._gnss_sensor = self._sensor_manager.create_gnss(
+            attach_to=self._vehicle,
+            config=self.sensor_noise_config,
+        )
+        self._imu_sensor = self._sensor_manager.create_imu(
+            attach_to=self._vehicle,
+            config=self.sensor_noise_config,
+        )
         self._lidar_sensor = self._sensor_manager.create_lidar(attach_to=self._vehicle)
 
         world_map = self._client_manager.world_map
@@ -211,6 +255,7 @@ class SimulationApp:
             self._planner_status = "Planner: CARLA"
 
         self._initialize_display()
+        self._apply_startup_benchmark_config()
 
     def _ensure_ready(self) -> None:
         required = {
@@ -247,6 +292,18 @@ class SimulationApp:
             self._display.behavior_tuning_rect,
             self.driving_behavior_config,
         )
+        self._sensor_noise_panel = ParameterEditor(
+            specs=SENSOR_NOISE_SPECS,
+            values=default_sensor_noise_values()
+            | {key: float(value) for key, value in self.sensor_noise_config.to_dict().items() if isinstance(value, (int, float))},
+            presets=SENSOR_NOISE_PRESETS,
+            active_preset=self.sensor_noise_config.preset_name,
+            title="Live Sensor Noise/Error Tuning",
+            on_commit=self._commit_live_sensor_noise,
+        )
+        self._sensor_noise_panel.status_text = self._last_sensor_apply_status
+        self._test_progress_panel = TestProgressPanel(self._display.behavior_tuning_rect)
+        self._live_evaluation_panel = LiveEvaluationPanel(self._display.control_panel_rect)
         self._control_visual_widget = ControlVisualizationWidget(self._display.control_visual_rect)
         self._driving_diagnostics_widget = DrivingDiagnosticsWidget(
             self._display.driving_state_rect,
@@ -264,6 +321,7 @@ class SimulationApp:
         self._control_panel.draw(self._display.surface)
         self._draw_driving_behavior_panels()
         self._draw_status_bar()
+        self._display.set_test_mode_titles(self._test_mode_active())
         self._display.end_frame()
 
     def _planned_route_for_metadata(
@@ -317,11 +375,73 @@ class SimulationApp:
             return {}
         return self._filter_manager.get_active_filter_tune()
 
+    def _apply_startup_benchmark_config(self) -> None:
+        config = self._startup_benchmark_config
+        if config is None or self._benchmark_start_attempted:
+            return
+        self._benchmark_start_attempted = True
+        self.sensor_noise_config = config.sensor_noise_config
+        apply_behavior_values(self.driving_behavior_config, config.vehicle_behavior_config)
+        if self._sensor_noise_panel is not None:
+            self._sensor_noise_panel.set_values(
+                {
+                    key: value
+                    for key, value in self.sensor_noise_config.to_dict().items()
+                    if isinstance(value, (int, float))
+                },
+                active_preset=config.sensor_noise_preset,
+                commit=False,
+            )
+
+        if self._filter_manager is not None:
+            ok, message = self._filter_manager.switch_filter(config.selected_filter, skip_current_sensor_frames=True)
+            if not ok:
+                self._planner_status = message
+                self._control_status_text = message
+                return
+            if not self._filter_manager.active_filter_safe_for_autonomous_control():
+                self._planner_status = "Benchmark blocked: selected filter is unsafe for autonomous control"
+                self._control_status_text = self._planner_status
+                return
+
+        if self._test_runner is None:
+            self._planner_status = "Benchmark runner unavailable"
+            self._control_status_text = self._planner_status
+            return
+        self._test_route_authoring_active = False
+        self._map_selection_active = False
+        self._drive_mode = DriveMode.AUTONOMOUS
+        started = self._test_runner.start_configured_benchmark(config, self._active_map_name)
+        self._planner_status = self._test_runner.status_text
+        self._control_status_text = self._test_runner.status_text
+        if not started and self._test_runner.needs_map_switch(self._active_map_name):
+            self._switch_map_for_benchmark()
+
     def _benchmark_output_status(self) -> str:
         runner = self._test_runner
         if runner is None or runner.benchmark_folder is None:
             return "Output: none"
         return f"Output: {runner.benchmark_folder.name}"
+
+    def _commit_live_sensor_noise(self, values: dict[str, float], preset_name: str) -> None:
+        if self._test_mode_active():
+            self._last_sensor_apply_status = "Sensor changes locked during benchmark test mode."
+            if self._sensor_noise_panel is not None:
+                self._sensor_noise_panel.status_text = self._last_sensor_apply_status
+            return
+        config = sensor_noise_config_from_values(values, preset_name=preset_name)
+        self.sensor_noise_config = config
+        try:
+            if self._gnss_sensor is not None:
+                self._gnss_sensor.apply_config(config, respawn=True)
+            if self._imu_sensor is not None:
+                self._imu_sensor.apply_config(config, respawn=True)
+            self._reset_estimator()
+            self._last_sensor_apply_status = "Applied: GNSS/IMU sensors respawned with updated noise."
+        except Exception as exc:
+            self._last_sensor_apply_status = f"Sensor noise apply failed: {exc}"
+        if self._sensor_noise_panel is not None:
+            self._sensor_noise_panel.status_text = self._last_sensor_apply_status
 
     def _active_performance_logger(self) -> FilterPerformanceLogger:
         if self._test_runner is not None and self._test_runner.current_logger is not None:
@@ -651,6 +771,9 @@ class SimulationApp:
             return False
         return self._filter_manager.active_filter_safe_for_autonomous_control()
 
+    def _test_mode_active(self) -> bool:
+        return bool(self._test_runner is not None and self._test_runner.is_active and self._test_runner.is_automated)
+
     def _active_filter_warning(self) -> str:
         if self._filter_manager is None or self._active_filter_safe_for_autonomous():
             return ""
@@ -762,6 +885,7 @@ class SimulationApp:
                 self._draw_driving_behavior_panels()
                 self._draw_control_panel()
                 self._draw_status_bar()
+                display.set_test_mode_titles(self._test_mode_active())
                 display.end_frame()
                 self._clock.tick_pygame()
         finally:
@@ -817,9 +941,17 @@ class SimulationApp:
             if event.type == pygame.KEYDOWN:
                 if not self._handle_key_down(event):
                     return False
-            elif self._behavior_tuning_panel is not None and self._behavior_tuning_panel.handle_event(event):
+            elif self._test_mode_active():
                 continue
             elif self._control_panel.handle_event(event):
+                continue
+            elif (
+                self._control_panel.active_tab == "Sensors"
+                and self._sensor_noise_panel is not None
+                and self._sensor_noise_panel.handle_event(event)
+            ):
+                continue
+            elif self._behavior_tuning_panel is not None and self._behavior_tuning_panel.handle_event(event):
                 continue
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 self._handle_mouse_button_down(event)
@@ -838,6 +970,10 @@ class SimulationApp:
         self._control_panel.set_rect(self._display.control_panel_rect)
         if self._behavior_tuning_panel is not None:
             self._behavior_tuning_panel.set_rect(self._display.behavior_tuning_rect)
+        if self._test_progress_panel is not None:
+            self._test_progress_panel.set_rect(self._display.behavior_tuning_rect)
+        if self._live_evaluation_panel is not None:
+            self._live_evaluation_panel.set_rect(self._display.control_panel_rect)
         if self._control_visual_widget is not None:
             self._control_visual_widget.set_rect(self._display.control_visual_rect)
         if self._driving_diagnostics_widget is not None:
@@ -1017,6 +1153,26 @@ class SimulationApp:
         self._planner_status = "Estimator reset"
         self._control_status_text = "Estimator reset"
 
+    def _respawn_benchmark_localization_sensors(self) -> None:
+        """Recreate GNSS/IMU actors so every benchmark attempt starts from the selected noise config."""
+        try:
+            if self._gnss_sensor is not None:
+                self._gnss_sensor.apply_config(self.sensor_noise_config, respawn=True)
+            if self._imu_sensor is not None:
+                self._imu_sensor.apply_config(self.sensor_noise_config, respawn=True)
+            self._latest_gnss_diagnostics = None
+            self._latest_gnss_frame = None
+            self._gnss_trail_xy.clear()
+        except RuntimeError as exc:
+            self._last_sensor_apply_status = f"Benchmark sensor respawn failed: {exc}"
+
+    def _reset_benchmark_failure_monitor(self) -> None:
+        self._failure_monitor_last_progress_time = None
+        self._failure_monitor_last_position = None
+        self._failure_monitor_last_distance_to_goal = None
+        self._failure_monitor_last_closest_index = 0
+        self._failure_monitor_deviation_started = None
+
     def _emergency_brake(self) -> None:
         if self._test_runner is not None and self._test_runner.is_active:
             self._test_runner.stop(aborted=True, reason="Test aborted: emergency brake")
@@ -1183,6 +1339,9 @@ class SimulationApp:
             self.route_planner.clear_route()
         self.waypoint_tracker.clear_route()
         self._latest_tracking = self._empty_tracking_status()
+        self._reset_benchmark_failure_monitor()
+        if self._test_mode_active():
+            self._respawn_benchmark_localization_sensors()
 
         self._pending_start_waypoint = start_waypoint
         self._pending_goal_waypoint = goal_waypoint
@@ -1356,7 +1515,110 @@ class SimulationApp:
             self.route_planner.clear_route()
         self.waypoint_tracker.clear_route()
         self._latest_tracking = self._empty_tracking_status()
+        self._reset_benchmark_failure_monitor()
         self._drive_mode = DriveMode.MANUAL
+        self._reset_driving_behavior()
+
+    def _switch_map_for_benchmark(self) -> None:
+        runner = self._test_runner
+        if runner is None or not runner.is_automated:
+            return
+        map_name = runner.required_map_name()
+        if not map_name:
+            return
+        load_name = self._client_manager.resolve_map_load_name(map_name)
+        runner_state_text = f"Loading map: {display_map_name(load_name)}"
+        self._planner_status = runner_state_text
+        self._control_status_text = runner_state_text
+        try:
+            self._destroy_world_actors_for_reload()
+            self._client_manager.load_world(load_name)
+            self._rebuild_world_context_after_map_load(selected_map_load_name=load_name)
+            runner.update_world_context(
+                world_map=self._client_manager.world_map,
+                route_store=self._test_route_store,
+                selected_map_load_name=map_name,
+            )
+            runner.begin_current_route(self._active_map_name)
+            self._drive_mode = DriveMode.AUTONOMOUS
+            self._planner_status = runner.status_text
+            self._control_status_text = runner.status_text
+        except Exception as exc:
+            runner.stop(aborted=True, reason=f"Map switch failed: {exc}")
+            self._planner_status = runner.status_text
+            self._control_status_text = runner.status_text
+
+    def _destroy_world_actors_for_reload(self) -> None:
+        if self._vehicle is not None:
+            try:
+                self._vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+            except RuntimeError:
+                pass
+        if self._sensor_manager is not None:
+            self._sensor_manager.destroy_all()
+        if self._vehicle_manager is not None:
+            self._vehicle_manager.destroy()
+        self._sensor_manager = None
+        self._camera_sensor = None
+        self._gnss_sensor = None
+        self._imu_sensor = None
+        self._lidar_sensor = None
+        self._vehicle_manager = None
+        self._vehicle = None
+
+    def _rebuild_world_context_after_map_load(self, selected_map_load_name: Optional[str]) -> None:
+        self._selected_map_load_name = selected_map_load_name
+        self._active_map_name = getattr(self._client_manager.world_map, "name", None)
+        self._active_map_id = normalize_map_name(self._active_map_name)
+        self._vehicle_manager = VehicleManager(
+            world=self._client_manager.world,
+            world_map=self._client_manager.world_map,
+            blueprint_library=self._client_manager.blueprint_library,
+        )
+        self._vehicle = self._vehicle_manager.spawn_vehicle()
+        self._sensor_manager = SensorManager(
+            world=self._client_manager.world,
+            blueprint_library=self._client_manager.blueprint_library,
+        )
+        self._camera_sensor = self._sensor_manager.create_rgb_camera(attach_to=self._vehicle)
+        self._gnss_sensor = self._sensor_manager.create_gnss(
+            attach_to=self._vehicle,
+            config=self.sensor_noise_config,
+        )
+        self._imu_sensor = self._sensor_manager.create_imu(
+            attach_to=self._vehicle,
+            config=self.sensor_noise_config,
+        )
+        self._lidar_sensor = self._sensor_manager.create_lidar(attach_to=self._vehicle)
+        self._waypoint_manager = WaypointManager(world_map=self._client_manager.world_map)
+        self._manual_controller = ManualController(vehicle=self._vehicle)
+        self._ground_truth_provider = GroundTruthStateProvider(vehicle=self._vehicle)
+        self._gnss_projector = GnssLocalProjector(world_map=self._client_manager.world_map)
+        self._filter_manager = FilterManager(
+            gnss_projector=self._gnss_projector,
+            gnss_sensor=self._gnss_sensor,
+            imu_sensor=self._imu_sensor,
+            default_filter_id=self._startup_benchmark_config.selected_filter
+            if self._startup_benchmark_config is not None
+            else "ca_kf",
+        )
+        if self._startup_benchmark_config is not None:
+            self._filter_manager.switch_filter(self._startup_benchmark_config.selected_filter, skip_current_sensor_frames=True)
+        self._map_selector = MapSelector(world_map=self._client_manager.world_map)
+        self.route_planner = RoutePlanner(world_map=self._client_manager.world_map)
+        self._topdown_renderer = TopDownMapRenderer(world_map=self._client_manager.world_map)
+        self._test_route_store = TestRouteStore(map_name=self._active_map_name)
+        self.waypoint_tracker.clear_route()
+        self._latest_tracking = self._empty_tracking_status()
+        self._latest_state = None
+        self._latest_ground_truth_state = None
+        self._latest_estimated_state = None
+        self._latest_localization_status = None
+        self._latest_gnss_diagnostics = None
+        self._latest_gnss_frame = None
+        self._gnss_trail_xy.clear()
+        self._cancel_route_activation()
+        self._reset_benchmark_failure_monitor()
         self._reset_driving_behavior()
 
     @staticmethod
@@ -1440,7 +1702,9 @@ class SimulationApp:
 
     def _draw_driving_behavior_panels(self) -> None:
         assert self._display is not None
-        if self._behavior_tuning_panel is not None:
+        if self._test_mode_active() and self._test_progress_panel is not None:
+            self._test_progress_panel.draw(self._display.surface, self._test_progress_lines())
+        elif self._behavior_tuning_panel is not None:
             self._behavior_tuning_panel.draw(self._display.surface)
         if self._control_visual_widget is not None:
             self._control_visual_widget.draw(
@@ -1459,12 +1723,125 @@ class SimulationApp:
     def _draw_control_panel(self) -> None:
         assert self._display is not None
         assert self._control_panel is not None
+        if self._test_mode_active() and self._live_evaluation_panel is not None:
+            self._update_live_evaluation_history()
+            self._live_evaluation_panel.draw(self._display.surface, self._live_evaluation_lines())
+            return
         self._update_control_panel_state()
         self._control_panel.draw(self._display.surface)
+        if self._control_panel.active_tab == "Sensors" and self._sensor_noise_panel is not None:
+            self._sensor_noise_panel.status_text = self._last_sensor_apply_status
+            sensor_rect = self._display.control_panel_rect.copy()
+            sensor_rect.top += 126
+            sensor_rect.height = max(40, sensor_rect.height - 126)
+            self._sensor_noise_panel.draw(self._display.surface, sensor_rect)
 
     def _draw_status_bar(self) -> None:
         assert self._display is not None
         self._status_bar.draw(self._display.surface, self._display.status_bar_rect)
+
+    def _test_progress_lines(self) -> list[str]:
+        runner = self._test_runner
+        config = runner.config if runner is not None else None
+        route = runner.current_route_name if runner is not None else ""
+        next_route = self._next_benchmark_route_name()
+        completion = self._route_completion_percent()
+        lines = [
+            "Test Mode: ON",
+            f"Route: {(runner.current_route_index + 1) if runner is not None else 0}/{runner.total_routes if runner is not None else 0}",
+            f"Current: {route or 'initializing'}",
+            f"Map: {self._active_map_display_name()}",
+            f"Filter: {self._active_filter_name()}",
+            f"State: {runner.state.value if runner is not None else 'n/a'}",
+            f"Route status: {runner.route_status if runner is not None else 'n/a'}",
+            f"Attempt: {runner.current_attempt if runner is not None and runner.current_attempt else 0}/{runner.max_attempts if runner is not None else 0}",
+            f"Test time: {runner.elapsed_test_seconds():.1f}s" if runner is not None else "Test time: n/a",
+            f"Route time: {runner.elapsed_route_seconds():.1f}s" if runner is not None else "Route time: n/a",
+            f"Distance to goal: {self._format_optional_metric(self._latest_tracking.distance_to_goal_m, 'm')}",
+            f"Completion: {completion:.0f}%" if completion is not None else "Completion: n/a",
+            f"Next: {next_route or 'none'}",
+        ]
+        if config is not None:
+            lines.insert(5, f"Sensor preset: {config.sensor_noise_preset}")
+            lines.insert(6, f"Behavior preset: {config.vehicle_behavior_preset}")
+        if runner is not None and runner.status_text:
+            lines.append(runner.status_text)
+        last_failure = runner.last_failure_reason if runner is not None else self._last_benchmark_failure_reason
+        if last_failure:
+            lines.append(f"Last failure: {last_failure}")
+        return lines
+
+    def _live_evaluation_lines(self) -> list[str]:
+        logger = self._active_performance_logger()
+        metrics = logger.running_metrics()
+        diagnostics = self._filter_manager.get_diagnostics() if self._filter_manager is not None else {}
+        ratio = self._ratio(logger.current_raw_gnss_error_m, logger.current_position_error_m)
+        improvement = None
+        raw_rmse = metrics.get("raw_gnss_rmse_m")
+        filtered_rmse = metrics.get("filtered_rmse_m")
+        if raw_rmse is not None and raw_rmse > 0.0 and filtered_rmse is not None:
+            improvement = 100.0 * (raw_rmse - filtered_rmse) / raw_rmse
+        lines = [
+            f"Current position error: {self._format_optional_metric(logger.current_position_error_m, 'm')}",
+            f"Current speed error: {self._format_optional_metric(self._current_speed_error(), 'm/s')}",
+            f"Current yaw error: {self._format_optional_metric(self._current_yaw_error(), 'deg')}",
+            f"Running position RMSE: {self._format_optional_metric(metrics.get('filtered_rmse_m'), 'm')}",
+            f"Running speed RMSE: {self._format_optional_metric(metrics.get('speed_rmse_mps'), 'm/s')}",
+            f"Running yaw RMSE: {self._format_optional_metric(metrics.get('yaw_rmse_deg'), 'deg')}",
+            f"Raw GNSS RMSE: {self._format_optional_metric(metrics.get('raw_gnss_rmse_m'), 'm')}",
+            f"Filtered RMSE: {self._format_optional_metric(metrics.get('filtered_rmse_m'), 'm')}",
+            f"Improvement: {self._format_optional_metric(improvement, '%')}",
+            f"Mean NIS: {self._format_optional_metric(metrics.get('mean_nis'), '')}",
+            f"Mean NEES: {self._format_optional_metric(metrics.get('mean_nees'), '')}",
+            f"P95 position error: {self._format_optional_metric(metrics.get('filtered_p95_error_m'), 'm')}",
+            f"Max position error: {self._format_optional_metric(metrics.get('filtered_max_error_m'), 'm')}",
+            f"Innovation norm: {self._format_optional_metric(metrics.get('innovation_mean'), '')}",
+            f"GNSS updates: {self._format_debug_value(diagnostics.get('last_gnss_frame'))}",
+            f"IMU updates: {self._format_debug_value(diagnostics.get('last_imu_frame'))}",
+            f"Instant improvement ratio: {self._format_optional_metric(ratio, 'x')}",
+        ]
+        return lines
+
+    def _update_live_evaluation_history(self) -> None:
+        if self._live_evaluation_panel is None:
+            return
+        self._live_evaluation_panel.update_histories(
+            position_error_m=self._active_performance_logger().current_position_error_m,
+            raw_error_m=self._active_performance_logger().current_raw_gnss_error_m,
+            actual_speed_mps=self._latest_ground_truth_state.speed if self._latest_ground_truth_state else None,
+            estimated_speed_mps=self._latest_estimated_state.speed if self._latest_estimated_state else None,
+        )
+
+    def _current_speed_error(self) -> Optional[float]:
+        if self._latest_ground_truth_state is None or self._latest_estimated_state is None:
+            return None
+        return self._latest_estimated_state.speed - self._latest_ground_truth_state.speed
+
+    def _current_yaw_error(self) -> Optional[float]:
+        if self._latest_ground_truth_state is None or self._latest_estimated_state is None:
+            return None
+        delta = self._latest_estimated_state.yaw - self._latest_ground_truth_state.yaw
+        while delta > 180.0:
+            delta -= 360.0
+        while delta < -180.0:
+            delta += 360.0
+        return delta
+
+    def _route_completion_percent(self) -> Optional[float]:
+        route = self.route_planner.get_route() if self.route_planner is not None else []
+        if not route:
+            return None
+        return 100.0 * min(1.0, max(0.0, self._latest_tracking.closest_index / max(1, len(route) - 1)))
+
+    def _next_benchmark_route_name(self) -> str:
+        runner = self._test_runner
+        if runner is None or not runner.is_automated or runner.config is None:
+            return ""
+        next_index = runner.current_route_index + (1 if runner.route_running else 0)
+        routes = runner.config.selected_routes
+        if 0 <= next_index < len(routes):
+            return routes[next_index].name
+        return ""
 
     def _update_test_performance(self) -> None:
         runner = self._test_runner
@@ -1485,6 +1862,8 @@ class SimulationApp:
                 gnss_diagnostics=self._latest_gnss_diagnostics,
                 tracking=self._latest_tracking,
                 route_completed=self._latest_tracking.completed,
+                filter_diagnostics=self._filter_manager.get_diagnostics() if self._filter_manager is not None else None,
+                speed_plan=self._latest_speed_plan,
             )
 
         route = self.route_planner.get_route() if self.route_planner is not None else []
@@ -1493,13 +1872,33 @@ class SimulationApp:
             and not route
             and not self._latest_tracking.completed
         )
-        paths = runner.update(
-            route_completed=self._latest_tracking.completed,
-            route_failed=route_failed,
-        )
+        failure_reason = self._benchmark_failure_reason(route_failed=route_failed)
+        if failure_reason:
+            self._last_benchmark_failure_reason = failure_reason
+            if self._vehicle is not None:
+                try:
+                    self._vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+                except RuntimeError:
+                    pass
+            paths = runner.fail_current_attempt(
+                reason=failure_reason,
+                simulation_time_s=self._latest_ground_truth_state.timestamp
+                if self._latest_ground_truth_state is not None
+                else None,
+                active_map_name=self._active_map_name,
+            )
+            self._reset_benchmark_failure_monitor()
+        else:
+            paths = runner.update(
+                route_completed=self._latest_tracking.completed,
+                route_failed=route_failed,
+                active_map_name=self._active_map_name,
+            )
         if paths is not None:
             self._control_status_text = runner.status_text
             self._planner_status = runner.status_text
+        if runner.needs_map_switch(self._active_map_name):
+            self._switch_map_for_benchmark()
 
     def _benchmark_phase(self) -> str:
         if self._latest_tracking.completed:
@@ -1509,6 +1908,73 @@ class SimulationApp:
         if self._route_activation_state == RouteActivationState.ROUTE_ACTIVE:
             return "driving"
         return "idle"
+
+    def _benchmark_failure_reason(self, route_failed: bool) -> str:
+        runner = self._test_runner
+        if runner is None or not runner.route_running or not self._test_mode_active():
+            self._reset_benchmark_failure_monitor()
+            return ""
+        if route_failed:
+            return "Route unavailable before completion"
+        if self._latest_tracking.completed:
+            self._reset_benchmark_failure_monitor()
+            return ""
+        if self._route_activation_state != RouteActivationState.ROUTE_ACTIVE:
+            self._reset_benchmark_failure_monitor()
+            return ""
+        state = self._latest_ground_truth_state
+        if state is None:
+            return ""
+
+        now = time.monotonic()
+        position = (float(state.x), float(state.y))
+        speed = abs(float(state.speed))
+        tracking = self._latest_tracking
+        cte = tracking.cross_track_error_m
+        if isinstance(cte, (int, float)) and math.isfinite(cte) and cte >= BENCHMARK_LATERAL_DEVIATION_M:
+            if self._failure_monitor_deviation_started is None:
+                self._failure_monitor_deviation_started = now
+            elif now - self._failure_monitor_deviation_started >= BENCHMARK_LATERAL_DEVIATION_SECONDS:
+                return f"Large lateral deviation ({cte:.1f} m from route)"
+        else:
+            self._failure_monitor_deviation_started = None
+
+        if self._failure_monitor_last_progress_time is None:
+            self._failure_monitor_last_progress_time = now
+            self._failure_monitor_last_position = position
+            self._failure_monitor_last_distance_to_goal = self._finite_float(tracking.distance_to_goal_m)
+            self._failure_monitor_last_closest_index = tracking.closest_index
+            return ""
+
+        moved_m = 0.0
+        if self._failure_monitor_last_position is not None:
+            moved_m = math.hypot(
+                position[0] - self._failure_monitor_last_position[0],
+                position[1] - self._failure_monitor_last_position[1],
+            )
+        current_goal_distance = self._finite_float(tracking.distance_to_goal_m)
+        previous_goal_distance = self._failure_monitor_last_distance_to_goal
+        goal_distance_progress = (
+            previous_goal_distance is not None
+            and current_goal_distance is not None
+            and previous_goal_distance - current_goal_distance >= BENCHMARK_GOAL_DISTANCE_PROGRESS_M
+        )
+        index_progress = tracking.closest_index > self._failure_monitor_last_closest_index
+        movement_progress = moved_m >= BENCHMARK_PROGRESS_DISTANCE_M
+
+        if movement_progress or goal_distance_progress or index_progress:
+            self._failure_monitor_last_progress_time = now
+            self._failure_monitor_last_position = position
+            self._failure_monitor_last_distance_to_goal = current_goal_distance
+            self._failure_monitor_last_closest_index = tracking.closest_index
+            return ""
+
+        stalled_seconds = now - self._failure_monitor_last_progress_time
+        if speed <= BENCHMARK_STUCK_SPEED_MPS and stalled_seconds >= BENCHMARK_STUCK_SECONDS:
+            return f"Vehicle stuck: speed {speed:.2f} m/s, no route progress for {stalled_seconds:.1f}s"
+        if stalled_seconds >= BENCHMARK_NO_PROGRESS_SECONDS:
+            return f"No route progress for {stalled_seconds:.1f}s"
+        return ""
 
     def _update_sensor_diagnostics(self) -> None:
         gnss = self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None
@@ -1529,6 +1995,12 @@ class SimulationApp:
         if self._latest_gnss_diagnostics is None:
             return None
         return self._latest_gnss_diagnostics.local_x, self._latest_gnss_diagnostics.local_y
+
+    @staticmethod
+    def _finite_float(value: object) -> Optional[float]:
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+        return None
 
     @staticmethod
     def _format_optional_metric(value: Optional[float], suffix: str) -> str:

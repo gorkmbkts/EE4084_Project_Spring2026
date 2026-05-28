@@ -123,7 +123,7 @@ class TabbedPanel:
             if button.handle_event(event):
                 return True
 
-        return event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL)
+        return False
 
     def draw(self, surface: pygame.Surface) -> None:
         pygame.draw.rect(

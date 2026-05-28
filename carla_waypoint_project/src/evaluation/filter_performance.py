@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from config.settings import BENCHMARK
+from src.control.driving_behavior import SpeedPlan
 from src.control.waypoint_tracker import TrackingStatus
 from src.localization.gnss_projection import GnssDiagnostics
 from src.localization.state_estimator import EgoState
@@ -46,6 +47,22 @@ class FilterPerformanceSample:
     closest_index: int
     target_index: int
     route_completed: bool
+    x_error_m: Optional[float]
+    y_error_m: Optional[float]
+    speed_error_mps: Optional[float]
+    yaw_error_deg: Optional[float]
+    curvature_score: Optional[float]
+    curvature_rad_per_m: Optional[float]
+    curvature_mode: Optional[str]
+    nis: Optional[float]
+    nees: Optional[float]
+    innovation_norm: Optional[float]
+    covariance_x_std_m: Optional[float]
+    covariance_y_std_m: Optional[float]
+    within_2sigma_x: Optional[bool]
+    within_2sigma_y: Optional[bool]
+    gnss_update_frame: Optional[int]
+    imu_update_frame: Optional[int]
 
 
 class FilterPerformanceLogger:
@@ -130,6 +147,8 @@ class FilterPerformanceLogger:
         route_completed: bool = False,
         phase: str = "driving",
         filtered_state: Optional[EgoState] = None,
+        filter_diagnostics: Optional[dict[str, object]] = None,
+        speed_plan: Optional[SpeedPlan] = None,
     ) -> Optional[FilterPerformanceSample]:
         if not self._started or tracking is None:
             return None
@@ -139,6 +158,19 @@ class FilterPerformanceLogger:
         timestamp = self._sample_timestamp(ground_truth_state, filtered_state)
         filtered_error = self._position_error(filtered_state, ground_truth_state)
         raw_gnss_error = gnss_diagnostics.horizontal_error_m if gnss_diagnostics is not None else None
+        x_error = self._axis_error(filtered_state, ground_truth_state, "x")
+        y_error = self._axis_error(filtered_state, ground_truth_state, "y")
+        speed_error = self._speed_error(filtered_state, ground_truth_state)
+        yaw_error = self._yaw_error(filtered_state, ground_truth_state)
+        diagnostics = filter_diagnostics or {}
+        covariance_diag = diagnostics.get("covariance_diagonal")
+        covariance_x_std = self._covariance_std(covariance_diag, 0)
+        covariance_y_std = self._covariance_std(covariance_diag, 1)
+        nis = self._finite_or_none(diagnostics.get("nis") if isinstance(diagnostics, dict) else None)
+        innovation_norm = self._innovation_norm(diagnostics.get("innovation") if isinstance(diagnostics, dict) else None)
+        nees = self._position_nees(x_error, y_error, covariance_x_std, covariance_y_std)
+        gnss_frame = self._optional_int(diagnostics.get("last_gnss_frame") if isinstance(diagnostics, dict) else None)
+        imu_frame = self._optional_int(diagnostics.get("last_imu_frame") if isinstance(diagnostics, dict) else None)
         sample = FilterPerformanceSample(
             timestamp=timestamp,
             route_name=route_name,
@@ -166,12 +198,31 @@ class FilterPerformanceLogger:
             closest_index=int(tracking.closest_index),
             target_index=int(tracking.target_index),
             route_completed=route_completed,
+            x_error_m=x_error,
+            y_error_m=y_error,
+            speed_error_mps=speed_error,
+            yaw_error_deg=yaw_error,
+            curvature_score=self._finite_or_none(speed_plan.curvature_score if speed_plan is not None else None),
+            curvature_rad_per_m=self._finite_or_none(speed_plan.curvature_rad_per_m if speed_plan is not None else None),
+            curvature_mode=speed_plan.mode if speed_plan is not None else None,
+            nis=nis,
+            nees=nees,
+            innovation_norm=innovation_norm,
+            covariance_x_std_m=covariance_x_std,
+            covariance_y_std_m=covariance_y_std,
+            within_2sigma_x=self._within_sigma(x_error, covariance_x_std, sigma=2.0),
+            within_2sigma_y=self._within_sigma(y_error, covariance_y_std, sigma=2.0),
+            gnss_update_frame=gnss_frame,
+            imu_update_frame=imu_frame,
         )
         self._samples.append(sample)
         return sample
 
     def running_rmse_m(self) -> Optional[float]:
         return self._rmse(self._finite_values(sample.filtered_position_error_m for sample in self._samples))
+
+    def running_metrics(self) -> dict[str, Optional[float]]:
+        return self._metrics_for_samples(self._samples)
 
     def build_summary(self) -> dict[str, object]:
         overall_metrics = self._metrics_for_samples(self._samples)
@@ -204,6 +255,10 @@ class FilterPerformanceLogger:
             "active_filter_rmse_m": filtered_rmse,
             "filtered_rmse_m": filtered_rmse,
             "filtered_mae_m": overall_metrics["filtered_mae_m"],
+            "x_rmse_m": overall_metrics["x_rmse_m"],
+            "y_rmse_m": overall_metrics["y_rmse_m"],
+            "speed_rmse_mps": overall_metrics["speed_rmse_mps"],
+            "yaw_rmse_deg": overall_metrics["yaw_rmse_deg"],
             "filtered_max_error_m": overall_metrics["filtered_max_error_m"],
             "filtered_p95_error_m": overall_metrics["filtered_p95_error_m"],
             "kalman_rmse_m": filtered_rmse,
@@ -221,10 +276,23 @@ class FilterPerformanceLogger:
             "max_cross_track_error_m": overall_metrics["max_cross_track_error_m"],
             "p95_cross_track_error_m": overall_metrics["p95_cross_track_error_m"],
             "mean_heading_error_deg": overall_metrics["mean_heading_error_deg"],
+            "mean_nis": overall_metrics["mean_nis"],
+            "mean_nees": overall_metrics["mean_nees"],
+            "innovation_mean": overall_metrics["innovation_mean"],
+            "innovation_std": overall_metrics["innovation_std"],
+            "within_2sigma_x_pct": overall_metrics["within_2sigma_x_pct"],
+            "within_2sigma_y_pct": overall_metrics["within_2sigma_y_pct"],
+            "gnss_update_count": self._unique_count(sample.gnss_update_frame for sample in self._samples),
+            "imu_update_count": self._unique_count(sample.imu_update_frame for sample in self._samples),
+            "segment_metrics": self._segment_metrics(self._samples),
             "driving_sample_count": len(driving_samples),
             "driving_active_filter_rmse_m": driving_filtered_rmse,
             "driving_filtered_rmse_m": driving_filtered_rmse,
             "driving_filtered_mae_m": driving_metrics["filtered_mae_m"],
+            "driving_x_rmse_m": driving_metrics["x_rmse_m"],
+            "driving_y_rmse_m": driving_metrics["y_rmse_m"],
+            "driving_speed_rmse_mps": driving_metrics["speed_rmse_mps"],
+            "driving_yaw_rmse_deg": driving_metrics["yaw_rmse_deg"],
             "driving_filtered_max_error_m": driving_metrics["filtered_max_error_m"],
             "driving_filtered_p95_error_m": driving_metrics["filtered_p95_error_m"],
             "driving_kalman_rmse_m": driving_filtered_rmse,
@@ -242,6 +310,9 @@ class FilterPerformanceLogger:
             "driving_max_cross_track_error_m": driving_metrics["max_cross_track_error_m"],
             "driving_p95_cross_track_error_m": driving_metrics["p95_cross_track_error_m"],
             "driving_mean_heading_error_deg": driving_metrics["mean_heading_error_deg"],
+            "driving_mean_nis": driving_metrics["mean_nis"],
+            "driving_mean_nees": driving_metrics["mean_nees"],
+            "driving_segment_metrics": self._segment_metrics(driving_samples),
             "excluded_filtered_plot_sample_count": self._excluded_filtered_plot_sample_count(driving_samples),
             "excluded_kalman_plot_sample_count": self._excluded_filtered_plot_sample_count(driving_samples),
         }
@@ -291,14 +362,91 @@ class FilterPerformanceLogger:
         return math.hypot(state.x - ground_truth_state.x, state.y - ground_truth_state.y)
 
     @staticmethod
+    def _axis_error(state: Optional[EgoState], ground_truth_state: Optional[EgoState], axis: str) -> Optional[float]:
+        if state is None or ground_truth_state is None:
+            return None
+        return float(getattr(state, axis) - getattr(ground_truth_state, axis))
+
+    @staticmethod
+    def _speed_error(state: Optional[EgoState], ground_truth_state: Optional[EgoState]) -> Optional[float]:
+        if state is None or ground_truth_state is None:
+            return None
+        return float(state.speed - ground_truth_state.speed)
+
+    @staticmethod
+    def _yaw_error(state: Optional[EgoState], ground_truth_state: Optional[EgoState]) -> Optional[float]:
+        if state is None or ground_truth_state is None:
+            return None
+        delta = float(state.yaw - ground_truth_state.yaw)
+        while delta > 180.0:
+            delta -= 360.0
+        while delta < -180.0:
+            delta += 360.0
+        return delta
+
+    @staticmethod
     def _finite_or_none(value: Optional[float]) -> Optional[float]:
-        if value is None or not math.isfinite(value):
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             return None
         return float(value)
 
+    @classmethod
+    def _covariance_std(cls, covariance_diag: object, index: int) -> Optional[float]:
+        if not isinstance(covariance_diag, list) or index >= len(covariance_diag):
+            return None
+        value = cls._finite_or_none(covariance_diag[index])
+        if value is None or value < 0.0:
+            return None
+        return math.sqrt(value)
+
+    @classmethod
+    def _innovation_norm(cls, innovation: object) -> Optional[float]:
+        if not isinstance(innovation, (list, tuple)):
+            return None
+        values = cls._finite_values(innovation)
+        if not values:
+            return None
+        return math.sqrt(sum(value * value for value in values))
+
+    @staticmethod
+    def _position_nees(
+        x_error: Optional[float],
+        y_error: Optional[float],
+        covariance_x_std: Optional[float],
+        covariance_y_std: Optional[float],
+    ) -> Optional[float]:
+        if x_error is None or y_error is None or covariance_x_std is None or covariance_y_std is None:
+            return None
+        x_var = covariance_x_std * covariance_x_std
+        y_var = covariance_y_std * covariance_y_std
+        if x_var <= 1.0e-9 or y_var <= 1.0e-9:
+            return None
+        return (x_error * x_error / x_var) + (y_error * y_error / y_var)
+
+    @staticmethod
+    def _within_sigma(error: Optional[float], stddev: Optional[float], sigma: float) -> Optional[bool]:
+        if error is None or stddev is None or stddev <= 0.0:
+            return None
+        return abs(error) <= sigma * stddev
+
+    @staticmethod
+    def _optional_int(value: object) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     @staticmethod
     def _finite_values(values: Iterable[Optional[float]]) -> list[float]:
-        return [float(value) for value in values if value is not None and math.isfinite(value)]
+        result = []
+        for value in values:
+            if not isinstance(value, (int, float)):
+                continue
+            if math.isfinite(float(value)):
+                result.append(float(value))
+        return result
 
     @classmethod
     def _metrics_for_samples(cls, samples: Iterable[FilterPerformanceSample]) -> dict[str, Optional[float]]:
@@ -310,9 +458,20 @@ class FilterPerformanceLogger:
             abs(value)
             for value in cls._finite_values(sample.heading_error_deg for sample in sample_list)
         ]
+        x_errors = cls._finite_values(sample.x_error_m for sample in sample_list)
+        y_errors = cls._finite_values(sample.y_error_m for sample in sample_list)
+        speed_errors = cls._finite_values(sample.speed_error_mps for sample in sample_list)
+        yaw_errors = [abs(value) for value in cls._finite_values(sample.yaw_error_deg for sample in sample_list)]
+        nis_values = cls._finite_values(sample.nis for sample in sample_list)
+        nees_values = cls._finite_values(sample.nees for sample in sample_list)
+        innovation_values = cls._finite_values(sample.innovation_norm for sample in sample_list)
         return {
             "filtered_rmse_m": cls._rmse(filtered_errors),
             "filtered_mae_m": cls._mean(filtered_errors),
+            "x_rmse_m": cls._rmse(x_errors),
+            "y_rmse_m": cls._rmse(y_errors),
+            "speed_rmse_mps": cls._rmse(speed_errors),
+            "yaw_rmse_deg": cls._rmse(yaw_errors),
             "filtered_max_error_m": max(filtered_errors) if filtered_errors else None,
             "filtered_p95_error_m": cls._percentile(filtered_errors, 95.0),
             "raw_gnss_rmse_m": cls._rmse(raw_gnss_errors),
@@ -323,7 +482,45 @@ class FilterPerformanceLogger:
             "max_cross_track_error_m": max(cross_track_errors) if cross_track_errors else None,
             "p95_cross_track_error_m": cls._percentile(cross_track_errors, 95.0),
             "mean_heading_error_deg": cls._mean(heading_errors),
+            "mean_nis": cls._mean(nis_values),
+            "mean_nees": cls._mean(nees_values),
+            "innovation_mean": cls._mean(innovation_values),
+            "innovation_std": cls._stddev(innovation_values),
+            "within_2sigma_x_pct": cls._boolean_percentage(sample.within_2sigma_x for sample in sample_list),
+            "within_2sigma_y_pct": cls._boolean_percentage(sample.within_2sigma_y for sample in sample_list),
         }
+
+    @classmethod
+    def _segment_metrics(cls, samples: Iterable[FilterPerformanceSample]) -> dict[str, dict[str, Optional[float]]]:
+        buckets: dict[str, list[FilterPerformanceSample]] = {}
+        for sample in samples:
+            segment = cls._segment_name(sample)
+            buckets.setdefault(segment, []).append(sample)
+        return {
+            segment: {
+                "sample_count": len(segment_samples),
+                "position_rmse_m": cls._rmse(cls._finite_values(item.filtered_position_error_m for item in segment_samples)),
+                "speed_rmse_mps": cls._rmse(cls._finite_values(item.speed_error_mps for item in segment_samples)),
+                "yaw_rmse_deg": cls._rmse([abs(value) for value in cls._finite_values(item.yaw_error_deg for item in segment_samples)]),
+                "mean_nis": cls._mean(cls._finite_values(item.nis for item in segment_samples)),
+                "mean_nees": cls._mean(cls._finite_values(item.nees for item in segment_samples)),
+            }
+            for segment, segment_samples in sorted(buckets.items())
+        }
+
+    @staticmethod
+    def _segment_name(sample: FilterPerformanceSample) -> str:
+        mode = (sample.curvature_mode or "").lower()
+        score = sample.curvature_score
+        if "approach" in mode:
+            return "curve_approach"
+        if "curve" in mode:
+            return "curve"
+        if "stopping" in mode:
+            return "curve_exit"
+        if isinstance(score, (int, float)) and score >= 0.18:
+            return "curve"
+        return "straight"
 
     @classmethod
     def _excluded_filtered_plot_sample_count(cls, samples: Iterable[FilterPerformanceSample]) -> int:
@@ -378,6 +575,24 @@ class FilterPerformanceLogger:
         if not values:
             return None
         return sum(values) / len(values)
+
+    @staticmethod
+    def _stddev(values: list[float]) -> Optional[float]:
+        if len(values) < 2:
+            return None
+        mean = sum(values) / len(values)
+        return math.sqrt(sum((value - mean) ** 2 for value in values) / (len(values) - 1))
+
+    @staticmethod
+    def _boolean_percentage(values: Iterable[Optional[bool]]) -> Optional[float]:
+        valid = [value for value in values if value is not None]
+        if not valid:
+            return None
+        return 100.0 * sum(1 for value in valid if value) / len(valid)
+
+    @staticmethod
+    def _unique_count(values: Iterable[Optional[int]]) -> int:
+        return len({value for value in values if value is not None})
 
     @staticmethod
     def _percentile(values: list[float], percentile: float) -> Optional[float]:

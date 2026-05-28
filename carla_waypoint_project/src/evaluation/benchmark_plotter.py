@@ -21,20 +21,45 @@ RouteBounds = tuple[float, float, float, float]
 
 
 def generate_benchmark_plots(benchmark_folder: Path) -> list[Path]:
-    """Generate benchmark plots from samples.csv, metadata.json, and summary.json."""
+    """Generate benchmark plots from route benchmark CSV/JSON files."""
     benchmark_folder = Path(benchmark_folder)
     plots_dir = benchmark_folder / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     metadata = _read_json(benchmark_folder / "metadata.json")
-    summary = _read_json(benchmark_folder / "summary.json")
-    samples = _read_samples(benchmark_folder / "samples.csv")
+    summary = _read_json(_first_existing(benchmark_folder / "route_summary.json", benchmark_folder / "summary.json"))
+    samples = _read_samples(_first_existing(benchmark_folder / "timeseries.csv", benchmark_folder / "samples.csv"))
 
     outputs = [
         _plot_trajectory(plots_dir / "trajectory_comparison.png", metadata, samples),
+        _plot_position_error(plots_dir / "position_error_over_time.png", metadata, samples),
+        _plot_raw_vs_filtered_error(plots_dir / "raw_gnss_vs_filtered_position_error.png", metadata, samples),
+        _plot_speed_comparison(plots_dir / "ground_truth_vs_estimated_speed.png", metadata, samples),
+        _plot_yaw_comparison(plots_dir / "ground_truth_vs_estimated_yaw.png", metadata, samples),
+        _plot_metric_over_time(plots_dir / "nis_over_time.png", metadata, samples, "nis", "NIS"),
+        _plot_metric_over_time(plots_dir / "nees_over_time.png", metadata, samples, "nees", "NEES"),
+        _plot_sigma_bounds(plots_dir / "estimation_error_2sigma_bounds.png", metadata, samples),
+        _plot_segment_rmse(plots_dir / "segment_rmse_bar_chart.png", metadata, summary),
+        _plot_curvature_vs_error(plots_dir / "curvature_severity_vs_position_error.png", metadata, samples),
         _plot_localization_error(plots_dir / "localization_error_over_time.png", samples),
         _plot_cross_track_error(plots_dir / "cross_track_error_over_time.png", samples),
         _plot_summary_dashboard(plots_dir / "summary_dashboard.png", metadata, summary, samples),
+    ]
+    return outputs
+
+
+def generate_aggregate_benchmark_plots(run_folder: Path) -> list[Path]:
+    """Generate aggregate plots for a multi-route automated benchmark run."""
+    run_folder = Path(run_folder)
+    plots_dir = run_folder / "aggregate_plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    rows = _read_csv_dicts(run_folder / "aggregate_summary.csv")
+    outputs = [
+        _plot_aggregate_bar(plots_dir / "position_rmse_per_route.png", rows, "filtered_rmse_m", "Position RMSE (m)"),
+        _plot_aggregate_raw_vs_filtered(plots_dir / "raw_gnss_rmse_vs_filtered_rmse.png", rows),
+        _plot_aggregate_bar(plots_dir / "improvement_percentage_per_route.png", rows, "improvement_percent", "Improvement (%)"),
+        _plot_aggregate_dual_metric(plots_dir / "mean_nees_nis_per_route.png", rows, "mean_nees", "mean_nis", "Mean NEES", "Mean NIS"),
+        _plot_aggregate_segments(plots_dir / "segment_rmse_summary.png", run_folder),
     ]
     return outputs
 
@@ -51,6 +76,172 @@ def _plot_trajectory(output_path: Path, metadata: dict[str, object], samples: li
 def _plot_localization_error(output_path: Path, samples: list[dict[str, object]]) -> Path:
     fig, ax = plt.subplots(figsize=(10, 5))
     _draw_localization_error_panel(ax, samples)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_position_error(output_path: Path, metadata: dict[str, object], samples: list[dict[str, object]]) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    metric_samples = _samples_for_metric_plots(samples)
+    _plot_series(ax, metric_samples, "filtered_position_error_m", "Filtered position error")
+    ax.set_title(_title_with_context("Position Error Over Time", metadata))
+    ax.set_xlabel("Time since benchmark start (s)")
+    ax.set_ylabel("Position error (m)")
+    ax.grid(True, alpha=0.3)
+    _warn_if_no_series(ax, metric_samples, "filtered_position_error_m", "No filtered position error samples")
+    _legend_if_labels(ax, fontsize=8)
+    _add_metadata_box(ax, metadata)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_raw_vs_filtered_error(output_path: Path, metadata: dict[str, object], samples: list[dict[str, object]]) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    _draw_localization_error_panel(ax, samples)
+    ax.set_title(_title_with_context("Raw GNSS vs Filtered Position Error", metadata))
+    _add_metadata_box(ax, metadata)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_speed_comparison(output_path: Path, metadata: dict[str, object], samples: list[dict[str, object]]) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    metric_samples = _samples_for_metric_plots(samples)
+    _plot_series(ax, metric_samples, "ground_truth_speed", "Ground truth speed")
+    _plot_series(ax, metric_samples, "filtered_speed", "Estimated speed", linestyle=":")
+    ax.set_title(_title_with_context("Ground Truth Speed vs Estimated Speed", metadata))
+    ax.set_xlabel("Time since benchmark start (s)")
+    ax.set_ylabel("Speed (m/s)")
+    ax.grid(True, alpha=0.3)
+    _warn_if_no_series(ax, metric_samples, "filtered_speed", "No estimated speed samples")
+    _legend_if_labels(ax, fontsize=8)
+    _add_metadata_box(ax, metadata)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_yaw_comparison(output_path: Path, metadata: dict[str, object], samples: list[dict[str, object]]) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    metric_samples = _samples_for_metric_plots(samples)
+    _plot_series(ax, metric_samples, "ground_truth_yaw", "Ground truth yaw")
+    _plot_series(ax, metric_samples, "filtered_yaw", "Estimated yaw", linestyle=":")
+    ax.set_title(_title_with_context("Ground Truth Yaw vs Estimated Yaw", metadata))
+    ax.set_xlabel("Time since benchmark start (s)")
+    ax.set_ylabel("Yaw (deg)")
+    ax.grid(True, alpha=0.3)
+    _warn_if_no_series(ax, metric_samples, "filtered_yaw", "No estimated yaw samples")
+    _legend_if_labels(ax, fontsize=8)
+    _add_metadata_box(ax, metadata)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_metric_over_time(
+    output_path: Path,
+    metadata: dict[str, object],
+    samples: list[dict[str, object]],
+    field: str,
+    label: str,
+) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    metric_samples = _samples_for_metric_plots(samples)
+    _plot_series(ax, metric_samples, field, label)
+    ax.set_title(_title_with_context(f"{label} Over Time", metadata))
+    ax.set_xlabel("Time since benchmark start (s)")
+    ax.set_ylabel(label)
+    ax.grid(True, alpha=0.3)
+    _warn_if_no_series(ax, metric_samples, field, f"No {label} samples available")
+    _legend_if_labels(ax, fontsize=8)
+    _add_metadata_box(ax, metadata)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_sigma_bounds(output_path: Path, metadata: dict[str, object], samples: list[dict[str, object]]) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    metric_samples = _samples_for_metric_plots(samples)
+    times, x_errors = _time_series(metric_samples, "x_error_m")
+    _times_y, y_errors = _time_series(metric_samples, "y_error_m", base_time=_base_timestamp(metric_samples))
+    _times_sx, sigma_x = _time_series(metric_samples, "covariance_x_std_m", base_time=_base_timestamp(metric_samples))
+    _times_sy, sigma_y = _time_series(metric_samples, "covariance_y_std_m", base_time=_base_timestamp(metric_samples))
+    if times and x_errors:
+        ax.plot(times, x_errors, label="X error")
+    if _times_y and y_errors:
+        ax.plot(_times_y, y_errors, label="Y error")
+    if _times_sx and sigma_x:
+        ax.plot(_times_sx, [2.0 * value for value in sigma_x], linestyle="--", color="tab:blue", label="+2sigma X")
+        ax.plot(_times_sx, [-2.0 * value for value in sigma_x], linestyle="--", color="tab:blue", alpha=0.55, label="-2sigma X")
+    if _times_sy and sigma_y:
+        ax.plot(_times_sy, [2.0 * value for value in sigma_y], linestyle="--", color="tab:orange", label="+2sigma Y")
+        ax.plot(_times_sy, [-2.0 * value for value in sigma_y], linestyle="--", color="tab:orange", alpha=0.55, label="-2sigma Y")
+    ax.set_title(_title_with_context("Estimation Error with +/-2sigma Bounds", metadata))
+    ax.set_xlabel("Time since benchmark start (s)")
+    ax.set_ylabel("Error (m)")
+    ax.grid(True, alpha=0.3)
+    if not times and not _times_y:
+        ax.text(0.5, 0.5, "No covariance/error samples available", transform=ax.transAxes, ha="center", va="center")
+    _legend_if_labels(ax, fontsize=8)
+    _add_metadata_box(ax, metadata)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_segment_rmse(output_path: Path, metadata: dict[str, object], summary: dict[str, object]) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    segments = summary.get("driving_segment_metrics") or summary.get("segment_metrics")
+    if isinstance(segments, dict) and segments:
+        labels = list(segments.keys())
+        values = [
+            _to_float(segments[label].get("position_rmse_m")) if isinstance(segments[label], dict) else None
+            for label in labels
+        ]
+        ax.bar(labels, [value if value is not None else 0.0 for value in values], color="tab:blue")
+        ax.set_ylabel("Position RMSE (m)")
+    else:
+        ax.text(0.5, 0.5, "No segment metrics available", transform=ax.transAxes, ha="center", va="center")
+    ax.set_title(_title_with_context("Segment-Based Position RMSE", metadata))
+    ax.grid(True, axis="y", alpha=0.3)
+    _add_metadata_box(ax, metadata)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_curvature_vs_error(output_path: Path, metadata: dict[str, object], samples: list[dict[str, object]]) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    metric_samples = _samples_for_metric_plots(samples)
+    xs = []
+    ys = []
+    for sample in metric_samples:
+        curvature = sample.get("curvature_score")
+        error = sample.get("filtered_position_error_m")
+        if _finite(curvature) and _finite(error):
+            xs.append(float(curvature))
+            ys.append(float(error))
+    if xs:
+        ax.scatter(xs, ys, s=8, alpha=0.45, color="tab:purple")
+    else:
+        ax.text(0.5, 0.5, "No curvature/error samples available", transform=ax.transAxes, ha="center", va="center")
+    ax.set_title(_title_with_context("Curvature Severity vs Position Error", metadata))
+    ax.set_xlabel("Curvature severity score")
+    ax.set_ylabel("Position error (m)")
+    ax.grid(True, alpha=0.3)
+    _add_metadata_box(ax, metadata)
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -464,6 +655,14 @@ def _read_samples(path: Path) -> list[dict[str, object]]:
         return [_normalize_sample_fields({key: _convert(value) for key, value in row.items()}) for row in reader]
 
 
+def _read_csv_dicts(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    with path.open("r", newline="", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        return [{key: _convert(value) for key, value in row.items()} for row in reader]
+
+
 def _read_json(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}
@@ -471,6 +670,13 @@ def _read_json(path: Path) -> dict[str, object]:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+
+
+def _first_existing(*paths: Path) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[0]
 
 
 def _route_points(metadata: dict[str, object]) -> list[dict[str, float]]:
@@ -670,6 +876,141 @@ def _normalize_sample_fields(sample: dict[str, object]) -> dict[str, object]:
     if "filtered_position_error_m" not in sample:
         sample["filtered_position_error_m"] = sample.get("kalman_position_error_m")
     return sample
+
+
+def _title_with_context(title: str, metadata: dict[str, object]) -> str:
+    general = metadata.get("general", {}) if isinstance(metadata.get("general"), dict) else {}
+    active_filter = _active_filter_info(metadata)
+    route = general.get("route_name") or "route"
+    map_name = general.get("map_name") or general.get("active_carla_map_name") or "map"
+    filter_name = active_filter.get("name") or active_filter.get("id") or "filter"
+    return f"{title}\n{filter_name} | {route} | {map_name}"
+
+
+def _add_metadata_box(ax, metadata: dict[str, object]) -> None:
+    general = metadata.get("general", {}) if isinstance(metadata.get("general"), dict) else {}
+    sensors = metadata.get("sensor_configuration", {}) if isinstance(metadata.get("sensor_configuration"), dict) else {}
+    behavior = metadata.get("vehicle_behavior_config", {}) if isinstance(metadata.get("vehicle_behavior_config"), dict) else {}
+    gnss = sensors.get("gnss", {}) if isinstance(sensors.get("gnss"), dict) else {}
+    text = (
+        f"run: {general.get('benchmark_id') or metadata.get('run_id', 'n/a')}\n"
+        f"GNSS std: {_fmt(gnss.get('noise_lat_stddev_deg'))}/{_fmt(gnss.get('noise_lon_stddev_deg'))} deg\n"
+        f"max/min speed: {_fmt(behavior.get('max_speed_mps'))}/{_fmt(behavior.get('min_curve_speed_mps'))} m/s"
+    )
+    ax.text(
+        0.99,
+        0.02,
+        text,
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=7.5,
+        family="monospace",
+        bbox={"facecolor": "white", "edgecolor": "0.65", "alpha": 0.78},
+    )
+
+
+def _plot_aggregate_bar(output_path: Path, rows: list[dict[str, object]], field: str, ylabel: str) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    labels = [_route_label(row, index) for index, row in enumerate(rows)]
+    values = [_to_float(row.get(field)) for row in rows]
+    if labels:
+        ax.bar(labels, [value if value is not None else 0.0 for value in values], color="tab:blue")
+        ax.tick_params(axis="x", rotation=25)
+    else:
+        ax.text(0.5, 0.5, "No aggregate rows available", transform=ax.transAxes, ha="center", va="center")
+    ax.set_title(ylabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_aggregate_raw_vs_filtered(output_path: Path, rows: list[dict[str, object]]) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    labels = [_route_label(row, index) for index, row in enumerate(rows)]
+    raw = [_to_float(row.get("raw_gnss_rmse_m")) or 0.0 for row in rows]
+    filtered = [_to_float(row.get("filtered_rmse_m")) or 0.0 for row in rows]
+    x_positions = list(range(len(labels)))
+    width = 0.38
+    if labels:
+        ax.bar([x - width / 2 for x in x_positions], raw, width=width, label="Raw GNSS")
+        ax.bar([x + width / 2 for x in x_positions], filtered, width=width, label="Filtered")
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(labels, rotation=25, ha="right")
+    else:
+        ax.text(0.5, 0.5, "No aggregate rows available", transform=ax.transAxes, ha="center", va="center")
+    ax.set_title("Raw GNSS RMSE vs Filtered RMSE")
+    ax.set_ylabel("RMSE (m)")
+    ax.grid(True, axis="y", alpha=0.3)
+    _legend_if_labels(ax)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_aggregate_dual_metric(
+    output_path: Path,
+    rows: list[dict[str, object]],
+    first_field: str,
+    second_field: str,
+    first_label: str,
+    second_label: str,
+) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    labels = [_route_label(row, index) for index, row in enumerate(rows)]
+    first_values = [_to_float(row.get(first_field)) for row in rows]
+    second_values = [_to_float(row.get(second_field)) for row in rows]
+    x_positions = list(range(len(labels)))
+    if labels:
+        ax.plot(x_positions, [value if value is not None else float("nan") for value in first_values], marker="o", label=first_label)
+        ax.plot(x_positions, [value if value is not None else float("nan") for value in second_values], marker="s", label=second_label)
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(labels, rotation=25, ha="right")
+    else:
+        ax.text(0.5, 0.5, "No aggregate rows available", transform=ax.transAxes, ha="center", va="center")
+    ax.set_title(f"{first_label} / {second_label} per Route")
+    ax.grid(True, alpha=0.3)
+    _legend_if_labels(ax)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_aggregate_segments(output_path: Path, run_folder: Path) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    aggregate = _read_json(run_folder / "aggregate_summary.json")
+    segments = aggregate.get("segment_rmse_summary") if isinstance(aggregate, dict) else None
+    if isinstance(segments, dict) and segments:
+        labels = list(segments.keys())
+        values = [_to_float(segments[label].get("position_rmse_m")) if isinstance(segments[label], dict) else None for label in labels]
+        ax.bar(labels, [value if value is not None else 0.0 for value in values], color="tab:green")
+    else:
+        ax.text(0.5, 0.5, "No aggregate segment metrics available", transform=ax.transAxes, ha="center", va="center")
+    ax.set_title("Segment-Based Position RMSE Across Routes")
+    ax.set_ylabel("Position RMSE (m)")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _route_label(row: dict[str, object], index: int) -> str:
+    name = str(row.get("route_name") or f"route_{index + 1}")
+    if len(name) > 20:
+        name = name[:17] + "..."
+    return name
+
+
+def _to_float(value: object) -> Optional[float]:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
 
 
 def _convert(value: str) -> object:

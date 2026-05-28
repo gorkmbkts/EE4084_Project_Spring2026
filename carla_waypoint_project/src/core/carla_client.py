@@ -6,7 +6,7 @@ import time
 from typing import Optional
 
 from config.settings import CARLA, SIMULATION
-from src.utils.map_names import display_map_name
+from src.utils.map_names import display_map_name, maps_compatible
 from src.utils.carla_import import ensure_carla_import
 
 carla = ensure_carla_import()
@@ -64,6 +64,46 @@ class CarlaClientManager:
             enabled=SIMULATION.synchronous_mode,
             fixed_delta_seconds=SIMULATION.fixed_delta_seconds,
         )
+
+    def load_world(self, map_name: str) -> None:
+        """Load another CARLA world and refresh cached map/blueprint handles."""
+        if not map_name:
+            raise CarlaConnectionError("Cannot load an empty CARLA map name.")
+        load_name = self.resolve_map_load_name(map_name)
+        self.restore_world_settings()
+        try:
+            original_timeout = self._timeout_seconds
+            self.client.set_timeout(max(float(original_timeout), 60.0))
+            self._world = self.client.load_world(load_name)
+            if self._world is None:
+                self._world = self._get_world_with_retries()
+            self._world_map = self._world.get_map()
+            self._blueprint_library = self._world.get_blueprint_library()
+        except RuntimeError as exc:
+            raise CarlaConnectionError(
+                f"Failed to load CARLA map {display_map_name(map_name)} via {load_name}: {exc}"
+            ) from exc
+        finally:
+            try:
+                self.client.set_timeout(self._timeout_seconds)
+            except RuntimeError:
+                pass
+
+        self.enable_synchronous_mode(
+            enabled=SIMULATION.synchronous_mode,
+            fixed_delta_seconds=SIMULATION.fixed_delta_seconds,
+        )
+
+    def resolve_map_load_name(self, map_name: str) -> str:
+        """Resolve saved route map metadata to a CARLA load_world map name."""
+        try:
+            available_maps = [str(item) for item in self.client.get_available_maps() or []]
+        except RuntimeError:
+            available_maps = []
+        for candidate in available_maps:
+            if maps_compatible(candidate, map_name):
+                return candidate
+        return display_map_name(map_name)
 
     def _load_requested_world(self, requested_map_name: str) -> "carla.World":
         try:

@@ -9,13 +9,15 @@ from src.core.carla_server import (
     CarlaServerTimeout,
     CarlaStartupCancelled,
 )
-from src.visualization.startup_map_selector import StartupMapSelector
 
 
 def main() -> None:
-    selector = StartupMapSelector()
     server_manager = None
+    selector = None
     try:
+        from src.visualization.startup_map_selector import StartupMapSelector
+
+        selector = StartupMapSelector()
         server_manager = CarlaServerManager()
         client = server_manager.ensure_server_running(
             status_callback=lambda status, detail: selector.show_status(
@@ -37,6 +39,7 @@ def main() -> None:
         app = SimulationApp(
             selected_map_load_name=selection.selected_map_load_name,
             existing_display_surface=selector.surface,
+            benchmark_config=selection.benchmark_config,
         )
         try:
             app.run()
@@ -45,7 +48,8 @@ def main() -> None:
             print(f"CARLA connection error: {exc}", file=sys.stderr)
             raise SystemExit(1) from None
     except (CarlaExecutableNotFound, CarlaLaunchError, CarlaServerTimeout) as exc:
-        selector.wait_for_error_ack(str(exc))
+        if selector is not None:
+            selector.wait_for_error_ack(str(exc))
         print(f"CARLA startup error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
     except ModuleNotFoundError as exc:
@@ -55,7 +59,8 @@ def main() -> None:
             "CARLA Python API not found. Place CARLA_0.9.16 near the project "
             "or install the CARLA Python package for this environment."
         )
-        selector.wait_for_error_ack(message)
+        if selector is not None:
+            selector.wait_for_error_ack(message)
         print(message, file=sys.stderr)
         raise SystemExit(1) from None
     except CarlaStartupCancelled:

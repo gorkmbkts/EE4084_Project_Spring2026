@@ -37,6 +37,8 @@ class PygameDisplay:
         self._camera_content_rect = self._layout.main_view_rect.copy()
         self._title_font = pygame.font.SysFont("consolas", DASHBOARD.title_font_size, bold=True)
         self._status_font = pygame.font.SysFont("consolas", DASHBOARD.text_font_size)
+        self._behavior_title = "Behavior Tuning"
+        self._tab_title = ""
 
     @property
     def surface(self) -> pygame.Surface:
@@ -149,13 +151,24 @@ class PygameDisplay:
     def draw_panel_chrome(self) -> None:
         """Draw panel borders and compact titles after panel contents render."""
         self._draw_panel_frame(self._layout.main_view_rect, "Game View")
-        self._draw_panel_frame(self._layout.behavior_tuning_rect, "Behavior Tuning")
+        self._draw_panel_frame(self._layout.behavior_tuning_rect, self._behavior_title)
         self._draw_panel_frame(self._layout.control_visual_rect, "Applied Controls")
         self._draw_panel_frame(self._layout.driving_state_rect, "Driving State")
         self._draw_panel_frame(self._layout.map_rect, "2D Map")
         self._draw_panel_frame(self._layout.lidar_rect, "LiDAR")
-        self._draw_panel_border(self._layout.tab_panel_rect)
+        if self._tab_title:
+            self._draw_panel_frame(self._layout.tab_panel_rect, self._tab_title)
+        else:
+            self._draw_panel_border(self._layout.tab_panel_rect)
         self._draw_panel_border(self._layout.status_bar_rect)
+
+    def set_test_mode_titles(self, enabled: bool) -> None:
+        if enabled:
+            self._behavior_title = "Test Configuration / Progress"
+            self._tab_title = "Live Filter Evaluation"
+        else:
+            self._behavior_title = "Behavior Tuning"
+            self._tab_title = ""
 
     @staticmethod
     def _fit_surface_rect(surface: pygame.Surface, target: pygame.Rect) -> pygame.Rect:

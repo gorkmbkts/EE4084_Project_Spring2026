@@ -1,0 +1,2 @@
+route_index,route_name,map_name,route_completion_success,filtered_rmse_m,raw_gnss_rmse_m,improvement_percent,speed_rmse_mps,yaw_rmse_deg,mean_nees,mean_nis,completion_time_s,route_folder,error
+1,test_route_001,Carla/Maps/Town04,False,87.14348255165501,0.6419615679990853,-13474.563789429085,641.1978525359191,30.954666471339895,24746.803424700458,6206.476994973059,127.2000018954277,C:\Users\gorke\Desktop\lectures\EE4084 Kalman and Bayesian Filters\EE4084_Project_Spring2026\carla_waypoint_project\benchmark_results\run_20260528_210016\routes\route_001_test_route_001,

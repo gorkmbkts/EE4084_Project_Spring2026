@@ -34,6 +34,12 @@ def build_benchmark_metadata(
     vehicle_blueprint: Optional[str] = None,
     active_filter_info: Optional[dict[str, object]] = None,
     active_filter_tune: Optional[dict[str, object]] = None,
+    sensor_noise_config: Optional[dict[str, object]] = None,
+    vehicle_behavior_config: Optional[dict[str, object]] = None,
+    random_seed: Optional[int] = None,
+    run_id: Optional[str] = None,
+    route_index: Optional[int] = None,
+    route_count: Optional[int] = None,
 ) -> dict[str, object]:
     """Build benchmark-level metadata from settings and route context."""
     filter_info = dict(active_filter_info or {})
@@ -48,7 +54,36 @@ def build_benchmark_metadata(
     raw_gnss_note = "Raw noisy GNSS is logged as a localization baseline and is not the default closed-loop control filter."
     normalized_active_map_id = active_map_id or normalize_map_name(map_name)
     normalized_route_map_id = normalize_map_name(route.map_name)
+    sensor_config = dict(sensor_noise_config or {})
+    behavior_config = dict(vehicle_behavior_config or {})
+    gnss_config = {
+        "sensor_tick": sensor_config.get("gnss_sensor_tick", GNSS.sensor_tick),
+        "noise_lat_stddev_deg": sensor_config.get("gnss_noise_lat_stddev_deg", GNSS.noise_lat_stddev_deg),
+        "noise_lon_stddev_deg": sensor_config.get("gnss_noise_lon_stddev_deg", GNSS.noise_lon_stddev_deg),
+        "noise_alt_stddev_m": sensor_config.get("gnss_noise_alt_stddev_m", GNSS.noise_alt_stddev_m),
+        "noise_lat_bias_deg": sensor_config.get("gnss_noise_lat_bias_deg", GNSS.noise_lat_bias_deg),
+        "noise_lon_bias_deg": sensor_config.get("gnss_noise_lon_bias_deg", GNSS.noise_lon_bias_deg),
+        "noise_alt_bias_m": sensor_config.get("gnss_noise_alt_bias_m", GNSS.noise_alt_bias_m),
+        "noise_seed": sensor_config.get("gnss_noise_seed", GNSS.noise_seed),
+    }
+    imu_config = {
+        "sensor_tick": sensor_config.get("imu_sensor_tick", IMU.sensor_tick),
+        "noise_accel_stddev_x": sensor_config.get("imu_noise_accel_stddev_x", IMU.noise_accel_stddev_x),
+        "noise_accel_stddev_y": sensor_config.get("imu_noise_accel_stddev_y", IMU.noise_accel_stddev_y),
+        "noise_accel_stddev_z": sensor_config.get("imu_noise_accel_stddev_z", IMU.noise_accel_stddev_z),
+        "noise_gyro_stddev_x": sensor_config.get("imu_noise_gyro_stddev_x", IMU.noise_gyro_stddev_x),
+        "noise_gyro_stddev_y": sensor_config.get("imu_noise_gyro_stddev_y", IMU.noise_gyro_stddev_y),
+        "noise_gyro_stddev_z": sensor_config.get("imu_noise_gyro_stddev_z", IMU.noise_gyro_stddev_z),
+        "noise_gyro_bias_x": sensor_config.get("imu_noise_gyro_bias_x", IMU.noise_gyro_bias_x),
+        "noise_gyro_bias_y": sensor_config.get("imu_noise_gyro_bias_y", IMU.noise_gyro_bias_y),
+        "noise_gyro_bias_z": sensor_config.get("imu_noise_gyro_bias_z", IMU.noise_gyro_bias_z),
+        "noise_seed": sensor_config.get("imu_noise_seed", IMU.noise_seed),
+    }
     return {
+        "run_id": run_id,
+        "random_seed": random_seed,
+        "route_index": route_index,
+        "route_count": route_count,
         "active_filter_id": active_filter_id,
         "active_filter_name": active_filter_name,
         "active_filter_type": active_filter_type,
@@ -71,8 +106,11 @@ def build_benchmark_metadata(
         },
         "general": {
             "benchmark_id": benchmark_id,
+            "run_id": run_id,
             "timestamp": timestamp,
             "route_name": route.name,
+            "route_index": route_index,
+            "route_count": route_count,
             "map_name": map_name,
             "active_carla_map_name": map_name,
             "normalized_active_map_id": normalized_active_map_id,
@@ -108,30 +146,11 @@ def build_benchmark_metadata(
             "tune": filter_tune,
         },
         "sensor_configuration": {
-            "gnss": {
-                "sensor_tick": GNSS.sensor_tick,
-                "noise_lat_stddev_deg": GNSS.noise_lat_stddev_deg,
-                "noise_lon_stddev_deg": GNSS.noise_lon_stddev_deg,
-                "noise_alt_stddev_m": GNSS.noise_alt_stddev_m,
-                "noise_lat_bias_deg": GNSS.noise_lat_bias_deg,
-                "noise_lon_bias_deg": GNSS.noise_lon_bias_deg,
-                "noise_alt_bias_m": GNSS.noise_alt_bias_m,
-                "noise_seed": GNSS.noise_seed,
-            },
-            "imu": {
-                "sensor_tick": IMU.sensor_tick,
-                "noise_accel_stddev_x": IMU.noise_accel_stddev_x,
-                "noise_accel_stddev_y": IMU.noise_accel_stddev_y,
-                "noise_accel_stddev_z": IMU.noise_accel_stddev_z,
-                "noise_gyro_stddev_x": IMU.noise_gyro_stddev_x,
-                "noise_gyro_stddev_y": IMU.noise_gyro_stddev_y,
-                "noise_gyro_stddev_z": IMU.noise_gyro_stddev_z,
-                "noise_gyro_bias_x": IMU.noise_gyro_bias_x,
-                "noise_gyro_bias_y": IMU.noise_gyro_bias_y,
-                "noise_gyro_bias_z": IMU.noise_gyro_bias_z,
-                "noise_seed": IMU.noise_seed,
-            },
+            "gnss": gnss_config,
+            "imu": imu_config,
+            "raw_config": sensor_config,
         },
+        "vehicle_behavior_config": behavior_config,
         "controller_configuration": {
             "target_speed_mps": AUTONOMOUS_CONTROL.target_speed_mps,
             "turn_speed_mps": AUTONOMOUS_CONTROL.turn_speed_mps,

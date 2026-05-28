@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import List, Protocol
 
+from src.evaluation.benchmark_config import SensorNoiseConfig
 from src.sensors.camera_sensor import CameraSensor
 from src.sensors.gnss_sensor import GnssSensor
 from src.sensors.imu_sensor import ImuSensor
@@ -33,16 +34,20 @@ class SensorManager:
         self._active_sensors.append(camera)
         return camera
 
-    def create_gnss(self, attach_to: "carla.Actor") -> GnssSensor:
+    def create_gnss(self, attach_to: "carla.Actor", config: SensorNoiseConfig | None = None) -> GnssSensor:
         """Create and spawn one GNSS sensor attached to an actor."""
         gnss = GnssSensor(self._world, self._blueprint_library)
+        if config is not None:
+            gnss.apply_config(config, respawn=False)
         gnss.spawn(attach_to=attach_to)
         self._active_sensors.append(gnss)
         return gnss
 
-    def create_imu(self, attach_to: "carla.Actor") -> ImuSensor:
+    def create_imu(self, attach_to: "carla.Actor", config: SensorNoiseConfig | None = None) -> ImuSensor:
         """Create and spawn one IMU sensor attached to an actor."""
         imu = ImuSensor(self._world, self._blueprint_library)
+        if config is not None:
+            imu.apply_config(config, respawn=False)
         imu.spawn(attach_to=attach_to)
         self._active_sensors.append(imu)
         return imu
