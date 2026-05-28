@@ -298,29 +298,60 @@ class ControlVisualizationWidget:
         radius: int,
         steer: float,
     ) -> None:
-        angle = -float(steer) * math.radians(90.0)
-        pygame.draw.circle(surface, (52, 61, 75), center, radius, width=7)
-        pygame.draw.circle(surface, (122, 139, 164), center, radius, width=2)
-        pygame.draw.circle(surface, (18, 22, 28), center, max(8, radius // 5))
-        pygame.draw.circle(surface, (116, 188, 255), center, max(5, radius // 8))
+        # CARLA steer value is usually in [-1.0, +1.0].
+        # Clamp it so the wheel drawing never goes wild if an unexpected value arrives.
+        steer = self._clamp(float(steer), -1.0, 1.0)
 
-        spoke_angles = (angle - math.pi * 0.58, angle + math.pi * 0.58, angle + math.pi * 1.5)
+        # Positive steer should visually rotate the wheel to the right.
+        # In pygame, +y goes downward, so the sign is inverted for natural rotation.
+        angle = -steer * math.radians(90.0)
+
+        rim_dark = (52, 61, 75)
+        rim_light = (122, 139, 164)
+        hub_dark = (18, 22, 28)
+        hub_blue = (116, 188, 255)
+        spoke_color = (158, 174, 198)
+        marker_color = (84, 222, 132)
+
+        # Outer steering wheel rim
+        pygame.draw.circle(surface, rim_dark, center, radius, width=7)
+        pygame.draw.circle(surface, rim_light, center, radius, width=2)
+
+        # Hub
+        hub_radius = max(8, radius // 5)
+        pygame.draw.circle(surface, hub_dark, center, hub_radius)
+        pygame.draw.circle(surface, hub_blue, center, max(5, radius // 8))
+
+        # More natural 3-spoke layout:
+        # 12 o'clock, 5 o'clock, 7 o'clock positions, all rotated by steer angle.
+        spoke_angles = (
+            angle - math.pi / 2.0,        # top spoke
+            angle + math.radians(30.0),   # lower-right spoke
+            angle + math.radians(150.0),  # lower-left spoke
+        )
+
+        spoke_start_radius = hub_radius + 2
+        spoke_end_radius = radius * 0.72
+
         for spoke_angle in spoke_angles:
             start = (
-                int(center[0] + math.cos(spoke_angle) * radius * 0.22),
-                int(center[1] + math.sin(spoke_angle) * radius * 0.22),
+                int(center[0] + math.cos(spoke_angle) * spoke_start_radius),
+                int(center[1] + math.sin(spoke_angle) * spoke_start_radius),
             )
             end = (
-                int(center[0] + math.cos(spoke_angle) * radius * 0.78),
-                int(center[1] + math.sin(spoke_angle) * radius * 0.78),
+                int(center[0] + math.cos(spoke_angle) * spoke_end_radius),
+                int(center[1] + math.sin(spoke_angle) * spoke_end_radius),
             )
-            pygame.draw.line(surface, (158, 174, 198), start, end, width=3)
+            pygame.draw.line(surface, spoke_color, start, end, width=3)
 
+        # Top marker, slightly inside the outer rim so it does not look detached.
+        marker_radius = radius - 2
+        marker_angle = angle - math.pi / 2.0
         marker = (
-            int(center[0] + math.cos(angle - math.pi / 2.0) * radius),
-            int(center[1] + math.sin(angle - math.pi / 2.0) * radius),
+            int(center[0] + math.cos(marker_angle) * marker_radius),
+            int(center[1] + math.sin(marker_angle) * marker_radius),
         )
-        pygame.draw.circle(surface, (84, 222, 132), marker, 4)
+        pygame.draw.circle(surface, marker_color, marker, 4)
 
     def _draw_vertical_bar(
         self,
