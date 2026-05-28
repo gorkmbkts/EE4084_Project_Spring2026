@@ -57,4 +57,5 @@ CARLA_0.9.16/
 .vscode/extensions/
 .vscode/settings.json
 
-
+carla_waypoint_project/benchmark_results/
+carla_waypoint_project/logs/filter_tests/
