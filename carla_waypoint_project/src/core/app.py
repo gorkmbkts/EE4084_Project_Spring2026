@@ -12,6 +12,12 @@ import pygame
 
 from config.settings import BENCHMARK, ROUTE_INITIALIZATION, TOPDOWN_MAP
 from src.KalmanLab.filter_manager import FilterManager
+from src.control.driving_behavior import (
+    ActuatorRealism,
+    CurvatureSpeedPlanner,
+    DrivingBehaviorConfig,
+    SpeedPlan,
+)
 from src.control.vehicle_controller import VehicleController
 from src.control.waypoint_tracker import TrackingStatus, WaypointTracker
 from src.core.carla_client import CarlaClientManager
@@ -38,6 +44,11 @@ from src.vehicle.vehicle_manager import VehicleManager
 from src.visualization.lidar_panel import LidarPanelRenderer
 from src.visualization.pygame_display import PygameDisplay
 from src.visualization.topdown_map import TopDownHudData, TopDownMapRenderer
+from src.visualization.ui.driving_behavior_widgets import (
+    BehaviorTuningPanel,
+    ControlVisualizationWidget,
+    DrivingDiagnosticsWidget,
+)
 from src.visualization.ui.status_bar import StatusBar
 from src.visualization.ui.tabbed_panel import TabbedPanel
 from src.visualization.waypoint_overlay import WaypointOverlayRenderer
@@ -69,10 +80,12 @@ class SimulationApp:
         self,
         requested_map_name: Optional[str] = None,
         selected_map_load_name: Optional[str] = None,
+        existing_display_surface: Optional[pygame.Surface] = None,
     ) -> None:
         pygame.init()
         self._requested_map_name = requested_map_name
         self._selected_map_load_name = selected_map_load_name or requested_map_name
+        self._existing_display_surface = existing_display_surface
         self._client_manager = CarlaClientManager(requested_map_name=requested_map_name)
         self._clock = SimulationClock()
         self._display: Optional[PygameDisplay] = None
@@ -102,6 +115,9 @@ class SimulationApp:
         self.route_planner: Optional[RoutePlanner] = None
         self.waypoint_tracker = WaypointTracker()
         self.autonomous_controller = VehicleController()
+        self.driving_behavior_config = DrivingBehaviorConfig()
+        self.speed_planner = CurvatureSpeedPlanner(self.driving_behavior_config)
+        self.actuator_realism = ActuatorRealism(self.driving_behavior_config)
 
         self._drive_mode = DriveMode.MANUAL
         self._map_selection_active = False
@@ -111,6 +127,9 @@ class SimulationApp:
         self._latest_estimated_state: Optional[EgoState] = None
         self._latest_localization_status: Optional[LocalizationStatus] = None
         self._latest_tracking = self._empty_tracking_status()
+        self._latest_speed_plan: SpeedPlan = self.speed_planner.latest_plan
+        self._latest_requested_control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.0)
+        self._latest_applied_control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.0)
         self._planner_status = ""
         self._latest_gnss_diagnostics: Optional[GnssDiagnostics] = None
         self._latest_gnss_frame: Optional[int] = None
@@ -128,6 +147,9 @@ class SimulationApp:
         self._stabilization_timed_out = False
         self._route_generation_blocked = False
         self._control_status_text = "Test idle"
+        self._behavior_tuning_panel: Optional[BehaviorTuningPanel] = None
+        self._control_visual_widget: Optional[ControlVisualizationWidget] = None
+        self._driving_diagnostics_widget: Optional[DrivingDiagnosticsWidget] = None
 
     def _setup(self) -> None:
         """Initialize CARLA world, vehicle, sensors, route tools, and visualization."""
@@ -215,10 +237,20 @@ class SimulationApp:
             raise RuntimeError(f"Application is not initialized: {', '.join(missing)}.")
 
     def _initialize_display(self) -> None:
-        self._display = PygameDisplay()
+        self._display = PygameDisplay(existing_surface=self._existing_display_surface)
+        self._existing_display_surface = None
         self._control_panel = TabbedPanel(
             self._display.control_panel_rect,
             tabs=("Route", "Filters", "Benchmark", "Sensors", "Debug"),
+        )
+        self._behavior_tuning_panel = BehaviorTuningPanel(
+            self._display.behavior_tuning_rect,
+            self.driving_behavior_config,
+        )
+        self._control_visual_widget = ControlVisualizationWidget(self._display.control_visual_rect)
+        self._driving_diagnostics_widget = DrivingDiagnosticsWidget(
+            self._display.driving_state_rect,
+            self.driving_behavior_config,
         )
         self._build_control_panel()
         self._control_status_text = "Dashboard ready"
@@ -230,6 +262,7 @@ class SimulationApp:
         self._display.begin_frame(None)
         self._update_control_panel_state()
         self._control_panel.draw(self._display.surface)
+        self._draw_driving_behavior_panels()
         self._draw_status_bar()
         self._display.end_frame()
 
@@ -680,6 +713,7 @@ class SimulationApp:
                 self._update_sensor_diagnostics()
                 self._update_test_performance()
 
+                dt_seconds = self._clock.fixed_delta_seconds
                 if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
                     control = carla.VehicleControl(
                         throttle=0.0,
@@ -688,25 +722,44 @@ class SimulationApp:
                         hand_brake=False,
                     )
                     vehicle.apply_control(control)
+                    self._set_latest_control(control, control)
+                    self.actuator_realism.reset(control)
                 elif self._drive_mode == DriveMode.AUTONOMOUS:
                     control_state = self._state_for_tracking_and_control()
                     if control_state is None:
                         control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+                        vehicle.apply_control(control)
+                        self._set_latest_control(control, control)
+                        self.actuator_realism.reset(control)
                     else:
+                        preview_waypoints = self.waypoint_tracker.get_preview_waypoints(max_count=90)
+                        no_active_target = self._latest_tracking.target_waypoint is None
+                        self._latest_speed_plan = self.speed_planner.plan(
+                            state=control_state,
+                            preview_waypoints=preview_waypoints,
+                            route_completed=self._latest_tracking.completed or no_active_target,
+                            dt_seconds=dt_seconds,
+                        )
                         control = self.autonomous_controller.compute_control(
                             state=control_state,
                             target_waypoint=self._latest_tracking.target_waypoint,
                             route_completed=self._latest_tracking.completed,
+                            target_speed_mps=self._latest_speed_plan.target_speed_mps,
                         )
-                    vehicle.apply_control(control)
+                        applied_control = self.actuator_realism.apply(control, dt_seconds)
+                        vehicle.apply_control(applied_control)
+                        self._set_latest_control(control, applied_control)
                 else:
-                    manual_controller.apply_control()
+                    control = manual_controller.apply_control()
+                    self._set_latest_control(control, control)
+                    self.actuator_realism.reset(control)
 
                 camera_surface = camera_sensor.get_latest_surface()
                 display.begin_frame(camera_surface)
                 self._draw_camera_waypoints(waypoint_manager, camera_sensor, vehicle)
                 self._draw_topdown_map()
                 self._draw_lidar_panel()
+                self._draw_driving_behavior_panels()
                 self._draw_control_panel()
                 self._draw_status_bar()
                 display.end_frame()
@@ -719,6 +772,34 @@ class SimulationApp:
         if self._drive_mode == DriveMode.AUTONOMOUS:
             return self._latest_estimated_state
         return self._latest_ground_truth_state
+
+    def _set_latest_control(
+        self,
+        requested_control: "carla.VehicleControl",
+        applied_control: "carla.VehicleControl",
+    ) -> None:
+        self._latest_requested_control = carla.VehicleControl(
+            throttle=float(getattr(requested_control, "throttle", 0.0)),
+            steer=float(getattr(requested_control, "steer", 0.0)),
+            brake=float(getattr(requested_control, "brake", 0.0)),
+            hand_brake=bool(getattr(requested_control, "hand_brake", False)),
+            reverse=bool(getattr(requested_control, "reverse", False)),
+            manual_gear_shift=bool(getattr(requested_control, "manual_gear_shift", False)),
+        )
+        self._latest_applied_control = carla.VehicleControl(
+            throttle=float(getattr(applied_control, "throttle", 0.0)),
+            steer=float(getattr(applied_control, "steer", 0.0)),
+            brake=float(getattr(applied_control, "brake", 0.0)),
+            hand_brake=bool(getattr(applied_control, "hand_brake", False)),
+            reverse=bool(getattr(applied_control, "reverse", False)),
+            manual_gear_shift=bool(getattr(applied_control, "manual_gear_shift", False)),
+        )
+
+    def _reset_driving_behavior(self) -> None:
+        initial_speed = self._latest_ground_truth_state.speed if self._latest_ground_truth_state is not None else 0.0
+        self.speed_planner.reset(initial_speed_mps=initial_speed)
+        self._latest_speed_plan = self.speed_planner.latest_plan
+        self.actuator_realism.reset(self._latest_applied_control)
 
     def _can_update_route_tracking(self) -> bool:
         if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
@@ -736,6 +817,8 @@ class SimulationApp:
             if event.type == pygame.KEYDOWN:
                 if not self._handle_key_down(event):
                     return False
+            elif self._behavior_tuning_panel is not None and self._behavior_tuning_panel.handle_event(event):
+                continue
             elif self._control_panel.handle_event(event):
                 continue
             elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -753,6 +836,12 @@ class SimulationApp:
         assert self._control_panel is not None
         self._display.resize(event.w, event.h)
         self._control_panel.set_rect(self._display.control_panel_rect)
+        if self._behavior_tuning_panel is not None:
+            self._behavior_tuning_panel.set_rect(self._display.behavior_tuning_rect)
+        if self._control_visual_widget is not None:
+            self._control_visual_widget.set_rect(self._display.control_visual_rect)
+        if self._driving_diagnostics_widget is not None:
+            self._driving_diagnostics_widget.set_rect(self._display.driving_state_rect)
 
     def _handle_key_down(self, event: pygame.event.Event) -> bool:
         if event.key == pygame.K_ESCAPE:
@@ -786,6 +875,7 @@ class SimulationApp:
             self._vehicle.set_autopilot(False)
         self._planner_status = "Mode: manual"
         self._control_status_text = "Manual mode"
+        self._reset_driving_behavior()
 
     def _toggle_map_selection(self) -> None:
         self._map_selection_active = not self._map_selection_active
@@ -944,6 +1034,7 @@ class SimulationApp:
             )
         self._planner_status = "Emergency brake"
         self._control_status_text = "Emergency brake"
+        self._reset_driving_behavior()
 
     def _save_test_report(self) -> None:
         if self._test_runner is not None and self._test_runner.benchmark_folder is not None:
@@ -1061,6 +1152,7 @@ class SimulationApp:
             self._drive_mode = DriveMode.AUTONOMOUS
             if self._vehicle is not None:
                 self._vehicle.set_autopilot(False)
+            self._reset_driving_behavior()
 
     def _begin_route_initialization_from_selection(self, start_autonomous: bool) -> None:
         if self._map_selector is None:
@@ -1105,6 +1197,7 @@ class SimulationApp:
         self._route_generation_blocked = True
         self._planner_status = "Planner: waiting localization stability"
         self._teleport_vehicle_to_route_start(start_waypoint)
+        self._reset_driving_behavior()
 
     def _generate_route_from_selection(
         self,
@@ -1177,6 +1270,7 @@ class SimulationApp:
                 self._drive_mode = DriveMode.AUTONOMOUS
                 if self._vehicle is not None:
                     self._vehicle.set_autopilot(False)
+                self._reset_driving_behavior()
             status_suffix = "timeout" if self._stabilization_timed_out else "stable"
             self._planner_status = f"Planner: {len(route)} wp, {status_suffix}, driving A->B"
         elif self.route_planner.planner_error:
@@ -1263,6 +1357,7 @@ class SimulationApp:
         self.waypoint_tracker.clear_route()
         self._latest_tracking = self._empty_tracking_status()
         self._drive_mode = DriveMode.MANUAL
+        self._reset_driving_behavior()
 
     @staticmethod
     def _empty_tracking_status() -> TrackingStatus:
@@ -1342,6 +1437,24 @@ class SimulationApp:
             rect=self._display.lidar_rect,
             measurement=measurement,
         )
+
+    def _draw_driving_behavior_panels(self) -> None:
+        assert self._display is not None
+        if self._behavior_tuning_panel is not None:
+            self._behavior_tuning_panel.draw(self._display.surface)
+        if self._control_visual_widget is not None:
+            self._control_visual_widget.draw(
+                self._display.surface,
+                applied_control=self._latest_applied_control,
+                requested_control=self._latest_requested_control,
+            )
+        if self._driving_diagnostics_widget is not None:
+            self._driving_diagnostics_widget.draw(
+                self._display.surface,
+                state=self._latest_ground_truth_state,
+                speed_plan=self._latest_speed_plan,
+                applied_control=self._latest_applied_control,
+            )
 
     def _draw_control_panel(self) -> None:
         assert self._display is not None

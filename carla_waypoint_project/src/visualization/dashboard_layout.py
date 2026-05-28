@@ -15,6 +15,9 @@ class DashboardLayout:
 
     main_view_rect: pygame.Rect
     workspace_rect: pygame.Rect
+    behavior_tuning_rect: pygame.Rect
+    control_visual_rect: pygame.Rect
+    driving_state_rect: pygame.Rect
     map_rect: pygame.Rect
     lidar_rect: pygame.Rect
     tab_panel_rect: pygame.Rect
@@ -66,6 +69,28 @@ def build_dashboard_layout(
         left_width,
         workspace_height,
     )
+    bottom_gap = max(8, gap)
+    bottom_panel_width = max(60, (workspace_rect.width - 2 * bottom_gap) // 3)
+    bottom_group_width = 3 * bottom_panel_width + 2 * bottom_gap
+    bottom_group_left = workspace_rect.left + max(0, (workspace_rect.width - bottom_group_width) // 2)
+    behavior_tuning_rect = pygame.Rect(
+        bottom_group_left,
+        workspace_rect.top,
+        bottom_panel_width,
+        workspace_rect.height,
+    )
+    control_visual_rect = pygame.Rect(
+        behavior_tuning_rect.right + bottom_gap,
+        workspace_rect.top,
+        bottom_panel_width,
+        workspace_rect.height,
+    )
+    driving_state_rect = pygame.Rect(
+        control_visual_rect.right + bottom_gap,
+        workspace_rect.top,
+        bottom_panel_width,
+        workspace_rect.height,
+    )
 
     right_x = margin + left_width + gap
     right_height = content_height
@@ -101,6 +126,9 @@ def build_dashboard_layout(
     return DashboardLayout(
         main_view_rect=main_view_rect,
         workspace_rect=workspace_rect,
+        behavior_tuning_rect=behavior_tuning_rect,
+        control_visual_rect=control_visual_rect,
+        driving_state_rect=driving_state_rect,
         map_rect=map_rect,
         lidar_rect=lidar_rect,
         tab_panel_rect=tab_panel_rect,

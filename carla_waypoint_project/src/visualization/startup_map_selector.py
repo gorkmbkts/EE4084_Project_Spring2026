@@ -10,8 +10,9 @@ from typing import Optional
 
 import pygame
 
-from config.settings import CARLA, DISPLAY
+from config.settings import CARLA, DASHBOARD, DISPLAY
 from src.utils.map_names import display_map_name, maps_compatible, normalize_map_name
+from src.visualization.windowing import create_display_surface, display_flags_from_settings
 
 
 _COMMON_FALLBACK_MAPS = (
@@ -49,12 +50,11 @@ class _MapOption:
 
 
 class StartupMapSelector:
-    """Small responsive pygame screen shown before dashboard initialization."""
+    """Full-window startup status and map-selection screen."""
 
-    def __init__(self, width: int = 1000, height: int = 720) -> None:
+    def __init__(self, width: int = DISPLAY.width, height: int = DISPLAY.height) -> None:
         pygame.init()
-        self._surface = pygame.display.set_mode((width, height), pygame.RESIZABLE)
-        pygame.display.set_caption("KalmanLab CARLA Startup")
+        self._surface = create_display_surface(width=width, height=height, title=DISPLAY.title)
         self._clock = pygame.time.Clock()
         self._init_fonts()
         self._status = "Not running"
@@ -66,9 +66,17 @@ class StartupMapSelector:
         self._options: list[_MapOption] = []
         self._selected_index = 0
         self._scroll_offset = 0
+        self._hovered_index: Optional[int] = None
         self._row_rects: dict[int, pygame.Rect] = {}
+        self._start_button_rect = pygame.Rect(0, 0, 1, 1)
+        self._use_current_button_rect = pygame.Rect(0, 0, 1, 1)
+        self._refresh_button_rect = pygame.Rect(0, 0, 1, 1)
         self._project_root = Path(__file__).resolve().parents[2]
         self._runtime_state_path = self._project_root / "config" / "runtime_state.json"
+
+    @property
+    def surface(self) -> pygame.Surface:
+        return self._surface
 
     def show_status(
         self,
@@ -128,8 +136,12 @@ class StartupMapSelector:
                         return result
                 elif event.type == pygame.MOUSEWHEEL:
                     self._scroll_by(-event.y * 3)
+                elif event.type == pygame.MOUSEMOTION:
+                    self._update_hover(event.pos)
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    self._handle_left_click(event.pos)
+                    result = self._handle_left_click(event, client)
+                    if result is not _NoSelection:
+                        return result
 
             self._draw(status_only=False)
             self._clock.tick(30)
@@ -344,11 +356,31 @@ class StartupMapSelector:
             return [], "Map list unavailable: get_available_maps() returned no maps."
         return maps, None
 
-    def _handle_left_click(self, position: tuple[int, int]) -> None:
+    def _handle_left_click(self, event: pygame.event.Event, client: object) -> object:
+        position = event.pos
+        if self._start_button_rect.collidepoint(position):
+            return self._load_selected_option(client)
+        if self._use_current_button_rect.collidepoint(position):
+            return self._use_current_map(client)
+        if self._refresh_button_rect.collidepoint(position):
+            self._refresh_options(client, preserve_selection=True)
+            return _NoSelection
+
         for index, rect in self._row_rects.items():
             if rect.collidepoint(position):
+                already_selected = self._selected_index == index
                 self._selected_index = index
                 self._ensure_selection_visible()
+                if already_selected and getattr(event, "clicks", 1) >= 2:
+                    return self._load_selected_option(client)
+                return _NoSelection
+        return _NoSelection
+
+    def _update_hover(self, position: tuple[int, int]) -> None:
+        self._hovered_index = None
+        for index, rect in self._row_rects.items():
+            if rect.collidepoint(position):
+                self._hovered_index = index
                 return
 
     def _move_selection(self, delta: int) -> None:
@@ -373,8 +405,9 @@ class StartupMapSelector:
         self._scroll_offset = max(0, self._scroll_offset)
 
     def _visible_row_count(self) -> int:
-        _left, top, _width, height = self._list_geometry()
-        return max(1, height // 42)
+        _rect, columns, card_height, gap = self._card_layout()
+        rows = max(1, (_rect.height + gap) // (card_height + gap))
+        return max(1, rows * columns)
 
     def _pump_basic_events(self) -> bool:
         for event in pygame.event.get():
@@ -389,7 +422,7 @@ class StartupMapSelector:
     def _resize(self, width: int, height: int) -> None:
         width = max(760, int(width))
         height = max(520, int(height))
-        self._surface = pygame.display.set_mode((width, height), pygame.RESIZABLE)
+        self._surface = pygame.display.set_mode((width, height), display_flags_from_settings())
 
     def _ensure_display_ready(self) -> None:
         if not pygame.get_init():
@@ -400,34 +433,43 @@ class StartupMapSelector:
         if not pygame.display.get_init():
             pygame.display.init()
         if pygame.display.get_surface() is None:
-            self._surface = pygame.display.set_mode((1000, 720), pygame.RESIZABLE)
-            pygame.display.set_caption("KalmanLab CARLA Startup")
+            self._surface = create_display_surface(title=DISPLAY.title)
             self._init_fonts()
 
     def _init_fonts(self) -> None:
-        self._title_font = pygame.font.SysFont("consolas", 26, bold=True)
-        self._subtitle_font = pygame.font.SysFont("consolas", 18, bold=True)
+        self._title_font = pygame.font.SysFont("consolas", 34, bold=True)
+        self._subtitle_font = pygame.font.SysFont("consolas", 20, bold=True)
         self._font = pygame.font.SysFont("consolas", 16)
-        self._small_font = pygame.font.SysFont("consolas", 14)
+        self._small_font = pygame.font.SysFont("consolas", 13)
+        self._button_font = pygame.font.SysFont("consolas", 15, bold=True)
 
     def _draw(self, status_only: bool) -> None:
         width, height = self._surface.get_size()
-        self._surface.fill((12, 15, 20))
-        margin = 32
+        self._surface.fill(DISPLAY.clear_color)
+        margin = max(28, min(54, width // 28))
+        header_top = max(28, height // 24)
 
         self._draw_text(
             "KalmanLab CARLA Localization Dashboard",
-            (margin, 24),
+            (margin, header_top),
             self._title_font,
             (239, 243, 250),
             max_width=width - 2 * margin,
         )
-        self._draw_status_panel(pygame.Rect(margin, 76, width - 2 * margin, 146))
+        self._draw_text(
+            "Select the CARLA world before entering the live simulation dashboard.",
+            (margin, header_top + 46),
+            self._font,
+            DASHBOARD.muted_text_color,
+            max_width=width - 2 * margin,
+        )
+        status_rect = pygame.Rect(margin, header_top + 86, width - 2 * margin, 128)
+        self._draw_status_panel(status_rect)
 
         if status_only:
             self._draw_text(
                 "Startup is preparing CARLA. Press ESC to quit safely.",
-                (margin, 244),
+                (margin, status_rect.bottom + 26),
                 self._font,
                 (185, 194, 210),
                 max_width=width - 2 * margin,
@@ -435,87 +477,151 @@ class StartupMapSelector:
             pygame.display.flip()
             return
 
-        self._draw_selector_header(pygame.Rect(margin, 244, width - 2 * margin, 70))
+        self._draw_selector_header(pygame.Rect(margin, status_rect.bottom + 24, width - 2 * margin, 58))
         self._draw_map_list()
-        self._draw_controls(pygame.Rect(margin, height - 64, width - 2 * margin, 40))
+        self._draw_controls(pygame.Rect(margin, height - 78, width - 2 * margin, 52))
         pygame.display.flip()
 
     def _draw_status_panel(self, rect: pygame.Rect) -> None:
-        pygame.draw.rect(self._surface, (23, 28, 36), rect, border_radius=6)
-        pygame.draw.rect(self._surface, (79, 91, 112), rect, width=1, border_radius=6)
+        pygame.draw.rect(self._surface, DASHBOARD.panel_background_color, rect, border_radius=6)
+        pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
 
-        y = rect.top + 14
-        self._draw_text("CARLA server", (rect.left + 16, y), self._subtitle_font, (235, 238, 244), rect.width - 32)
-        y += 34
-        self._draw_text(f"Status: {self._status}", (rect.left + 16, y), self._font, (119, 220, 156), rect.width - 32)
-        y += 26
-        exe_text = self._executable_path or "not detected yet"
-        self._draw_text(f"Executable: {exe_text}", (rect.left + 16, y), self._small_font, (190, 198, 212), rect.width - 32)
-        y += 24
+        column_gap = 28
+        left_width = max(260, int(rect.width * 0.35))
+        left = pygame.Rect(rect.left + 18, rect.top + 14, left_width, rect.height - 28)
+        right = pygame.Rect(left.right + column_gap, rect.top + 14, rect.right - left.right - column_gap - 18, rect.height - 28)
+
+        self._draw_text("CARLA server", left.topleft, self._subtitle_font, DASHBOARD.title_color, left.width)
+        status_color = DASHBOARD.success_color if self._status.lower() in ("connected", "running") else (116, 188, 255)
+        self._draw_text(f"Status: {self._status}", (left.left, left.top + 34), self._font, status_color, left.width)
         current_map = display_map_name(self._current_map_name) if self._current_map_name else "unread"
-        self._draw_text(f"Currently loaded map: {current_map}", (rect.left + 16, y), self._small_font, (190, 198, 212), rect.width - 32)
-        y += 24
+        self._draw_text(f"Current map: {current_map}", (left.left, left.top + 62), self._small_font, DASHBOARD.text_color, left.width)
+
+        exe_text = self._executable_path or "not detected yet"
+        self._draw_text("Executable", right.topleft, self._small_font, DASHBOARD.muted_text_color, right.width)
+        self._draw_text(exe_text, (right.left, right.top + 20), self._small_font, DASHBOARD.text_color, right.width)
         message = self._error or self._detail
-        color = (255, 198, 94) if self._error else (170, 178, 194)
-        self._draw_text(message, (rect.left + 16, y), self._small_font, color, rect.width - 32)
+        color = DASHBOARD.warning_color if self._error else DASHBOARD.muted_text_color
+        self._draw_text(message, (right.left, right.top + 52), self._small_font, color, right.width)
 
     def _draw_selector_header(self, rect: pygame.Rect) -> None:
         available = f"{self._available_count} available map(s)"
         normalized = normalize_map_name(self._current_map_name) or "unknown"
-        self._draw_text("Startup map selection", (rect.left, rect.top), self._subtitle_font, (235, 238, 244), rect.width)
+        self._draw_text("Startup map selection", (rect.left, rect.top), self._subtitle_font, DASHBOARD.title_color, rect.width)
         self._draw_text(
-            f"{available} from CARLA RPC. Active map id if using current: {normalized}",
+            f"{available} from CARLA RPC | current map id: {normalized}",
             (rect.left, rect.top + 30),
             self._font,
-            (178, 187, 204),
+            DASHBOARD.muted_text_color,
             rect.width,
         )
 
     def _draw_map_list(self) -> None:
-        left, top, width, height = self._list_geometry()
-        rect = pygame.Rect(left, top, width, height)
-        pygame.draw.rect(self._surface, (17, 21, 28), rect, border_radius=6)
-        pygame.draw.rect(self._surface, (77, 89, 111), rect, width=1, border_radius=6)
+        rect, columns, card_height, gap = self._card_layout()
+        pygame.draw.rect(self._surface, (14, 18, 24), rect, border_radius=6)
+        pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
         self._row_rects.clear()
 
         if not self._options:
-            self._draw_text("No map options available.", (left + 16, top + 16), self._font, (230, 230, 230), width - 32)
+            self._draw_text("No map options available.", (rect.left + 16, rect.top + 16), self._font, DASHBOARD.text_color, rect.width - 32)
             return
 
-        row_h = 42
         visible = self._visible_row_count()
         end_index = min(len(self._options), self._scroll_offset + visible)
-        y = top + 8
+        card_width = max(120, (rect.width - 2 * DASHBOARD.panel_padding_px - (columns - 1) * gap) // columns)
+        start_x = rect.left + DASHBOARD.panel_padding_px
+        start_y = rect.top + DASHBOARD.panel_padding_px
         for index in range(self._scroll_offset, end_index):
             option = self._options[index]
-            row = pygame.Rect(left + 8, y, width - 16, row_h - 4)
-            self._row_rects[index] = row
+            visible_index = index - self._scroll_offset
+            row_index = visible_index // columns
+            column_index = visible_index % columns
+            card = pygame.Rect(
+                start_x + column_index * (card_width + gap),
+                start_y + row_index * (card_height + gap),
+                card_width,
+                card_height,
+            )
+            self._row_rects[index] = card
             selected = index == self._selected_index
-            row_color = (42, 63, 84) if selected else (24, 29, 38)
-            pygame.draw.rect(self._surface, row_color, row, border_radius=4)
+            hovered = index == self._hovered_index
+            card_color = (33, 48, 63) if selected else ((28, 34, 44) if hovered else (21, 26, 34))
+            border_color = (116, 188, 255) if selected else ((122, 139, 164) if hovered else (58, 67, 82))
+            pygame.draw.rect(self._surface, card_color, card, border_radius=6)
+            pygame.draw.rect(self._surface, border_color, card, width=1, border_radius=6)
             if selected:
-                pygame.draw.rect(self._surface, (116, 188, 255), row, width=1, border_radius=4)
-
+                accent = pygame.Rect(card.left, card.top + 10, 4, card.height - 20)
+                pygame.draw.rect(self._surface, DASHBOARD.success_color, accent, border_radius=2)
             title_color = (248, 250, 253) if selected else (222, 228, 238)
-            detail_color = (182, 193, 211) if option.guaranteed else (255, 198, 94)
-            self._draw_text(option.display_name, (row.left + 12, row.top + 5), self._font, title_color, row.width - 24)
-            self._draw_text(option.detail, (row.left + 12, row.top + 23), self._small_font, detail_color, row.width - 24)
-            y += row_h
+            detail_color = DASHBOARD.muted_text_color if option.guaranteed else DASHBOARD.warning_color
+            badge = "CURRENT" if option.is_current else ("AVAILABLE" if option.guaranteed else "FALLBACK")
+            badge_color = DASHBOARD.success_color if option.is_current else ((116, 188, 255) if option.guaranteed else DASHBOARD.warning_color)
+            self._draw_text(option.display_name, (card.left + 16, card.top + 13), self._font, title_color, card.width - 32)
+            self._draw_text(option.detail, (card.left + 16, card.top + 38), self._small_font, detail_color, card.width - 32)
+            self._draw_text(badge, (card.left + 16, card.bottom - 22), self._small_font, badge_color, card.width - 32)
 
         if len(self._options) > visible:
             scroll_text = f"{self._scroll_offset + 1}-{end_index} / {len(self._options)}"
-            self._draw_text(scroll_text, (rect.right - 130, rect.bottom - 24), self._small_font, (160, 170, 188), 120)
+            self._draw_text(scroll_text, (rect.right - 130, rect.bottom - 24), self._small_font, DASHBOARD.muted_text_color, 120)
 
     def _draw_controls(self, rect: pygame.Rect) -> None:
-        controls = "Up/Down: move | Mouse wheel: scroll | Click: select | Enter: load | U: use current | R: refresh | ESC: quit"
-        self._draw_text(controls, (rect.left, rect.top), self._small_font, (192, 201, 216), rect.width)
+        button_gap = 10
+        start_width = 180
+        secondary_width = 136
+        self._start_button_rect = pygame.Rect(rect.right - start_width, rect.top, start_width, 36)
+        self._refresh_button_rect = pygame.Rect(
+            self._start_button_rect.left - button_gap - secondary_width,
+            rect.top,
+            secondary_width,
+            36,
+        )
+        self._use_current_button_rect = pygame.Rect(
+            self._refresh_button_rect.left - button_gap - secondary_width,
+            rect.top,
+            secondary_width,
+            36,
+        )
+
+        controls = "Arrow keys select | Mouse wheel scrolls | Enter starts | Double-click starts | ESC quits"
+        available_width = max(80, self._use_current_button_rect.left - rect.left - 12)
+        self._draw_text(controls, (rect.left, rect.top + 9), self._small_font, DASHBOARD.muted_text_color, available_width)
+        self._draw_button(self._use_current_button_rect, "Use Current", muted=False)
+        self._draw_button(self._refresh_button_rect, "Refresh", muted=False)
+        self._draw_button(self._start_button_rect, "Start Dashboard", muted=not bool(self._options), primary=True)
 
     def _list_geometry(self) -> tuple[int, int, int, int]:
         width, height = self._surface.get_size()
-        margin = 32
-        top = 320
-        bottom_margin = 84
+        margin = max(28, min(54, width // 28))
+        top = max(330, height // 3)
+        bottom_margin = 94
         return margin, top, width - 2 * margin, max(120, height - top - bottom_margin)
+
+    def _card_layout(self) -> tuple[pygame.Rect, int, int, int]:
+        left, top, width, height = self._list_geometry()
+        columns = 3 if width >= 1240 else (2 if width >= 820 else 1)
+        gap = 12
+        card_height = 86
+        return pygame.Rect(left, top, width, height), columns, card_height, gap
+
+    def _draw_button(self, rect: pygame.Rect, label: str, muted: bool = False, primary: bool = False) -> None:
+        mouse_pos = pygame.mouse.get_pos()
+        hovered = rect.collidepoint(mouse_pos)
+        if muted:
+            background = (38, 42, 50)
+            border = (56, 62, 72)
+            text_color = DASHBOARD.muted_text_color
+        elif primary:
+            background = (32, 88, 63) if not hovered else (39, 105, 75)
+            border = DASHBOARD.success_color
+            text_color = DASHBOARD.title_color
+        else:
+            background = (24, 30, 39) if not hovered else (38, 47, 61)
+            border = DASHBOARD.panel_border_color if not hovered else (122, 139, 164)
+            text_color = DASHBOARD.text_color
+        pygame.draw.rect(self._surface, background, rect, border_radius=5)
+        pygame.draw.rect(self._surface, border, rect, width=1, border_radius=5)
+        rendered = self._button_font.render(label, True, text_color)
+        self._surface.blit(rendered, rendered.get_rect(center=rect.center))
 
     def _draw_text(
         self,

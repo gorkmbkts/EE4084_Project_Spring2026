@@ -48,8 +48,8 @@ class ManualController:
             manual_gear_shift=False,
         )
 
-    def apply_control(self) -> None:
-        """Apply one manual-control step to the vehicle."""
+    def apply_control(self) -> "carla.VehicleControl":
+        """Apply one manual-control step to the vehicle and return the command."""
         control = self._build_control()
         self._vehicle.apply_control(control)
-
+        return control

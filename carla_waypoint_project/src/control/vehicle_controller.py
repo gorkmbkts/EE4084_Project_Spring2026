@@ -48,13 +48,14 @@ class VehicleController:
         state: EgoState,
         target_waypoint: Optional["carla.Waypoint"],
         route_completed: bool = False,
+        target_speed_mps: Optional[float] = None,
     ) -> "carla.VehicleControl":
         """Compute a CARLA control command for the current route target."""
         if route_completed or target_waypoint is None:
             return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=False)
 
         steer = self._compute_steer(state, target_waypoint)
-        throttle, brake = self._compute_speed_control(state, steer)
+        throttle, brake = self._compute_speed_control(state, steer, target_speed_mps)
         return carla.VehicleControl(
             throttle=throttle,
             steer=steer,
@@ -85,8 +86,13 @@ class VehicleController:
         normalized = self._steering_gain * steer_angle / self._max_steer_angle_rad
         return self._clamp(normalized, -self._max_steer, self._max_steer)
 
-    def _compute_speed_control(self, state: EgoState, steer: float) -> tuple[float, float]:
-        target_speed = self._target_speed_for_steer(steer)
+    def _compute_speed_control(
+        self,
+        state: EgoState,
+        steer: float,
+        target_speed_mps: Optional[float],
+    ) -> tuple[float, float]:
+        target_speed = self._target_speed_for_steer(steer) if target_speed_mps is None else max(0.0, target_speed_mps)
         speed_error = target_speed - state.speed
         if speed_error >= 0.0:
             throttle = self._clamp(self._speed_kp * speed_error, 0.0, self._max_throttle)

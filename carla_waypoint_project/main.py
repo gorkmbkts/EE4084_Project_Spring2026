@@ -34,7 +34,10 @@ def main() -> None:
         from src.core.carla_client import CarlaConnectionError
         from src.core.app import SimulationApp
 
-        app = SimulationApp(selected_map_load_name=selection.selected_map_load_name)
+        app = SimulationApp(
+            selected_map_load_name=selection.selected_map_load_name,
+            existing_display_surface=selector.surface,
+        )
         try:
             app.run()
         except CarlaConnectionError as exc:

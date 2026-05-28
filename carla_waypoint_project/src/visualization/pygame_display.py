@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import ctypes
-from ctypes import wintypes
-import sys
 from typing import Optional
 
 import pygame
 
 from config.settings import DASHBOARD, DISPLAY
 from src.visualization.dashboard_layout import DashboardLayout, build_dashboard_layout
+from src.visualization.windowing import configure_native_window, create_display_surface, display_flags_from_settings
 
 
 class PygameDisplay:
@@ -21,74 +19,24 @@ class PygameDisplay:
         width: int = DISPLAY.width,
         height: int = DISPLAY.height,
         title: str = DISPLAY.title,
-    ) -> None:
+        existing_surface: Optional[pygame.Surface] = None,
+        ) -> None:
         pygame.init()
-        self._display_flags = self._display_flags_from_settings()
-        self._surface = pygame.display.set_mode((width, height), self._display_flags)
+        self._display_flags = display_flags_from_settings()
+        current_surface = pygame.display.get_surface()
+        if existing_surface is not None and current_surface is not None:
+            self._surface = current_surface
+            pygame.display.set_caption(title)
+            configure_native_window()
+        else:
+            self._surface = create_display_surface(width=width, height=height, title=title)
         pygame.display.set_caption(title)
-        self._configure_native_window()
         self._clear_color = DISPLAY.clear_color
         actual_width, actual_height = self._surface.get_size()
         self._layout = build_dashboard_layout(width=actual_width, height=actual_height)
         self._camera_content_rect = self._layout.main_view_rect.copy()
         self._title_font = pygame.font.SysFont("consolas", DASHBOARD.title_font_size, bold=True)
         self._status_font = pygame.font.SysFont("consolas", DASHBOARD.text_font_size)
-
-    @staticmethod
-    def _display_flags_from_settings() -> int:
-        flags = 0
-        if DISPLAY.fullscreen and not DISPLAY.maximized:
-            flags |= pygame.FULLSCREEN
-        if DISPLAY.resizable or DISPLAY.maximized:
-            flags |= pygame.RESIZABLE
-        return flags
-
-    def _configure_native_window(self) -> None:
-        """Apply Windows window styles and maximize without pygame fullscreen."""
-        if sys.platform != "win32":
-            return
-
-        window_info = pygame.display.get_wm_info()
-        hwnd = window_info.get("window")
-        if not hwnd:
-            return
-
-        hwnd_handle = wintypes.HWND(hwnd)
-        if DISPLAY.borderless:
-            self._make_window_borderless_resizable(hwnd_handle)
-        if DISPLAY.maximized:
-            ctypes.windll.user32.ShowWindow(hwnd_handle, 3)
-        pygame.time.wait(50)
-        pygame.event.pump()
-        self._surface = pygame.display.get_surface() or self._surface
-
-    @staticmethod
-    def _make_window_borderless_resizable(hwnd: wintypes.HWND) -> None:
-        user32 = ctypes.windll.user32
-        gwl_style = -16
-        swp_nosize = 0x0001
-        swp_nomove = 0x0002
-        swp_nozorder = 0x0004
-        swp_framechanged = 0x0020
-        ws_caption = 0x00C00000
-        ws_sysmenu = 0x00080000
-        ws_thickframe = 0x00040000
-        ws_minimizebox = 0x00020000
-        ws_maximizebox = 0x00010000
-
-        style = user32.GetWindowLongW(hwnd, gwl_style)
-        style &= ~ws_caption
-        style |= ws_sysmenu | ws_thickframe | ws_minimizebox | ws_maximizebox
-        user32.SetWindowLongW(hwnd, gwl_style, style)
-        user32.SetWindowPos(
-            hwnd,
-            wintypes.HWND(0),
-            0,
-            0,
-            0,
-            0,
-            swp_nomove | swp_nosize | swp_nozorder | swp_framechanged,
-        )
 
     @property
     def surface(self) -> pygame.Surface:
@@ -109,6 +57,18 @@ class PygameDisplay:
     @property
     def workspace_rect(self) -> pygame.Rect:
         return self._layout.workspace_rect
+
+    @property
+    def behavior_tuning_rect(self) -> pygame.Rect:
+        return self._layout.behavior_tuning_rect
+
+    @property
+    def control_visual_rect(self) -> pygame.Rect:
+        return self._layout.control_visual_rect
+
+    @property
+    def driving_state_rect(self) -> pygame.Rect:
+        return self._layout.driving_state_rect
 
     @property
     def map_rect(self) -> pygame.Rect:
@@ -148,7 +108,9 @@ class PygameDisplay:
         self._surface.fill(self._clear_color)
         for rect in (
             self._layout.main_view_rect,
-            self._layout.workspace_rect,
+            self._layout.behavior_tuning_rect,
+            self._layout.control_visual_rect,
+            self._layout.driving_state_rect,
             self._layout.map_rect,
             self._layout.lidar_rect,
             self._layout.tab_panel_rect,
@@ -187,7 +149,9 @@ class PygameDisplay:
     def draw_panel_chrome(self) -> None:
         """Draw panel borders and compact titles after panel contents render."""
         self._draw_panel_frame(self._layout.main_view_rect, "Game View")
-        self._draw_panel_frame(self._layout.workspace_rect, "Workspace")
+        self._draw_panel_frame(self._layout.behavior_tuning_rect, "Behavior Tuning")
+        self._draw_panel_frame(self._layout.control_visual_rect, "Applied Controls")
+        self._draw_panel_frame(self._layout.driving_state_rect, "Driving State")
         self._draw_panel_frame(self._layout.map_rect, "2D Map")
         self._draw_panel_frame(self._layout.lidar_rect, "LiDAR")
         self._draw_panel_border(self._layout.tab_panel_rect)
