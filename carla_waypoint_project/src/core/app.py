@@ -10,8 +10,14 @@ from typing import Optional
 
 import pygame
 
-from config.settings import BENCHMARK, ROUTE_INITIALIZATION, TOPDOWN_MAP
+from config.settings import BENCHMARK, DASHBOARD, ROUTE_INITIALIZATION, TOPDOWN_MAP
+from src.KalmanLab.filter_base import (
+    FilterControlInput,
+    TRACKING_MODE_ACTIVE,
+    TRACKING_MODE_PASSIVE,
+)
 from src.KalmanLab.filter_manager import FilterManager
+from src.KalmanLab.tune_advisor import TuneRecommendation, recommend_filter_tune
 from src.control.driving_behavior import (
     ActuatorRealism,
     CurvatureSpeedPlanner,
@@ -176,6 +182,15 @@ class SimulationApp:
         self._control_status_text = "Test idle"
         self._behavior_tuning_panel: Optional[BehaviorTuningPanel] = None
         self._sensor_noise_panel: Optional[ParameterEditor] = None
+        self._filter_tune_panel: Optional[ParameterEditor] = None
+        self._filter_tune_panel_filter_id = ""
+        self._filter_tracking_rects: dict[str, pygame.Rect] = {}
+        self._filter_apply_recommended_rect = pygame.Rect(0, 0, 1, 1)
+        self._last_filter_tune_status = "Tune changes reset the active estimator."
+        self._filter_recommendation_applied_by_filter: dict[str, bool] = {}
+        self._filter_overlay_font = pygame.font.SysFont("consolas", DASHBOARD.small_font_size)
+        self._filter_overlay_small_font = pygame.font.SysFont("consolas", 11)
+        self._filter_overlay_bold_font = pygame.font.SysFont("consolas", DASHBOARD.small_font_size, bold=True)
         self._test_progress_panel: Optional[TestProgressPanel] = None
         self._live_evaluation_panel: Optional[LiveEvaluationPanel] = None
         self._control_visual_widget: Optional[ControlVisualizationWidget] = None
@@ -246,6 +261,8 @@ class SimulationApp:
             vehicle_blueprint_callback=self._vehicle_blueprint_metadata,
             active_filter_info_callback=self._active_filter_info_for_metadata,
             active_filter_tune_callback=self._active_filter_tune_for_metadata,
+            tracking_mode_callback=self._tracking_mode_for_metadata,
+            active_control_used_callback=self._active_control_used_for_metadata,
             selected_map_load_name=self._selected_map_load_name,
         )
 
@@ -310,6 +327,7 @@ class SimulationApp:
             self.driving_behavior_config,
         )
         self._build_control_panel()
+        self._sync_filter_tune_panel()
         self._control_status_text = "Dashboard ready"
         self._draw_startup_frame()
 
@@ -368,12 +386,31 @@ class SimulationApp:
     def _active_filter_info_for_metadata(self) -> dict[str, object]:
         if self._filter_manager is None:
             return {}
-        return self._filter_manager.get_active_filter_info()
+        info = self._filter_manager.get_active_filter_info()
+        filter_id = str(info.get("id") or self._filter_manager.active_filter_id or "")
+        info["tracking_mode"] = self._filter_manager.tracking_mode
+        info["active_control_input_used"] = self._filter_manager.active_control_input_used
+        info["recommendation_applied"] = bool(self._filter_recommendation_applied_by_filter.get(filter_id, False))
+        return info
 
     def _active_filter_tune_for_metadata(self) -> dict[str, object]:
         if self._filter_manager is None:
             return {}
         return self._filter_manager.get_active_filter_tune()
+
+    def _tracking_mode_for_metadata(self) -> str:
+        if self._filter_manager is None:
+            return TRACKING_MODE_PASSIVE
+        return self._filter_manager.tracking_mode
+
+    def _active_control_used_for_metadata(self) -> bool:
+        if self._filter_manager is None:
+            return False
+        diagnostics = self._filter_manager.get_diagnostics()
+        return bool(
+            diagnostics.get("active_command_used_latest_prediction")
+            or diagnostics.get("active_control_input_used")
+        )
 
     def _apply_startup_benchmark_config(self) -> None:
         config = self._startup_benchmark_config
@@ -394,11 +431,21 @@ class SimulationApp:
             )
 
         if self._filter_manager is not None:
+            if config.selected_filter_tune:
+                self._filter_manager.update_filter_tune(
+                    config.selected_filter,
+                    dict(config.selected_filter_tune),
+                    reset_active=False,
+                )
             ok, message = self._filter_manager.switch_filter(config.selected_filter, skip_current_sensor_frames=True)
             if not ok:
                 self._planner_status = message
                 self._control_status_text = message
                 return
+            self._filter_manager.set_tracking_mode(config.tracking_mode, reset_active=True)
+            config.selected_filter_tune = self._filter_manager.get_active_filter_tune()
+            config.tracking_mode = self._filter_manager.tracking_mode
+            self._sync_filter_tune_panel()
             if not self._filter_manager.active_filter_safe_for_autonomous_control():
                 self._planner_status = "Benchmark blocked: selected filter is unsafe for autonomous control"
                 self._control_status_text = self._planner_status
@@ -530,7 +577,7 @@ class SimulationApp:
         if active_tab == "Route":
             self._control_panel.set_text_lines("Route", self._route_tab_lines())
         elif active_tab == "Filters":
-            self._control_panel.set_text_lines("Filters", self._filters_tab_lines())
+            self._control_panel.set_text_lines("Filters", ())
         elif active_tab == "Benchmark":
             self._control_panel.set_text_lines("Benchmark", self._benchmark_tab_lines())
         elif active_tab == "Sensors":
@@ -558,16 +605,266 @@ class SimulationApp:
             return
 
         ok, message = self._filter_manager.switch_filter(filter_id, skip_current_sensor_frames=True)
-        self._latest_estimated_state = None
-        self._latest_localization_status = None
-        self._latest_gnss_diagnostics = None
-        self._latest_gnss_frame = None
-        self._gnss_trail_xy.clear()
+        self._sync_filter_tune_panel()
+        self._clear_localization_after_filter_reset()
         warning = self._active_filter_warning()
         self._planner_status = message
         self._control_status_text = warning or message
         if not ok:
             self._planner_status = message
+
+    def _handle_filters_tab_event(self, event: pygame.event.Event) -> bool:
+        if self._filter_tune_panel is not None and self._filter_tune_panel.handle_event(event):
+            return True
+        if event.type != pygame.MOUSEBUTTONDOWN or getattr(event, "button", None) != 1 or not hasattr(event, "pos"):
+            return False
+        position = event.pos
+        for mode, rect in self._filter_tracking_rects.items():
+            if rect.collidepoint(position):
+                self._set_live_tracking_mode(mode)
+                return True
+        if self._filter_apply_recommended_rect.collidepoint(position):
+            self._apply_recommended_filter_tune()
+            return True
+        return False
+
+    def _sync_filter_tune_panel(self) -> None:
+        manager = self._filter_manager
+        if manager is None or manager.active_filter_id is None:
+            self._filter_tune_panel = None
+            self._filter_tune_panel_filter_id = ""
+            return
+        filter_id = manager.active_filter_id
+        specs = manager.get_filter_tune_specs(filter_id)
+        if not specs:
+            self._filter_tune_panel = None
+            self._filter_tune_panel_filter_id = filter_id
+            return
+        values = manager.get_filter_runtime_tune(filter_id)
+        if self._filter_tune_panel is None or self._filter_tune_panel_filter_id != filter_id:
+            self._filter_tune_panel = ParameterEditor(
+                specs=specs,
+                values={key: float(value) for key, value in values.items() if isinstance(value, (int, float, bool))},
+                presets={},
+                active_preset="Custom",
+                title="Tune Parameters",
+                on_commit=self._commit_live_filter_tune,
+            )
+            self._filter_tune_panel_filter_id = filter_id
+        else:
+            self._filter_tune_panel.set_values(values, active_preset="Custom", commit=False)
+        self._filter_tune_panel.status_text = self._last_filter_tune_status
+
+    def _commit_live_filter_tune(self, values: dict[str, float], _preset_name: str) -> None:
+        manager = self._filter_manager
+        if manager is None or manager.active_filter_id is None:
+            self._last_filter_tune_status = "Filter manager unavailable."
+            return
+        if self._test_mode_active():
+            self._last_filter_tune_status = "Tune edits locked during automated benchmark."
+            if self._filter_tune_panel is not None:
+                self._filter_tune_panel.status_text = self._last_filter_tune_status
+            return
+        filter_id = manager.active_filter_id
+        ok, message = manager.update_filter_tune(filter_id, values, reset_active=True)
+        self._last_filter_tune_status = "Applied and estimator reset." if ok else message
+        self._filter_recommendation_applied_by_filter[filter_id] = False
+        self._sync_filter_tune_panel()
+        if ok:
+            self._clear_localization_after_filter_reset()
+            self._hold_vehicle_after_filter_reset()
+        self._planner_status = message
+        self._control_status_text = self._last_filter_tune_status
+
+    def _set_live_tracking_mode(self, mode: str) -> None:
+        manager = self._filter_manager
+        if manager is None:
+            self._control_status_text = "Filter manager unavailable"
+            return
+        if self._test_mode_active():
+            self._control_status_text = "Tracking mode locked during automated benchmark"
+            self._planner_status = self._control_status_text
+            return
+        ok, message = manager.set_tracking_mode(mode, reset_active=True)
+        self._last_filter_tune_status = message
+        self._sync_filter_tune_panel()
+        if ok:
+            self._clear_localization_after_filter_reset()
+            self._hold_vehicle_after_filter_reset()
+        self._planner_status = message
+        self._control_status_text = message
+
+    def _current_filter_recommendation(self) -> TuneRecommendation:
+        manager = self._filter_manager
+        if manager is None or manager.active_filter_id is None:
+            return TuneRecommendation("", TRACKING_MODE_PASSIVE, {}, ("Filter manager unavailable.",))
+        filter_id = manager.active_filter_id
+        return recommend_filter_tune(
+            filter_id=filter_id,
+            sensor_noise_config=self.sensor_noise_config,
+            tracking_mode=manager.tracking_mode,
+            current_tune=manager.get_filter_runtime_tune(filter_id),
+            tune_specs=manager.get_filter_tune_specs(filter_id),
+        )
+
+    def _apply_recommended_filter_tune(self) -> None:
+        manager = self._filter_manager
+        if manager is None or manager.active_filter_id is None:
+            return
+        if self._test_mode_active():
+            self._last_filter_tune_status = "Recommendations locked during automated benchmark."
+            return
+        recommendation = self._current_filter_recommendation()
+        if not recommendation.values:
+            self._last_filter_tune_status = "No recommendation available for this filter."
+            return
+        filter_id = manager.active_filter_id
+        ok, message = manager.update_filter_tune(filter_id, recommendation.values, reset_active=True)
+        self._last_filter_tune_status = "Recommended tune applied; estimator reset." if ok else message
+        self._filter_recommendation_applied_by_filter[filter_id] = bool(ok)
+        self._sync_filter_tune_panel()
+        if ok:
+            self._clear_localization_after_filter_reset()
+            self._hold_vehicle_after_filter_reset()
+        self._planner_status = message
+        self._control_status_text = self._last_filter_tune_status
+
+    def _draw_filters_tab_overlay(self) -> None:
+        if self._display is None or self._control_panel is None:
+            return
+        manager = self._filter_manager
+        if manager is None:
+            return
+        surface = self._display.surface
+        panel = self._display.control_panel_rect
+        padding = DASHBOARD.panel_padding_px
+        y = self._filters_button_bottom(panel) + 8
+        bottom = panel.bottom - padding
+        content_width = panel.width - 2 * padding
+        self._filter_tracking_rects.clear()
+        self._filter_apply_recommended_rect = pygame.Rect(0, 0, 1, 1)
+
+        mode_rect = pygame.Rect(panel.left + padding, y, content_width, 26)
+        self._draw_filter_tracking_buttons(surface, mode_rect, manager.tracking_mode)
+        y = mode_rect.bottom + 8
+
+        summary_height = 48
+        summary_rect = pygame.Rect(panel.left + padding, y, content_width, summary_height)
+        pygame.draw.rect(surface, (17, 22, 29), summary_rect, border_radius=4)
+        pygame.draw.rect(surface, DASHBOARD.panel_border_color, summary_rect, width=1, border_radius=4)
+        info = manager.get_active_filter_info()
+        warning = self._active_filter_warning()
+        summary_lines = [
+            f"Active: {info.get('name', 'none')} ({info.get('id', 'n/a')}) | Mode: {manager.tracking_mode}",
+            warning or manager.tracking_mode_message or self._last_filter_tune_status,
+        ]
+        line_y = summary_rect.top + 7
+        for line in summary_lines:
+            color = DASHBOARD.warning_color if "unsafe" in line.lower() or "unsupported" in line.lower() else DASHBOARD.text_color
+            self._draw_overlay_text(surface, line, (summary_rect.left + 8, line_y), self._filter_overlay_small_font, color, summary_rect.width - 16)
+            line_y += 17
+        y = summary_rect.bottom + 8
+
+        recommendation_height = 72
+        recommendation_rect = pygame.Rect(panel.left + padding, max(y + 82, bottom - recommendation_height), content_width, recommendation_height)
+        tune_rect = pygame.Rect(panel.left + padding, y, content_width, max(64, recommendation_rect.top - y - 8))
+        if self._filter_tune_panel is not None:
+            self._filter_tune_panel.status_text = self._last_filter_tune_status
+            self._filter_tune_panel.draw(surface, tune_rect)
+        else:
+            pygame.draw.rect(surface, DASHBOARD.panel_inner_color, tune_rect, border_radius=4)
+            pygame.draw.rect(surface, DASHBOARD.panel_border_color, tune_rect, width=1, border_radius=4)
+            self._draw_overlay_text(
+                surface,
+                "Selected filter exposes no editable tune specs.",
+                (tune_rect.left + 8, tune_rect.top + 10),
+                self._filter_overlay_small_font,
+                DASHBOARD.muted_text_color,
+                tune_rect.width - 16,
+            )
+        self._draw_live_recommendation_card(surface, recommendation_rect)
+
+    def _draw_filter_tracking_buttons(self, surface: pygame.Surface, rect: pygame.Rect, active_mode: str) -> None:
+        gap = 6
+        button_width = max(60, (rect.width - gap) // 2)
+        for index, (mode, label) in enumerate(((TRACKING_MODE_PASSIVE, "Passive"), (TRACKING_MODE_ACTIVE, "Active"))):
+            button = pygame.Rect(rect.left + index * (button_width + gap), rect.top, button_width, rect.height)
+            self._filter_tracking_rects[mode] = button
+            active = active_mode == mode
+            hovered = button.collidepoint(pygame.mouse.get_pos())
+            background = (35, 73, 53) if active else ((38, 47, 61) if hovered else (24, 30, 39))
+            border = DASHBOARD.success_color if active else DASHBOARD.panel_border_color
+            pygame.draw.rect(surface, background, button, border_radius=4)
+            pygame.draw.rect(surface, border, button, width=1, border_radius=4)
+            rendered = self._filter_overlay_bold_font.render(label, True, DASHBOARD.title_color if active else DASHBOARD.text_color)
+            surface.blit(rendered, rendered.get_rect(center=button.center))
+
+    def _draw_live_recommendation_card(self, surface: pygame.Surface, rect: pygame.Rect) -> None:
+        recommendation = self._current_filter_recommendation()
+        pygame.draw.rect(surface, (18, 23, 30), rect, border_radius=4)
+        pygame.draw.rect(surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=4)
+        title_y = rect.top + 7
+        self._draw_overlay_text(surface, "Recommendation", (rect.left + 8, title_y), self._filter_overlay_bold_font, DASHBOARD.title_color, rect.width - 154)
+        self._filter_apply_recommended_rect = pygame.Rect(rect.right - 136, rect.top + 6, 128, 24)
+        self._draw_overlay_button(surface, self._filter_apply_recommended_rect, "Apply Recommended", enabled=recommendation.has_values)
+        lines = list(recommendation.messages[:2])
+        lines.extend(recommendation.warnings[:1])
+        if not lines:
+            lines = ["No recommendation available for this filter."]
+        y = rect.top + 34
+        for line in lines[:2]:
+            color = DASHBOARD.warning_color if line in recommendation.warnings else DASHBOARD.muted_text_color
+            self._draw_overlay_text(surface, line, (rect.left + 8, y), self._filter_overlay_small_font, color, rect.width - 16)
+            y += 15
+
+    def _draw_overlay_button(self, surface: pygame.Surface, rect: pygame.Rect, label: str, enabled: bool = True) -> None:
+        hovered = rect.collidepoint(pygame.mouse.get_pos())
+        if enabled:
+            background = (32, 88, 63) if hovered else (24, 64, 48)
+            border = DASHBOARD.success_color
+            text_color = DASHBOARD.title_color
+        else:
+            background = (38, 42, 50)
+            border = (56, 62, 72)
+            text_color = DASHBOARD.muted_text_color
+        pygame.draw.rect(surface, background, rect, border_radius=4)
+        pygame.draw.rect(surface, border, rect, width=1, border_radius=4)
+        rendered = self._filter_overlay_small_font.render(self._fit_overlay_text(label, self._filter_overlay_small_font, rect.width - 8), True, text_color)
+        surface.blit(rendered, rendered.get_rect(center=rect.center))
+
+    def _filters_button_bottom(self, panel: pygame.Rect) -> int:
+        manager = self._filter_manager
+        button_count = len(manager.available_filters()) if manager is not None else 0
+        if button_count <= 0:
+            return panel.top + 40
+        columns = 1 if panel.width < 380 else 2
+        rows = (button_count + columns - 1) // columns
+        return panel.top + 40 + rows * 28 - 4
+
+    def _draw_overlay_text(
+        self,
+        surface: pygame.Surface,
+        text: object,
+        position: tuple[int, int],
+        font: pygame.font.Font,
+        color: tuple[int, int, int],
+        max_width: int,
+    ) -> None:
+        rendered = font.render(self._fit_overlay_text(str(text), font, max_width), True, color)
+        surface.blit(rendered, position)
+
+    @staticmethod
+    def _fit_overlay_text(text: str, font: pygame.font.Font, max_width: int) -> str:
+        if font.size(text)[0] <= max_width:
+            return text
+        ellipsis = "..."
+        available = max(0, max_width - font.size(ellipsis)[0])
+        fitted = ""
+        for char in text:
+            if font.size(fitted + char)[0] > available:
+                break
+            fitted += char
+        return fitted.rstrip() + ellipsis
 
     def _route_tab_lines(self) -> list[str]:
         store = self._test_route_store
@@ -739,6 +1036,7 @@ class SimulationApp:
         return (
             f"MODE {self._drive_mode.value} | "
             f"FILTER {self._active_filter_name()} | "
+            f"TRACK {self._tracking_mode_for_metadata()} | "
             f"WORLD {self._active_map_display_name()} | "
             f"MAP {'ON' if self._map_selection_active else 'OFF'} | "
             f"ROUTE {self._selected_route_label()} | "
@@ -775,7 +1073,12 @@ class SimulationApp:
         return bool(self._test_runner is not None and self._test_runner.is_active and self._test_runner.is_automated)
 
     def _active_filter_warning(self) -> str:
-        if self._filter_manager is None or self._active_filter_safe_for_autonomous():
+        if self._filter_manager is None:
+            return ""
+        tracking_message = self._filter_manager.tracking_mode_message
+        if "unsupported" in tracking_message.lower():
+            return tracking_message
+        if self._active_filter_safe_for_autonomous():
             return ""
         return "Raw GNSS is noisy and may be unsafe for closed-loop control."
 
@@ -846,6 +1149,7 @@ class SimulationApp:
                     )
                     vehicle.apply_control(control)
                     self._set_latest_control(control, control)
+                    self._feed_filter_control_input(control, source="route_initialization_brake")
                     self.actuator_realism.reset(control)
                 elif self._drive_mode == DriveMode.AUTONOMOUS:
                     control_state = self._state_for_tracking_and_control()
@@ -853,6 +1157,7 @@ class SimulationApp:
                         control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
                         vehicle.apply_control(control)
                         self._set_latest_control(control, control)
+                        self._feed_filter_control_input(control, source="autonomous_safety_brake")
                         self.actuator_realism.reset(control)
                     else:
                         preview_waypoints = self.waypoint_tracker.get_preview_waypoints(max_count=90)
@@ -872,6 +1177,7 @@ class SimulationApp:
                         applied_control = self.actuator_realism.apply(control, dt_seconds)
                         vehicle.apply_control(applied_control)
                         self._set_latest_control(control, applied_control)
+                        self._feed_filter_control_input(applied_control, source="autonomous_applied")
                 else:
                     control = manual_controller.apply_control()
                     self._set_latest_control(control, control)
@@ -919,6 +1225,24 @@ class SimulationApp:
             manual_gear_shift=bool(getattr(applied_control, "manual_gear_shift", False)),
         )
 
+    def _feed_filter_control_input(self, applied_control: "carla.VehicleControl", source: str) -> None:
+        if self._filter_manager is None:
+            return
+        state = self._latest_ground_truth_state
+        timestamp = state.timestamp if state is not None else time.monotonic()
+        control_input = FilterControlInput(
+            timestamp=float(timestamp),
+            throttle=float(getattr(applied_control, "throttle", 0.0)),
+            steer=float(getattr(applied_control, "steer", 0.0)),
+            brake=float(getattr(applied_control, "brake", 0.0)),
+            hand_brake=bool(getattr(applied_control, "hand_brake", False)),
+            reverse=bool(getattr(applied_control, "reverse", False)),
+            source=source,
+            speed_mps=float(state.speed) if state is not None else None,
+            yaw_deg=float(state.yaw) if state is not None else None,
+        )
+        self._filter_manager.process_control(control_input)
+
     def _reset_driving_behavior(self) -> None:
         initial_speed = self._latest_ground_truth_state.speed if self._latest_ground_truth_state is not None else 0.0
         self.speed_planner.reset(initial_speed_mps=initial_speed)
@@ -938,20 +1262,31 @@ class SimulationApp:
             if event.type == pygame.VIDEORESIZE:
                 self._handle_video_resize(event)
                 continue
+            if (
+                not self._test_mode_active()
+                and self._control_panel.active_tab == "Filters"
+                and self._handle_filters_tab_event(event)
+            ):
+                continue
+            if (
+                not self._test_mode_active()
+                and self._control_panel.active_tab == "Sensors"
+                and self._sensor_noise_panel is not None
+                and self._sensor_noise_panel.handle_event(event)
+            ):
+                continue
+            if (
+                not self._test_mode_active()
+                and self._behavior_tuning_panel is not None
+                and self._behavior_tuning_panel.handle_event(event)
+            ):
+                continue
             if event.type == pygame.KEYDOWN:
                 if not self._handle_key_down(event):
                     return False
             elif self._test_mode_active():
                 continue
             elif self._control_panel.handle_event(event):
-                continue
-            elif (
-                self._control_panel.active_tab == "Sensors"
-                and self._sensor_noise_panel is not None
-                and self._sensor_noise_panel.handle_event(event)
-            ):
-                continue
-            elif self._behavior_tuning_panel is not None and self._behavior_tuning_panel.handle_event(event):
                 continue
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 self._handle_mouse_button_down(event)
@@ -1145,13 +1480,28 @@ class SimulationApp:
             return
 
         self._filter_manager.reset(skip_current_sensor_frames=True)
+        self._clear_localization_after_filter_reset()
+        self._hold_vehicle_after_filter_reset()
+        self._planner_status = "Estimator reset"
+        self._control_status_text = "Estimator reset"
+
+    def _clear_localization_after_filter_reset(self) -> None:
         self._latest_estimated_state = None
         self._latest_localization_status = None
         self._latest_gnss_diagnostics = None
         self._latest_gnss_frame = None
         self._gnss_trail_xy.clear()
-        self._planner_status = "Estimator reset"
-        self._control_status_text = "Estimator reset"
+
+    def _hold_vehicle_after_filter_reset(self) -> None:
+        if self._drive_mode != DriveMode.AUTONOMOUS or self._vehicle is None:
+            return
+        control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=False)
+        try:
+            self._vehicle.apply_control(control)
+        except RuntimeError:
+            return
+        self._set_latest_control(control, control)
+        self.actuator_realism.reset(control)
 
     def _respawn_benchmark_localization_sensors(self) -> None:
         """Recreate GNSS/IMU actors so every benchmark attempt starts from the selected noise config."""
@@ -1491,10 +1841,7 @@ class SimulationApp:
         self._vehicle_manager.teleport_to_waypoint(start_waypoint)
         if self._filter_manager is not None:
             self._filter_manager.reset(skip_current_sensor_frames=True)
-            self._latest_estimated_state = None
-            self._latest_gnss_diagnostics = None
-            self._latest_gnss_frame = None
-            self._gnss_trail_xy.clear()
+            self._clear_localization_after_filter_reset()
         if self._ground_truth_provider is not None:
             self._latest_ground_truth_state = self._ground_truth_provider.get_state()
             self._latest_state = self._latest_ground_truth_state
@@ -1594,6 +1941,11 @@ class SimulationApp:
         self._manual_controller = ManualController(vehicle=self._vehicle)
         self._ground_truth_provider = GroundTruthStateProvider(vehicle=self._vehicle)
         self._gnss_projector = GnssLocalProjector(world_map=self._client_manager.world_map)
+        tune_overrides = {}
+        if self._startup_benchmark_config is not None:
+            tune_overrides[self._startup_benchmark_config.selected_filter] = dict(
+                self._startup_benchmark_config.selected_filter_tune or {}
+            )
         self._filter_manager = FilterManager(
             gnss_projector=self._gnss_projector,
             gnss_sensor=self._gnss_sensor,
@@ -1601,9 +1953,17 @@ class SimulationApp:
             default_filter_id=self._startup_benchmark_config.selected_filter
             if self._startup_benchmark_config is not None
             else "ca_kf",
+            default_tune_overrides=tune_overrides,
+            tracking_mode=self._startup_benchmark_config.tracking_mode
+            if self._startup_benchmark_config is not None
+            else TRACKING_MODE_PASSIVE,
         )
         if self._startup_benchmark_config is not None:
             self._filter_manager.switch_filter(self._startup_benchmark_config.selected_filter, skip_current_sensor_frames=True)
+            self._filter_manager.set_tracking_mode(self._startup_benchmark_config.tracking_mode, reset_active=True)
+            self._startup_benchmark_config.selected_filter_tune = self._filter_manager.get_active_filter_tune()
+            self._startup_benchmark_config.tracking_mode = self._filter_manager.tracking_mode
+        self._sync_filter_tune_panel()
         self._map_selector = MapSelector(world_map=self._client_manager.world_map)
         self.route_planner = RoutePlanner(world_map=self._client_manager.world_map)
         self._topdown_renderer = TopDownMapRenderer(world_map=self._client_manager.world_map)
@@ -1729,6 +2089,13 @@ class SimulationApp:
             return
         self._update_control_panel_state()
         self._control_panel.draw(self._display.surface)
+        if self._control_panel.active_tab == "Filters":
+            if (
+                self._filter_manager is not None
+                and self._filter_manager.active_filter_id != self._filter_tune_panel_filter_id
+            ):
+                self._sync_filter_tune_panel()
+            self._draw_filters_tab_overlay()
         if self._control_panel.active_tab == "Sensors" and self._sensor_noise_panel is not None:
             self._sensor_noise_panel.status_text = self._last_sensor_apply_status
             sensor_rect = self._display.control_panel_rect.copy()
@@ -1752,6 +2119,7 @@ class SimulationApp:
             f"Current: {route or 'initializing'}",
             f"Map: {self._active_map_display_name()}",
             f"Filter: {self._active_filter_name()}",
+            f"Tracking mode: {self._tracking_mode_for_metadata()}",
             f"State: {runner.state.value if runner is not None else 'n/a'}",
             f"Route status: {runner.route_status if runner is not None else 'n/a'}",
             f"Attempt: {runner.current_attempt if runner is not None and runner.current_attempt else 0}/{runner.max_attempts if runner is not None else 0}",

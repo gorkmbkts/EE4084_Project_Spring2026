@@ -11,7 +11,9 @@ from typing import Optional
 import pygame
 
 from config.settings import CARLA, DASHBOARD, DISPLAY
+from src.KalmanLab.filter_base import TRACKING_MODE_ACTIVE, TRACKING_MODE_PASSIVE
 from src.KalmanLab.registry import discover_filters
+from src.KalmanLab.tune_advisor import TuneRecommendation, recommend_filter_tune
 from src.evaluation.benchmark_config import (
     BEHAVIOR_PRESETS,
     BEHAVIOR_SPECS,
@@ -96,6 +98,14 @@ class StartupMapSelector:
         self._setup_filter_records = []
         self._setup_filter_buttons: dict[str, pygame.Rect] = {}
         self._selected_filter_id = ""
+        self._selected_filter_tunes: dict[str, dict[str, object]] = {}
+        self._filter_tune_editor: Optional[ParameterEditor] = None
+        self._filter_tune_editor_filter_id = ""
+        self._filter_tune_panel_rect = pygame.Rect(0, 0, 1, 1)
+        self._tracking_mode = TRACKING_MODE_PASSIVE
+        self._tracking_button_rects: dict[str, pygame.Rect] = {}
+        self._apply_recommended_rect = pygame.Rect(0, 0, 1, 1)
+        self._recommendation_applied_by_filter: dict[str, bool] = {}
         self._sensor_editor: Optional[ParameterEditor] = None
         self._behavior_editor: Optional[ParameterEditor] = None
         self._sensor_preset = "Medium Noise"
@@ -567,6 +577,7 @@ class StartupMapSelector:
         ]
         if self._setup_filter_records and not self._selected_filter_id:
             self._selected_filter_id = self._setup_filter_records[0].filter_id
+        self._ensure_filter_tune_editor()
         self._route_items = load_available_test_routes([option.load_name or option.detail for option in self._options])
         if self._sensor_editor is None:
             self._sensor_editor = ParameterEditor(
@@ -585,6 +596,88 @@ class StartupMapSelector:
                 title="Vehicle Behavior Settings",
             )
 
+    def _selected_filter_record(self) -> object | None:
+        return next(
+            (record for record in self._setup_filter_records if record.filter_id == self._selected_filter_id),
+            None,
+        )
+
+    def _ensure_filter_tune_editor(self) -> None:
+        record = self._selected_filter_record()
+        if record is None:
+            self._filter_tune_editor = None
+            self._filter_tune_editor_filter_id = ""
+            return
+        if record.filter_id not in self._selected_filter_tunes:
+            self._selected_filter_tunes[record.filter_id] = dict(record.tune)
+        specs = tuple(getattr(record, "tune_specs", ()))
+        if not specs:
+            self._filter_tune_editor = None
+            self._filter_tune_editor_filter_id = record.filter_id
+            return
+        values = self._selected_filter_tunes.get(record.filter_id, dict(record.tune))
+        if self._filter_tune_editor is None or self._filter_tune_editor_filter_id != record.filter_id:
+            self._filter_tune_editor = ParameterEditor(
+                specs=specs,
+                values={key: float(value) for key, value in values.items() if isinstance(value, (int, float, bool))},
+                presets={},
+                active_preset="Custom",
+                title="Tune Parameters",
+                on_commit=self._commit_setup_filter_tune,
+            )
+            self._filter_tune_editor_filter_id = record.filter_id
+        else:
+            self._filter_tune_editor.set_values(values, active_preset="Custom", commit=False)
+
+    def _commit_setup_filter_tune(self, values: dict[str, float], _preset_name: str) -> None:
+        record = self._selected_filter_record()
+        if record is None:
+            return
+        merged = dict(self._selected_filter_tunes.get(record.filter_id, record.tune))
+        for key, value in values.items():
+            default = record.tune.get(key)
+            merged[key] = bool(value >= 0.5) if isinstance(default, bool) else float(value)
+        self._selected_filter_tunes[record.filter_id] = merged
+        self._recommendation_applied_by_filter[record.filter_id] = False
+
+    def _current_filter_tune_values(self) -> dict[str, object]:
+        record = self._selected_filter_record()
+        if record is None:
+            return {}
+        if self._filter_tune_editor is not None:
+            self._commit_setup_filter_tune(self._filter_tune_editor.values(), "Custom")
+        return dict(self._selected_filter_tunes.get(record.filter_id, record.tune))
+
+    def _current_sensor_values(self) -> dict[str, object]:
+        if self._sensor_editor is not None:
+            return self._sensor_editor.values()
+        return SENSOR_NOISE_PRESETS["Medium Noise"]
+
+    def _current_recommendation(self) -> TuneRecommendation:
+        record = self._selected_filter_record()
+        if record is None:
+            return TuneRecommendation("", self._tracking_mode, {}, ("Select a filter to see recommendations.",))
+        return recommend_filter_tune(
+            filter_id=record.filter_id,
+            sensor_noise_config=sensor_noise_config_from_values(self._current_sensor_values(), preset_name=self._sensor_preset),
+            tracking_mode=self._tracking_mode,
+            current_tune=dict(self._selected_filter_tunes.get(record.filter_id, record.tune)),
+            tune_specs=getattr(record, "tune_specs", ()),
+        )
+
+    def _apply_recommended_setup_tune(self) -> None:
+        record = self._selected_filter_record()
+        if record is None:
+            return
+        recommendation = self._current_recommendation()
+        if not recommendation.values:
+            return
+        merged = dict(self._selected_filter_tunes.get(record.filter_id, record.tune))
+        merged.update(recommendation.values)
+        self._selected_filter_tunes[record.filter_id] = merged
+        self._recommendation_applied_by_filter[record.filter_id] = True
+        self._ensure_filter_tune_editor()
+
     def _handle_test_setup_event(self, event: pygame.event.Event, client: object) -> object:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
@@ -598,6 +691,23 @@ class StartupMapSelector:
                 self._active_tab = tab
                 return _NoSelection
 
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and hasattr(event, "pos"):
+            position = event.pos
+            for filter_id, rect in self._setup_filter_buttons.items():
+                if rect.collidepoint(position):
+                    self._selected_filter_id = filter_id
+                    self._ensure_filter_tune_editor()
+                    return _NoSelection
+            for mode, rect in self._tracking_button_rects.items():
+                if rect.collidepoint(position):
+                    self._tracking_mode = mode
+                    return _NoSelection
+            if self._apply_recommended_rect.collidepoint(position):
+                self._apply_recommended_setup_tune()
+                return _NoSelection
+
+        if self._filter_tune_editor is not None and self._filter_tune_editor.handle_event(event):
+            return _NoSelection
         if self._sensor_editor is not None and self._sensor_editor.handle_event(event):
             self._sensor_preset = self._sensor_editor.active_preset
             return _NoSelection
@@ -610,10 +720,6 @@ class StartupMapSelector:
             return _NoSelection
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and hasattr(event, "pos"):
             position = event.pos
-            for filter_id, rect in self._setup_filter_buttons.items():
-                if rect.collidepoint(position):
-                    self._selected_filter_id = filter_id
-                    return _NoSelection
             if self._select_all_routes_rect.collidepoint(position):
                 self._selected_route_indices = {item.index for item in self._route_items}
                 return _NoSelection
@@ -634,28 +740,53 @@ class StartupMapSelector:
     def _draw_test_setup(self, rect: pygame.Rect) -> None:
         self._refresh_test_setup()
         gap = 12
-        column_width = max(260, (rect.width - 2 * gap) // 3)
-        left = pygame.Rect(rect.left, rect.top, column_width, rect.height - 58)
-        middle = pygame.Rect(left.right + gap, rect.top, column_width, rect.height - 58)
-        right = pygame.Rect(middle.right + gap, rect.top, rect.right - middle.right - gap, rect.height - 58)
         bottom = pygame.Rect(rect.left, rect.bottom - 46, rect.width, 42)
+        work = pygame.Rect(rect.left, rect.top, rect.width, rect.height - 58)
 
-        self._draw_filter_selection(left)
-        if self._sensor_editor is not None:
-            self._sensor_editor.draw(self._surface, middle)
-        if self._behavior_editor is not None:
-            behavior_rect = pygame.Rect(right.left, right.top, right.width, max(180, int(right.height * 0.56)))
+        if work.width >= 1280:
+            column_width = max(250, (work.width - 3 * gap) // 4)
+            left = pygame.Rect(work.left, work.top, column_width, work.height)
+            tune = pygame.Rect(left.right + gap, work.top, column_width, work.height)
+            sensor = pygame.Rect(tune.right + gap, work.top, column_width, work.height)
+            right = pygame.Rect(sensor.right + gap, work.top, work.right - sensor.right - gap, work.height)
+            self._draw_filter_selection(left)
+            self._draw_filter_tune_panel(tune)
+            if self._sensor_editor is not None:
+                self._sensor_editor.draw(self._surface, sensor)
+            behavior_rect = pygame.Rect(right.left, right.top, right.width, max(180, int(right.height * 0.50)))
             routes_rect = pygame.Rect(right.left, behavior_rect.bottom + gap, right.width, right.bottom - behavior_rect.bottom - gap)
+        else:
+            top_height = max(220, int((work.height - gap) * 0.48))
+            bottom_height = work.height - top_height - gap
+            column_width = max(260, (work.width - gap) // 2)
+            left_top = pygame.Rect(work.left, work.top, column_width, top_height)
+            right_top = pygame.Rect(left_top.right + gap, work.top, work.right - left_top.right - gap, top_height)
+            left_bottom = pygame.Rect(work.left, left_top.bottom + gap, column_width, bottom_height)
+            right_bottom = pygame.Rect(left_bottom.right + gap, left_bottom.top, work.right - left_bottom.right - gap, bottom_height)
+            self._draw_filter_selection(left_top)
+            self._draw_filter_tune_panel(right_top)
+            if self._sensor_editor is not None:
+                self._sensor_editor.draw(self._surface, left_bottom)
+            behavior_rect = pygame.Rect(right_bottom.left, right_bottom.top, right_bottom.width, max(170, int(right_bottom.height * 0.52)))
+            routes_rect = pygame.Rect(
+                right_bottom.left,
+                behavior_rect.bottom + gap,
+                right_bottom.width,
+                max(80, right_bottom.bottom - behavior_rect.bottom - gap),
+            )
+
+        if self._behavior_editor is not None:
             self._behavior_editor.draw(self._surface, behavior_rect)
             self._draw_route_selection(routes_rect)
         else:
-            self._draw_route_selection(right)
+            self._draw_route_selection(routes_rect)
         self._draw_test_setup_footer(bottom)
 
     def _draw_filter_selection(self, rect: pygame.Rect) -> None:
         pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, rect, border_radius=6)
         pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
         content = rect.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
+        self._tracking_button_rects.clear()
         self._draw_text("Filter Selection", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
         y = content.top + 34
         self._setup_filter_buttons.clear()
@@ -685,6 +816,66 @@ class StartupMapSelector:
                     break
                 self._draw_text(line, (content.left, y), self._small_font, DASHBOARD.text_color, content.width)
                 y += 18
+        if y + 58 <= content.bottom:
+            y += 8
+            self._draw_text("Tracking Mode", (content.left, y), self._small_font, DASHBOARD.muted_text_color, content.width)
+            y += 20
+            self._draw_tracking_mode_buttons(pygame.Rect(content.left, y, content.width, 28))
+
+    def _draw_filter_tune_panel(self, rect: pygame.Rect) -> None:
+        self._filter_tune_panel_rect = rect.copy()
+        recommendation_height = min(112, max(86, int(rect.height * 0.24)))
+        recommendation_rect = pygame.Rect(rect.left, rect.bottom - recommendation_height, rect.width, recommendation_height)
+        editor_rect = pygame.Rect(rect.left, rect.top, rect.width, max(80, recommendation_rect.top - rect.top - 10))
+        if self._filter_tune_editor is not None:
+            self._filter_tune_editor.draw(self._surface, editor_rect)
+        else:
+            pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, editor_rect, border_radius=6)
+            pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, editor_rect, width=1, border_radius=6)
+            content = editor_rect.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
+            self._draw_text("Tune Parameters", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+            self._draw_text(
+                "Selected filter exposes no editable tune specs.",
+                (content.left, content.top + 34),
+                self._small_font,
+                DASHBOARD.muted_text_color,
+                content.width,
+            )
+        self._draw_recommendation_card(recommendation_rect)
+
+    def _draw_tracking_mode_buttons(self, rect: pygame.Rect) -> None:
+        self._tracking_button_rects.clear()
+        gap = 8
+        button_width = max(60, (rect.width - gap) // 2)
+        for index, (mode, label) in enumerate(((TRACKING_MODE_PASSIVE, "Passive"), (TRACKING_MODE_ACTIVE, "Active"))):
+            button = pygame.Rect(rect.left + index * (button_width + gap), rect.top, button_width, rect.height)
+            self._tracking_button_rects[mode] = button
+            active = self._tracking_mode == mode
+            hovered = button.collidepoint(pygame.mouse.get_pos())
+            background = (35, 73, 53) if active else ((38, 47, 61) if hovered else (24, 30, 39))
+            border = DASHBOARD.success_color if active else DASHBOARD.panel_border_color
+            pygame.draw.rect(self._surface, background, button, border_radius=5)
+            pygame.draw.rect(self._surface, border, button, width=1, border_radius=5)
+            rendered = self._button_font.render(label, True, DASHBOARD.title_color if active else DASHBOARD.text_color)
+            self._surface.blit(rendered, rendered.get_rect(center=button.center))
+
+    def _draw_recommendation_card(self, rect: pygame.Rect) -> None:
+        pygame.draw.rect(self._surface, (18, 23, 30), rect, border_radius=6)
+        pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
+        content = rect.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
+        self._draw_text("Recommendation", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+        recommendation = self._current_recommendation()
+        line_y = content.top + 30
+        shown_lines = list(recommendation.messages[:2])
+        shown_lines.extend(recommendation.warnings[:1])
+        if not shown_lines:
+            shown_lines = ["No recommendation for this filter."]
+        for line in shown_lines[:3]:
+            color = DASHBOARD.warning_color if line in recommendation.warnings else DASHBOARD.muted_text_color
+            self._draw_text(line, (content.left, line_y), self._small_font, color, content.width)
+            line_y += 17
+        self._apply_recommended_rect = pygame.Rect(content.right - 142, content.bottom - 28, 142, 24)
+        self._draw_button(self._apply_recommended_rect, "Apply Recommended", muted=not recommendation.has_values)
 
     def _draw_route_selection(self, rect: pygame.Rect) -> None:
         pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, rect, border_radius=6)
@@ -728,7 +919,10 @@ class StartupMapSelector:
         maps = sorted({display_map_name(route.map_name) for route in routes})
         filter_label = self._selected_filter_id or "none"
         map_text = ", ".join(maps[:3]) + ("..." if len(maps) > 3 else "")
-        return f"Filter {filter_label} | Routes {len(routes)} | Maps {map_text or 'none'} | Sensor {self._sensor_preset} | Behavior {self._behavior_preset}"
+        return (
+            f"Filter {filter_label} | Mode {self._tracking_mode} | Routes {len(routes)} | "
+            f"Maps {map_text or 'none'} | Sensor {self._sensor_preset} | Behavior {self._behavior_preset}"
+        )
 
     def _start_benchmark_from_setup(self, client: object) -> object:
         routes = [item.route for item in self._route_items if item.index in self._selected_route_indices]
@@ -738,14 +932,22 @@ class StartupMapSelector:
             self._sensor_preset = self._sensor_editor.active_preset
         if self._behavior_editor is not None:
             self._behavior_preset = self._behavior_editor.active_preset
+        selected_filter_tune = self._current_filter_tune_values()
+        recommendation_applied = bool(self._recommendation_applied_by_filter.get(self._selected_filter_id, False))
         config = BenchmarkConfig(
             selected_filter=self._selected_filter_id,
             selected_routes=tuple(routes),
             sensor_noise_config=sensor_noise_config_from_values(sensor_values, preset_name=self._sensor_preset),
             vehicle_behavior_config=driving_behavior_from_values(behavior_values, preset_name=self._behavior_preset),
+            selected_filter_tune=selected_filter_tune,
+            tracking_mode=self._tracking_mode,
             sensor_noise_preset=self._sensor_preset,
             vehicle_behavior_preset=self._behavior_preset,
-            metadata={"startup_mode": "test_setup"},
+            metadata={
+                "startup_mode": "test_setup",
+                "filter_tune_recommendation_applied": recommendation_applied,
+                "filter_tune_recommendation_applied_by_filter": dict(self._recommendation_applied_by_filter),
+            },
         )
         errors = validate_benchmark_config(
             config,

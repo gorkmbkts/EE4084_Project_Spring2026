@@ -52,6 +52,8 @@ class RouteTestRunner:
         vehicle_blueprint_callback: Callable[[], Optional[str]],
         active_filter_info_callback: Callable[[], dict[str, object]],
         active_filter_tune_callback: Callable[[], dict[str, object]],
+        tracking_mode_callback: Callable[[], str] | None = None,
+        active_control_used_callback: Callable[[], bool] | None = None,
         selected_map_load_name: Optional[str] = None,
     ) -> None:
         self._world_map = world_map
@@ -63,6 +65,8 @@ class RouteTestRunner:
         self._vehicle_blueprint_callback = vehicle_blueprint_callback
         self._active_filter_info_callback = active_filter_info_callback
         self._active_filter_tune_callback = active_filter_tune_callback
+        self._tracking_mode_callback = tracking_mode_callback or (lambda: "passive")
+        self._active_control_used_callback = active_control_used_callback or (lambda: False)
         self._selected_map_load_name = selected_map_load_name
 
         self._active = False
@@ -466,6 +470,8 @@ class RouteTestRunner:
             vehicle_blueprint=self._vehicle_blueprint_callback(),
             active_filter_info=active_filter_info,
             active_filter_tune=active_filter_tune,
+            tracking_mode=self._tracking_mode_callback(),
+            active_control_input_used=self._active_control_used_callback(),
             sensor_noise_config=sensor_config,
             vehicle_behavior_config=behavior_config,
             random_seed=self._config.random_seed if self._config is not None else None,
@@ -635,6 +641,10 @@ class RouteTestRunner:
             "failed_route_count": max(0, len(self._route_summaries) - len(successful)),
             "max_route_attempts": self._max_route_attempts,
             "selected_filter": self._config.selected_filter if self._config is not None else None,
+            "selected_filter_tune": config.get("selected_filter_tune"),
+            "active_filter_tune": self._active_filter_tune_callback(),
+            "tracking_mode": config.get("tracking_mode"),
+            "active_control_input_used_by_filter": self._active_control_used_callback(),
             "sensor_noise_config": config.get("sensor_noise_config"),
             "vehicle_behavior_config": config.get("vehicle_behavior_config"),
             "random_seed": config.get("random_seed"),
@@ -787,6 +797,10 @@ class RouteTestRunner:
                 "map_name": active_map_name,
                 "route_map_name": route.map_name,
                 "selected_filter": config.selected_filter if config is not None else None,
+                "selected_filter_tune": config.selected_filter_tune if config is not None else None,
+                "active_filter_tune": self._active_filter_tune_callback(),
+                "tracking_mode": config.tracking_mode if config is not None else self._tracking_mode_callback(),
+                "active_control_input_used_by_filter": self._active_control_used_callback(),
                 "sensor_noise_config": config.sensor_noise_config.to_dict() if config is not None else None,
                 "vehicle_behavior_config": config.vehicle_behavior_config if config is not None else None,
                 "random_seed": config.random_seed if config is not None else None,

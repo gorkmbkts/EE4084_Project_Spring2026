@@ -37,6 +37,7 @@ def _load_plugin(path: Path) -> FilterPluginRecord:
             valid=False,
             filter_info={"id": module_name, "name": "Filter Template"},
             tune={},
+            tune_specs=(),
             filter_class=None,
             error="Template file; copy and rename it to create a filter plugin.",
             template=True,
@@ -54,6 +55,7 @@ def _load_plugin(path: Path) -> FilterPluginRecord:
 def _validate_module(path: Path, module_name: str, module: ModuleType) -> FilterPluginRecord:
     filter_info = getattr(module, "FILTER_INFO", None)
     tune = getattr(module, "TUNE", None)
+    tune_specs = getattr(module, "TUNE_SPECS", ())
     filter_class = getattr(module, "Filter", None)
 
     if not isinstance(filter_info, dict):
@@ -75,8 +77,23 @@ def _validate_module(path: Path, module_name: str, module: ModuleType) -> Filter
         valid=True,
         filter_info=normalized_info,
         tune=dict(tune),
+        tune_specs=_normalize_tune_specs(tune_specs),
         filter_class=filter_class,
     )
+
+
+def _normalize_tune_specs(value: object) -> tuple[Any, ...]:
+    """Return optional tune specs without making them mandatory plugin metadata."""
+    if value is None:
+        return ()
+    if not isinstance(value, (tuple, list)):
+        return ()
+
+    specs = []
+    for spec in value:
+        if hasattr(spec, "key") and hasattr(spec, "clamp"):
+            specs.append(spec)
+    return tuple(specs)
 
 
 def _invalid_record(
@@ -95,6 +112,7 @@ def _invalid_record(
         valid=False,
         filter_info={"id": module_name, "name": module_name},
         tune={},
+        tune_specs=(),
         filter_class=None,
         error=message,
     )

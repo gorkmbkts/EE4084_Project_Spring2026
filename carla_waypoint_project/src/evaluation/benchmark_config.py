@@ -14,6 +14,13 @@ from config.settings import GNSS, IMU
 from src.evaluation.test_route_store import SavedTestRoute, TestRouteStore
 from src.utils.map_names import maps_compatible, normalize_map_name
 
+_VALID_TRACKING_MODES = ("passive", "active")
+
+
+def _normalize_tracking_mode(value: object) -> str:
+    text = str(value or "passive").strip().lower()
+    return text if text in _VALID_TRACKING_MODES else "passive"
+
 
 @dataclass(frozen=True)
 class ParameterSpec:
@@ -271,6 +278,8 @@ class BenchmarkConfig:
     selected_routes: tuple[SavedTestRoute, ...]
     sensor_noise_config: SensorNoiseConfig
     vehicle_behavior_config: dict[str, object]
+    selected_filter_tune: dict[str, object] | None = None
+    tracking_mode: str = "passive"
     sensor_noise_preset: str = "Medium Noise"
     vehicle_behavior_preset: str = "Balanced"
     random_seed: int = 4084
@@ -286,6 +295,9 @@ class BenchmarkConfig:
             self.created_at = datetime.now().isoformat(timespec="seconds")
         if self.metadata is None:
             self.metadata = {}
+        if self.selected_filter_tune is None:
+            self.selected_filter_tune = {}
+        self.tracking_mode = _normalize_tracking_mode(self.tracking_mode)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -293,6 +305,8 @@ class BenchmarkConfig:
             "selected_routes": [route.to_dict() for route in self.selected_routes],
             "sensor_noise_config": self.sensor_noise_config.to_dict(),
             "vehicle_behavior_config": dict(self.vehicle_behavior_config),
+            "selected_filter_tune": dict(self.selected_filter_tune or {}),
+            "tracking_mode": self.tracking_mode,
             "sensor_noise_preset": self.sensor_noise_preset,
             "vehicle_behavior_preset": self.vehicle_behavior_preset,
             "random_seed": self.random_seed,
@@ -361,6 +375,8 @@ def validate_benchmark_config(
         errors.append(f"Unsupported filter: {config.selected_filter}.")
     if not config.selected_routes:
         errors.append("Select at least one saved test route.")
+    if _normalize_tracking_mode(config.tracking_mode) != config.tracking_mode:
+        errors.append(f"Unsupported tracking mode: {config.tracking_mode}.")
 
     available = [name for name in available_maps if name]
     for route in config.selected_routes:

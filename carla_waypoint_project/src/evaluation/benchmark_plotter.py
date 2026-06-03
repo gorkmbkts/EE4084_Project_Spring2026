@@ -454,6 +454,20 @@ def _summary_text(
         excluded_plot_samples = trajectory_info.get("excluded_filtered_plot_sample_count")
     tune = active_filter.get("tune") if isinstance(active_filter.get("tune"), dict) else {}
     tune_lines = [f"{key}: {_fmt(value)}" for key, value in list(tune.items())[:6]]
+    tracking_mode = _tracking_mode_label(metadata, active_filter, summary)
+    active_control_used = _first(
+        summary,
+        "active_control_input_used_by_filter",
+        "active_control_input_used",
+    )
+    if active_control_used is None:
+        active_control_used = _first(
+            metadata,
+            "active_control_input_used_by_filter",
+            "active_control_input_used",
+        )
+    if active_control_used is None:
+        active_control_used = active_filter.get("active_control_input_used")
 
     lines = [
         "KalmanLab Benchmark Summary",
@@ -461,8 +475,10 @@ def _summary_text(
         f"Map: {general.get('map_name')}",
         f"Benchmark: {general.get('benchmark_id')}",
         "",
-        "Active Filter",
+        "Selected Filter",
         f"Name: {active_filter.get('name')}",
+        f"Tracking mode: {tracking_mode}",
+        f"Active control input used: {_fmt_bool(active_control_used)}",
         f"Type: {active_filter.get('type')}",
         f"State: {active_filter.get('state_vector')}",
         f"Process: {active_filter.get('process_model')}",
@@ -499,7 +515,7 @@ def _summary_text(
         "Raw GNSS is evaluated as a",
         "localization baseline only.",
         "Vehicle control uses the",
-        "active filter estimate.",
+        "selected filter estimate.",
     ]
     if no_valid_filtered:
         lines.extend(["", "Warning:", "No valid filtered trajectory", "samples after filtering."])
@@ -831,9 +847,32 @@ def _first(data: dict[str, object], *keys: str) -> object:
     return None
 
 
+def _tracking_mode_label(
+    metadata: dict[str, object],
+    active_filter: dict[str, object],
+    summary: Optional[dict[str, object]] = None,
+) -> str:
+    general = metadata.get("general") if isinstance(metadata.get("general"), dict) else {}
+    kalman_filter = metadata.get("kalman_filter") if isinstance(metadata.get("kalman_filter"), dict) else {}
+    summary = summary if isinstance(summary, dict) else {}
+    value = (
+        summary.get("tracking_mode")
+        or metadata.get("tracking_mode")
+        or active_filter.get("tracking_mode")
+        or general.get("tracking_mode")
+        or kalman_filter.get("tracking_mode")
+    )
+    text = str(value or "passive").strip().lower()
+    if text == "active":
+        return "Active"
+    if text == "passive":
+        return "Passive"
+    return str(value)
+
+
 def _active_filter_name(metadata: dict[str, object]) -> str:
     info = _active_filter_info(metadata)
-    return str(info.get("name") or info.get("id") or "Active filter")
+    return str(info.get("name") or info.get("id") or "Selected filter")
 
 
 def _active_filter_info(metadata: dict[str, object]) -> dict[str, object]:
@@ -842,6 +881,7 @@ def _active_filter_info(metadata: dict[str, object]) -> dict[str, object]:
         return active_filter
 
     legacy = metadata.get("kalman_filter")
+    active_control_used = _first(metadata, "active_control_input_used_by_filter", "active_control_input_used")
     if isinstance(legacy, dict):
         return {
             "id": metadata.get("active_filter_id", "legacy_filter"),
@@ -850,6 +890,10 @@ def _active_filter_info(metadata: dict[str, object]) -> dict[str, object]:
             "state_vector": metadata.get("active_filter_state_vector") or legacy.get("state_vector"),
             "process_model": metadata.get("active_filter_process_model") or legacy.get("process_model"),
             "measurement_model": metadata.get("active_filter_measurement_model") or legacy.get("measurement_models"),
+            "tracking_mode": metadata.get("tracking_mode") or legacy.get("tracking_mode"),
+            "active_control_input_used": active_control_used
+            if active_control_used is not None
+            else legacy.get("active_control_input_used"),
             "tune": legacy.get("tune", {}),
         }
 
@@ -860,6 +904,8 @@ def _active_filter_info(metadata: dict[str, object]) -> dict[str, object]:
         "state_vector": metadata.get("active_filter_state_vector", "n/a"),
         "process_model": metadata.get("active_filter_process_model", "n/a"),
         "measurement_model": metadata.get("active_filter_measurement_model", "n/a"),
+        "tracking_mode": metadata.get("tracking_mode"),
+        "active_control_input_used": active_control_used,
         "tune": metadata.get("active_filter_tune", {}),
     }
 
@@ -1046,6 +1092,19 @@ def _fmt(value: object) -> str:
     if abs(value_f) >= 1000.0 or (0.0 < abs(value_f) < 0.001):
         return f"{value_f:.2e}"
     return f"{value_f:.3f}"
+
+
+def _fmt_bool(value: object) -> str:
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if value is None:
+        return "n/a"
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes"):
+        return "Yes"
+    if text in ("false", "0", "no"):
+        return "No"
+    return str(value)
 
 
 def _legend_if_labels(ax, fontsize: Optional[int] = None) -> None:

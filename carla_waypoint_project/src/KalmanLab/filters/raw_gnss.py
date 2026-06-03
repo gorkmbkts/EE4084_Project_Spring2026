@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from typing import Optional, TYPE_CHECKING
 
+from src.KalmanLab.filter_base import normalize_tracking_mode
+from src.evaluation.benchmark_config import ParameterSpec
 from src.localization.gnss_projection import GnssLocalProjector, LocalGnssMeasurement
 from src.localization.state_estimator import EgoState
 
@@ -31,11 +33,26 @@ TUNE = {
 }
 
 
+TUNE_SPECS = (
+    ParameterSpec("yaw_from_velocity_min_speed_mps", "Yaw min speed", 0.05, 3.0, "m/s", 2, "Raw GNSS"),
+    ParameterSpec("max_speed_step_mps", "Max speed step", 5.0, 160.0, "m/s", 1, "Raw GNSS"),
+)
+
+
 class Filter:
     """Use raw projected GNSS as an EgoState-producing baseline filter."""
 
-    def __init__(self, gnss_projector: GnssLocalProjector) -> None:
+    def __init__(
+        self,
+        gnss_projector: GnssLocalProjector,
+        tune: Optional[dict[str, object]] = None,
+        tracking_mode: str = "passive",
+    ) -> None:
         self._gnss_projector = gnss_projector
+        self._tune = dict(TUNE)
+        if tune:
+            self._tune.update(dict(tune))
+        self._tracking_mode = normalize_tracking_mode(tracking_mode)
         self._latest_state: Optional[EgoState] = None
         self._latest_gnss_local: Optional[LocalGnssMeasurement] = None
         self._previous_gnss_local: Optional[LocalGnssMeasurement] = None
@@ -67,7 +84,7 @@ class Filter:
         yaw_deg = self._yaw_deg_from_compass(imu.compass)
         if yaw_deg is not None:
             self._latest_imu_yaw_deg = yaw_deg
-            if self._speed_mps < float(TUNE["yaw_from_velocity_min_speed_mps"]):
+            if self._speed_mps < float(self._tune["yaw_from_velocity_min_speed_mps"]):
                 self._last_valid_yaw_deg = yaw_deg
         self._last_imu_frame = int(imu.frame)
         return self._latest_state
@@ -100,6 +117,8 @@ class Filter:
             "filter_id": FILTER_INFO["id"],
             "initialized": self.initialized,
             "safe_for_autonomous_control": False,
+            "tracking_mode": self._tracking_mode,
+            "active_tracking_supported": False,
             "warning": "Raw GNSS is noisy and may be unsafe for closed-loop control.",
             "latest_speed_mps": self._speed_mps,
             "latest_yaw_deg": self._last_valid_yaw_deg,
@@ -119,8 +138,8 @@ class Filter:
 
         dx = float(local.x) - float(self._latest_gnss_local.x)
         dy = float(local.y) - float(self._latest_gnss_local.y)
-        speed = min(math.hypot(dx, dy) / dt, float(TUNE["max_speed_step_mps"]))
-        if speed >= float(TUNE["yaw_from_velocity_min_speed_mps"]):
+        speed = min(math.hypot(dx, dy) / dt, float(self._tune["max_speed_step_mps"]))
+        if speed >= float(self._tune["yaw_from_velocity_min_speed_mps"]):
             self._last_valid_yaw_deg = self._normalize_angle_deg(math.degrees(math.atan2(dy, dx)))
         elif self._latest_imu_yaw_deg is not None:
             self._last_valid_yaw_deg = self._latest_imu_yaw_deg

@@ -24,6 +24,31 @@ REQUIRED_FILTER_INFO_FIELDS = (
     "description",
 )
 
+TRACKING_MODE_PASSIVE = "passive"
+TRACKING_MODE_ACTIVE = "active"
+VALID_TRACKING_MODES = (TRACKING_MODE_PASSIVE, TRACKING_MODE_ACTIVE)
+
+
+def normalize_tracking_mode(value: object) -> str:
+    """Return a supported tracking mode, defaulting safely to passive."""
+    text = str(value or TRACKING_MODE_PASSIVE).strip().lower()
+    return text if text in VALID_TRACKING_MODES else TRACKING_MODE_PASSIVE
+
+
+@dataclass(frozen=True)
+class FilterControlInput:
+    """Applied vehicle command made available to active-tracking filters."""
+
+    timestamp: float
+    throttle: float
+    steer: float
+    brake: float
+    hand_brake: bool
+    reverse: bool
+    source: str
+    speed_mps: Optional[float] = None
+    yaw_deg: Optional[float] = None
+
 
 @dataclass(frozen=True)
 class FilterPluginRecord:
@@ -34,6 +59,7 @@ class FilterPluginRecord:
     valid: bool
     filter_info: dict[str, Any]
     tune: dict[str, Any]
+    tune_specs: tuple[Any, ...]
     filter_class: Optional[type]
     error: Optional[str] = None
     template: bool = False
@@ -69,6 +95,9 @@ class LocalizationFilter(Protocol):
         ...
 
     def process_gnss(self, gnss: "GnssMeasurement") -> Optional[EgoState]:
+        ...
+
+    def process_control(self, control_input: FilterControlInput) -> bool:
         ...
 
     def get_state(self) -> Optional[EgoState]:

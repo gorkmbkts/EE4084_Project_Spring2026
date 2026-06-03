@@ -34,6 +34,8 @@ def build_benchmark_metadata(
     vehicle_blueprint: Optional[str] = None,
     active_filter_info: Optional[dict[str, object]] = None,
     active_filter_tune: Optional[dict[str, object]] = None,
+    tracking_mode: str = "passive",
+    active_control_input_used: bool = False,
     sensor_noise_config: Optional[dict[str, object]] = None,
     vehicle_behavior_config: Optional[dict[str, object]] = None,
     random_seed: Optional[int] = None,
@@ -84,6 +86,9 @@ def build_benchmark_metadata(
         "random_seed": random_seed,
         "route_index": route_index,
         "route_count": route_count,
+        "selected_filter": active_filter_id,
+        "tracking_mode": tracking_mode,
+        "active_control_input_used_by_filter": bool(active_control_input_used),
         "active_filter_id": active_filter_id,
         "active_filter_name": active_filter_name,
         "active_filter_type": active_filter_type,
@@ -102,6 +107,9 @@ def build_benchmark_metadata(
             "measurement_model": active_filter_measurement_model,
             "description": active_filter_description,
             "safe_for_autonomous_control": bool(filter_info.get("safe_for_autonomous_control", True)),
+            "tracking_mode": tracking_mode,
+            "active_control_input_used": bool(active_control_input_used),
+            "recommendation_applied": bool(filter_info.get("recommendation_applied", False)),
             "tune": filter_tune,
         },
         "general": {
@@ -126,6 +134,8 @@ def build_benchmark_metadata(
             "pygame_fps": DISPLAY.fps,
             "weather": weather,
             "vehicle_blueprint": vehicle_blueprint,
+            "tracking_mode": tracking_mode,
+            "active_control_input_used_by_filter": bool(active_control_input_used),
             "benchmark_settings": {
                 "max_pass_duration_s": BENCHMARK.max_pass_duration_s,
                 "generate_plots_on_completion": BENCHMARK.generate_plots_on_completion,
@@ -143,6 +153,8 @@ def build_benchmark_metadata(
             "state_vector": active_filter_state_vector,
             "process_model": active_filter_process_model,
             "measurement_models": [active_filter_measurement_model],
+            "tracking_mode": tracking_mode,
+            "active_control_input_used": bool(active_control_input_used),
             "tune": filter_tune,
         },
         "sensor_configuration": {
@@ -174,8 +186,8 @@ def build_benchmark_metadata(
         "notes": {
             "raw_gnss_baseline": raw_gnss_note,
             "single_run_benchmark": (
-                "Vehicle control uses the active KalmanLab filter estimate. "
-                "Ground truth, active filter estimate, raw GNSS, and route tracking are logged in one run."
+                "Vehicle control uses the selected KalmanLab filter estimate. "
+                "Ground truth, selected filter estimate, raw GNSS, and route tracking are logged in one run."
             ),
         },
     }

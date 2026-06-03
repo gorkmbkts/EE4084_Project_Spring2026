@@ -25,6 +25,9 @@ from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 
+from src.KalmanLab.control_model import estimate_command_motion
+from src.KalmanLab.filter_base import FilterControlInput, TRACKING_MODE_ACTIVE, normalize_tracking_mode
+from src.evaluation.benchmark_config import ParameterSpec
 from src.localization.gnss_projection import GnssLocalProjector, LocalGnssMeasurement
 from src.localization.state_estimator import EgoState
 
@@ -42,13 +45,14 @@ FILTER_INFO = {
     "measurement_model": "GNSS position x/y",
     "description": "Linear constant-velocity Kalman filter using noisy GNSS position and optional IMU-assisted prediction.",
     "safe_for_autonomous_control": True,
+    "active_tracking_supported": True,
 }
 
 
 TUNE = {
     # White acceleration process noise used by the CV process model.
     # Higher value: filter trusts the motion model less and adapts faster.
-    "process_accel_stddev_mps2": 1.8,
+    "process_accel_stddev_mps2": 5.0,
 
     # GNSS position measurement noise in local CARLA meters.
     "gnss_position_stddev_m": 1.25,
@@ -67,7 +71,35 @@ TUNE = {
     # If True, IMU acceleration is used as a control input during prediction.
     # If False, this becomes a pure GNSS-only CV Kalman filter.
     "use_imu_acceleration_control": False,
+
+    # Active-tracking command model.
+    "imu_accel_control_stddev_mps2": 0.65,
+    "command_accel_stddev_mps2": 1.40,
+    "command_throttle_accel_gain_mps2": 3.0,
+    "command_brake_decel_gain_mps2": 6.0,
+    "command_max_accel_mps2": 8.0,
+    "command_yaw_rate_stddev_dps": 18.0,
+    "command_max_yaw_rate_dps": 90.0,
 }
+
+
+TUNE_SPECS = (
+    ParameterSpec("process_accel_stddev_mps2", "Process accel", 0.05, 12.0, "m/s2", 2, "Noise"),
+    ParameterSpec("gnss_position_stddev_m", "GNSS position", 0.10, 12.0, "m", 2, "Noise"),
+    ParameterSpec("initial_position_stddev_m", "Initial pos", 0.25, 25.0, "m", 2, "Initialization"),
+    ParameterSpec("initial_velocity_stddev_mps", "Initial speed", 0.10, 15.0, "m/s", 2, "Initialization"),
+    ParameterSpec("yaw_from_velocity_min_speed_mps", "Yaw min speed", 0.05, 3.0, "m/s", 2, "Yaw"),
+    ParameterSpec("min_prediction_dt_s", "Min dt", 0.00001, 0.02, "s", 5, "Prediction"),
+    ParameterSpec("max_prediction_dt_s", "Max dt", 0.02, 0.60, "s", 2, "Prediction"),
+    ParameterSpec("use_imu_acceleration_control", "Use IMU accel", 0.0, 1.0, "", 0, "Prediction"),
+    ParameterSpec("imu_accel_control_stddev_mps2", "IMU accel trust", 0.05, 5.0, "m/s2", 2, "Active tracking"),
+    ParameterSpec("command_accel_stddev_mps2", "Command trust", 0.10, 6.0, "m/s2", 2, "Active tracking"),
+    ParameterSpec("command_throttle_accel_gain_mps2", "Throttle accel", 0.2, 8.0, "m/s2", 2, "Active tracking"),
+    ParameterSpec("command_brake_decel_gain_mps2", "Brake decel", 0.5, 12.0, "m/s2", 2, "Active tracking"),
+    ParameterSpec("command_max_accel_mps2", "Cmd accel cap", 0.5, 15.0, "m/s2", 2, "Active tracking"),
+    ParameterSpec("command_yaw_rate_stddev_dps", "Yaw-rate trust", 1.0, 90.0, "deg/s", 1, "Active tracking"),
+    ParameterSpec("command_max_yaw_rate_dps", "Yaw-rate cap", 10.0, 180.0, "deg/s", 1, "Active tracking"),
+)
 
 
 @dataclass(frozen=True)
@@ -290,20 +322,36 @@ class _CVFilterCore:
 class Filter:
     """Self-contained CV-KF plugin with GNSS update and IMU-assisted prediction."""
 
-    def __init__(self, gnss_projector: GnssLocalProjector) -> None:
+    def __init__(
+        self,
+        gnss_projector: GnssLocalProjector,
+        tune: Optional[dict[str, object]] = None,
+        tracking_mode: str = "passive",
+    ) -> None:
         self._gnss_projector = gnss_projector
-        self._filter = _CVFilterCore(TUNE)
+        self._tune = dict(TUNE)
+        if tune:
+            self._tune.update(dict(tune))
+        self._tracking_mode = normalize_tracking_mode(tracking_mode)
+        self._filter = _CVFilterCore(self._tune)
 
-        self._yaw_speed_threshold = float(TUNE["yaw_from_velocity_min_speed_mps"])
-        self._min_prediction_dt_s = float(TUNE["min_prediction_dt_s"])
-        self._max_prediction_dt_s = float(TUNE["max_prediction_dt_s"])
-        self._use_imu_acceleration_control = bool(TUNE["use_imu_acceleration_control"])
+        self._yaw_speed_threshold = float(self._tune["yaw_from_velocity_min_speed_mps"])
+        self._min_prediction_dt_s = float(self._tune["min_prediction_dt_s"])
+        self._max_prediction_dt_s = float(self._tune["max_prediction_dt_s"])
+        self._use_imu_acceleration_control = bool(self._tune["use_imu_acceleration_control"])
+        self._imu_accel_control_stddev = float(self._tune["imu_accel_control_stddev_mps2"])
+        self._command_accel_stddev = float(self._tune["command_accel_stddev_mps2"])
 
         self._latest_state: Optional[EgoState] = None
         self._latest_gnss_local: Optional[LocalGnssMeasurement] = None
 
         self._latest_acceleration_xy: tuple[float, float] = (0.0, 0.0)
         self._latest_imu_yaw_deg: Optional[float] = None
+        self._latest_control_input: Optional[FilterControlInput] = None
+        self._latest_command_acceleration_xy: Optional[tuple[float, float]] = None
+        self._latest_command_yaw_rate_dps: Optional[float] = None
+        self._latest_command_longitudinal_accel_mps2: Optional[float] = None
+        self._active_command_used_latest_prediction = False
         self._last_valid_yaw_deg = 0.0
 
         self._last_imu_frame: Optional[int] = None
@@ -325,10 +373,19 @@ class Filter:
 
         self._latest_acceleration_xy = (0.0, 0.0)
         self._latest_imu_yaw_deg = None
+        self._latest_control_input = None
+        self._latest_command_acceleration_xy = None
+        self._latest_command_yaw_rate_dps = None
+        self._latest_command_longitudinal_accel_mps2 = None
+        self._active_command_used_latest_prediction = False
         self._last_valid_yaw_deg = 0.0
 
         self._last_imu_frame = None
         self._last_gnss_frame = None
+
+    def process_control(self, control_input: FilterControlInput) -> bool:
+        self._latest_control_input = control_input
+        return self._tracking_mode == TRACKING_MODE_ACTIVE
 
     def process_imu(self, imu: "ImuMeasurement") -> Optional[EgoState]:
         yaw_deg = self._yaw_deg_from_compass(imu.compass)
@@ -380,6 +437,12 @@ class Filter:
             "nis": self._filter.last_nis,
             "latest_acceleration_xy": self._latest_acceleration_xy,
             "latest_imu_yaw_deg": self._latest_imu_yaw_deg,
+            "tracking_mode": self._tracking_mode,
+            "latest_control_input": self._control_input_dict(self._latest_control_input),
+            "active_command_used_latest_prediction": self._active_command_used_latest_prediction,
+            "latest_command_acceleration_xy": self._latest_command_acceleration_xy,
+            "latest_command_yaw_rate_dps": self._latest_command_yaw_rate_dps,
+            "latest_command_longitudinal_accel_mps2": self._latest_command_longitudinal_accel_mps2,
             "last_gnss_frame": self._last_gnss_frame,
             "last_imu_frame": self._last_imu_frame,
             "timestamp": snapshot.timestamp if snapshot is not None else None,
@@ -394,12 +457,49 @@ class Filter:
         if dt <= self._min_prediction_dt_s:
             return
 
-        acceleration_xy = self._latest_acceleration_xy if self._use_imu_acceleration_control else (0.0, 0.0)
+        clipped_dt = min(dt, self._max_prediction_dt_s)
+        acceleration_xy = self._prediction_acceleration_xy(clipped_dt)
 
         self._filter.predict(
-            dt=min(dt, self._max_prediction_dt_s),
+            dt=clipped_dt,
             timestamp=timestamp,
             acceleration_xy=acceleration_xy,
+        )
+
+    def _prediction_acceleration_xy(self, dt: float) -> tuple[float, float]:
+        self._active_command_used_latest_prediction = False
+        imu_accel = self._latest_acceleration_xy if self._use_imu_acceleration_control else (0.0, 0.0)
+        if self._tracking_mode != TRACKING_MODE_ACTIVE or self._latest_control_input is None:
+            return imu_accel
+
+        snapshot = self._filter.snapshot()
+        if snapshot is None:
+            return imu_accel
+
+        speed = math.hypot(snapshot.vx, snapshot.vy)
+        yaw_deg = self._yaw_for_command(snapshot.vx, snapshot.vy, speed)
+        command = estimate_command_motion(
+            control_input=self._latest_control_input,
+            speed_mps=speed,
+            yaw_deg=yaw_deg,
+            tune=self._tune,
+            dt_s=dt,
+        )
+        self._latest_command_acceleration_xy = command.acceleration_xy
+        self._latest_command_yaw_rate_dps = command.yaw_rate_dps
+        self._latest_command_longitudinal_accel_mps2 = command.longitudinal_accel_mps2
+        self._active_command_used_latest_prediction = True
+
+        if not self._use_imu_acceleration_control:
+            return command.acceleration_xy
+
+        imu_var = max(1.0e-6, self._imu_accel_control_stddev**2)
+        command_var = max(1.0e-6, self._command_accel_stddev**2)
+        command_weight = imu_var / (imu_var + command_var)
+        imu_weight = 1.0 - command_weight
+        return (
+            imu_weight * imu_accel[0] + command_weight * command.acceleration_xy[0],
+            imu_weight * imu_accel[1] + command_weight * command.acceleration_xy[1],
         )
 
     def _refresh_state_from_filter(self) -> Optional[EgoState]:
@@ -434,6 +534,13 @@ class Filter:
 
         return self._last_valid_yaw_deg
 
+    def _yaw_for_command(self, vx: float, vy: float, speed: float) -> float:
+        if speed >= self._yaw_speed_threshold:
+            return self._normalize_angle_deg(math.degrees(math.atan2(vy, vx)))
+        if self._latest_imu_yaw_deg is not None:
+            return self._latest_imu_yaw_deg
+        return self._last_valid_yaw_deg
+
     def _imu_acceleration_to_world_xy(
         self,
         imu: "ImuMeasurement",
@@ -466,3 +573,19 @@ class Filter:
         while angle_deg < -180.0:
             angle_deg += 360.0
         return float(angle_deg)
+
+    @staticmethod
+    def _control_input_dict(control_input: Optional[FilterControlInput]) -> Optional[dict[str, object]]:
+        if control_input is None:
+            return None
+        return {
+            "timestamp": control_input.timestamp,
+            "throttle": control_input.throttle,
+            "steer": control_input.steer,
+            "brake": control_input.brake,
+            "hand_brake": control_input.hand_brake,
+            "reverse": control_input.reverse,
+            "source": control_input.source,
+            "speed_mps": control_input.speed_mps,
+            "yaw_deg": control_input.yaw_deg,
+        }
