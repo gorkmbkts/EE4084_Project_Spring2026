@@ -477,6 +477,9 @@ def _summary_text(
         )
     if active_control_used is None:
         active_control_used = active_filter.get("active_control_input_used")
+    driving_mean_nis = _primary(summary, "driving_mean_nis", "mean_nis")
+    driving_mean_nees = _primary(summary, "driving_mean_nees", "mean_nees")
+    consistency_warning = _consistency_warning(driving_mean_nis, driving_mean_nees)
 
     lines = [
         "KalmanLab Benchmark Summary",
@@ -514,6 +517,12 @@ def _summary_text(
         f"Mean CTE: {_fmt(_primary(summary, 'driving_mean_cross_track_error_m', 'mean_cross_track_error_m'))} m",
         f"Max CTE: {_fmt(_primary(summary, 'driving_max_cross_track_error_m', 'max_cross_track_error_m'))} m",
         "",
+        "Consistency (Driving Phase)",
+        f"Driving Mean NIS: {_fmt(driving_mean_nis)}",
+        f"Driving Mean NEES: {_fmt(driving_mean_nees)}",
+        f"Overall Mean NIS: {_fmt(summary.get('mean_nis'))}",
+        f"Overall Mean NEES: {_fmt(summary.get('mean_nees'))}",
+        "",
         "Completion",
         f"Success: {summary.get('route_completion_success')}",
         f"Aborted: {summary.get('route_aborted')}",
@@ -528,6 +537,11 @@ def _summary_text(
     ]
     if no_valid_filtered:
         lines.extend(["", "Warning:", "No valid filtered trajectory", "samples after filtering."])
+    if consistency_warning:
+        lines.extend(["", "Warning:", "High NIS/NEES suggests", "covariance/noise tuning", "inconsistency."])
+    diagnostic_notes = summary.get("diagnostic_notes")
+    if isinstance(diagnostic_notes, list) and diagnostic_notes:
+        lines.extend(["", "Diagnostic note:", str(diagnostic_notes[0])[:38]])
     return "\n".join(lines)
 
 
@@ -1200,6 +1214,12 @@ def _fmt_bool(value: object) -> str:
     if text in ("false", "0", "no"):
         return "No"
     return str(value)
+
+
+def _consistency_warning(mean_nis: object, mean_nees: object) -> bool:
+    nis = _to_float(mean_nis)
+    nees = _to_float(mean_nees)
+    return (nis is not None and nis > 10.0) or (nees is not None and nees > 10.0)
 
 
 def _legend_if_labels(ax, fontsize: Optional[int] = None) -> None:

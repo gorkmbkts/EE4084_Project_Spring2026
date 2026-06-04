@@ -2,52 +2,7 @@
   "map_name": "Carla/Maps/Town01_Opt",
   "routes": [
     {
-      "name": "test_route_001",
-      "start": {
-        "x": 361.086669921875,
-        "y": 2.007514476776123,
-        "z": 0.0
-      },
-      "goal": {
-        "x": 392.362548828125,
-        "y": 24.394691467285156,
-        "z": 0.0
-      },
-      "created_from": "2d_map",
-      "map_name": "Carla/Maps/Town01_Opt"
-    },
-    {
-      "name": "test_route_002",
-      "start": {
-        "x": 272.5655822753906,
-        "y": 129.49136352539062,
-        "z": 0.0
-      },
-      "goal": {
-        "x": 334.8396301269531,
-        "y": 99.80290222167969,
-        "z": 0.0
-      },
-      "created_from": "2d_map",
-      "map_name": "Carla/Maps/Town01_Opt"
-    },
-    {
-      "name": "test_route_003",
-      "start": {
-        "x": -44.30120086669922,
-        "y": -57.01285171508789,
-        "z": 0.055450439453125
-      },
-      "goal": {
-        "x": 13.065485000610352,
-        "y": -94.8741226196289,
-        "z": 0.0
-      },
-      "created_from": "2d_map",
-      "map_name": "Carla/Maps/Town05_Opt"
-    },
-    {
-      "name": "test_route_004",
+      "name": "mahalle_arasi",
       "start": {
         "x": 200.0160675048828,
         "y": -312.7500305175781,
@@ -60,6 +15,81 @@
       },
       "created_from": "2d_map",
       "map_name": "Carla/Maps/Town04_Opt"
+    },
+    {
+      "name": "sadece_viraj",
+      "start": {
+        "x": 396.3664855957031,
+        "y": 21.119693756103516,
+        "z": 0.0
+      },
+      "goal": {
+        "x": 377.4791564941406,
+        "y": -1.9837778806686401,
+        "z": 0.0
+      },
+      "created_from": "2d_map",
+      "map_name": "Carla/Maps/Town01_Opt"
+    },
+    {
+      "name": "U_seklinde_viraj",
+      "start": {
+        "x": -7.396338939666748,
+        "y": 278.1156921386719,
+        "z": 0.0
+      },
+      "goal": {
+        "x": 45.85696029663086,
+        "y": 269.6273193359375,
+        "z": 0.0
+      },
+      "created_from": "2d_map",
+      "map_name": "Carla/Maps/Town02_Opt"
+    },
+    {
+      "name": "buyuk_capli_viraj",
+      "start": {
+        "x": 70.88964080810547,
+        "y": -145.31532287597656,
+        "z": 0.038604736328125
+      },
+      "goal": {
+        "x": 69.45487976074219,
+        "y": 142.3334197998047,
+        "z": 0.038604736328125
+      },
+      "created_from": "2d_map",
+      "map_name": "Carla/Maps/Town05_Opt"
+    },
+    {
+      "name": "doner_ada_viraj",
+      "start": {
+        "x": 154.4805908203125,
+        "y": 58.929588317871094,
+        "z": 0.0
+      },
+      "goal": {
+        "x": 154.49400329589844,
+        "y": 62.42955780029297,
+        "z": 0.0
+      },
+      "created_from": "2d_map",
+      "map_name": "Carla/Maps/Town03_Opt"
+    },
+    {
+      "name": "her_seyden_biraz",
+      "start": {
+        "x": 111.42407989501953,
+        "y": 133.00291442871094,
+        "z": 0.25039657950401306
+      },
+      "goal": {
+        "x": 193.34071350097656,
+        "y": 58.829612731933594,
+        "z": 0.0
+      },
+      "created_from": "2d_map",
+      "map_name": "Carla/Maps/Town03_Opt"
     }
   ]
 }

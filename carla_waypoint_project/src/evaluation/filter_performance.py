@@ -221,8 +221,14 @@ class FilterPerformanceLogger:
     def running_rmse_m(self) -> Optional[float]:
         return self._rmse(self._finite_values(sample.filtered_position_error_m for sample in self._samples))
 
-    def running_metrics(self) -> dict[str, Optional[float]]:
-        return self._metrics_for_samples(self._samples)
+    def running_metrics(self, phases: Optional[tuple[str, ...]] = None) -> dict[str, Optional[float]]:
+        return self._metrics_for_samples(self._samples_for_phases(phases))
+
+    def running_driving_metrics(self) -> dict[str, Optional[float]]:
+        return self.running_metrics(phases=("driving", "completed"))
+
+    def running_sample_count(self, phases: Optional[tuple[str, ...]] = None) -> int:
+        return len(self._samples_for_phases(phases))
 
     def build_summary(self) -> dict[str, object]:
         overall_metrics = self._metrics_for_samples(self._samples)
@@ -623,6 +629,11 @@ class FilterPerformanceLogger:
     @staticmethod
     def _unique_count(values: Iterable[Optional[int]]) -> int:
         return len({value for value in values if value is not None})
+
+    def _samples_for_phases(self, phases: Optional[tuple[str, ...]]) -> list[FilterPerformanceSample]:
+        if phases is None:
+            return list(self._samples)
+        return [sample for sample in self._samples if sample.phase in phases]
 
     @staticmethod
     def _percentile(values: list[float], percentile: float) -> Optional[float]:

@@ -2174,7 +2174,15 @@ class SimulationApp:
 
     def _live_evaluation_lines(self) -> list[str]:
         logger = self._active_performance_logger()
-        metrics = logger.running_metrics()
+        driving_sample_count = logger.running_sample_count(phases=("driving", "completed"))
+        if driving_sample_count > 0:
+            metrics = logger.running_driving_metrics()
+            metric_phase_label = f"driving phase ({driving_sample_count} samples)"
+            waiting_line = None
+        else:
+            metrics = logger.running_metrics()
+            metric_phase_label = "all-phase/stabilization"
+            waiting_line = "Waiting for driving phase..."
         diagnostics = self._filter_manager.get_diagnostics() if self._filter_manager is not None else {}
         ratio = self._ratio(logger.current_raw_gnss_error_m, logger.current_position_error_m)
         improvement = None
@@ -2183,12 +2191,13 @@ class SimulationApp:
         if raw_rmse is not None and raw_rmse > 0.0 and filtered_rmse is not None:
             improvement = 100.0 * (raw_rmse - filtered_rmse) / raw_rmse
         lines = [
+            f"Metric source: {metric_phase_label}",
             f"Current position error: {self._format_optional_metric(logger.current_position_error_m, 'm')}",
             f"Current speed error: {self._format_optional_metric(self._current_speed_error(), 'm/s')}",
             f"Current yaw error: {self._format_optional_metric(self._current_yaw_error(), 'deg')}",
-            f"Running position RMSE: {self._format_optional_metric(metrics.get('filtered_rmse_m'), 'm')}",
-            f"Running speed RMSE: {self._format_optional_metric(metrics.get('speed_rmse_mps'), 'm/s')}",
-            f"Running yaw RMSE: {self._format_optional_metric(metrics.get('yaw_rmse_deg'), 'deg')}",
+            f"Primary position RMSE: {self._format_optional_metric(metrics.get('filtered_rmse_m'), 'm')}",
+            f"Primary speed RMSE: {self._format_optional_metric(metrics.get('speed_rmse_mps'), 'm/s')}",
+            f"Primary yaw RMSE: {self._format_optional_metric(metrics.get('yaw_rmse_deg'), 'deg')}",
             f"Raw GNSS RMSE: {self._format_optional_metric(metrics.get('raw_gnss_rmse_m'), 'm')}",
             f"Filtered RMSE: {self._format_optional_metric(metrics.get('filtered_rmse_m'), 'm')}",
             f"Improvement: {self._format_optional_metric(improvement, '%')}",
@@ -2201,6 +2210,8 @@ class SimulationApp:
             f"IMU updates: {self._format_debug_value(diagnostics.get('last_imu_frame'))}",
             f"Instant improvement ratio: {self._format_optional_metric(ratio, 'x')}",
         ]
+        if waiting_line is not None:
+            lines.insert(1, waiting_line)
         return lines
 
     def _update_live_evaluation_history(self) -> None:
