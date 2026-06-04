@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol, TYPE_CHECKING
 
+from src.core.vehicle_state import VehicleState
 from src.localization.gnss_projection import LocalGnssMeasurement
-from src.localization.state_estimator import EgoState
 
 if TYPE_CHECKING:
     from src.sensors.gnss_sensor import GnssMeasurement
@@ -88,6 +88,11 @@ class FilterPluginRecord:
     def experimental(self) -> bool:
         return bool(self.filter_info.get("experimental", False))
 
+    @property
+    def provided_state_fields(self) -> tuple[str, ...]:
+        value = self.filter_info.get("provided_state_fields", ())
+        return tuple(str(item) for item in value) if isinstance(value, (tuple, list)) else ()
+
 
 class LocalizationFilter(Protocol):
     """Duck-typed plugin surface consumed by ``FilterManager``."""
@@ -103,16 +108,16 @@ class LocalizationFilter(Protocol):
     def reset(self) -> None:
         ...
 
-    def process_imu(self, imu: "ImuMeasurement") -> Optional[EgoState]:
+    def process_imu(self, imu: "ImuMeasurement") -> Optional[VehicleState]:
         ...
 
-    def process_gnss(self, gnss: "GnssMeasurement") -> Optional[EgoState]:
+    def process_gnss(self, gnss: "GnssMeasurement") -> Optional[VehicleState]:
         ...
 
     def process_control(self, control_input: FilterControlInput) -> bool:
         ...
 
-    def get_state(self) -> Optional[EgoState]:
+    def get_state(self) -> Optional[VehicleState]:
         ...
 
     def get_diagnostics(self) -> dict[str, Any]:

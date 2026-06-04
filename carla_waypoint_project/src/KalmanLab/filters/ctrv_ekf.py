@@ -10,9 +10,9 @@ import numpy as np
 
 from config.settings import AUTONOMOUS_CONTROL
 from src.KalmanLab.filter_base import FilterControlInput, TRACKING_MODE_ACTIVE, normalize_tracking_mode
+from src.core.vehicle_state import VehicleState
 from src.evaluation.benchmark_config import ParameterSpec
 from src.localization.gnss_projection import GnssLocalProjector, LocalGnssMeasurement
-from src.localization.state_estimator import EgoState
 
 if TYPE_CHECKING:
     from src.sensors.gnss_sensor import GnssMeasurement
@@ -28,7 +28,20 @@ FILTER_INFO = {
     "measurement_model": "GNSS position x/y + IMU compass yaw + IMU gyro z yaw-rate",
     "description": "Nonlinear CTRV EKF using projected GNSS and raw IMU heading/yaw-rate measurements.",
     "model_type": "CTRV",
-    "motion_info_fields": ("yaw_rate_radps", "curvature_1pm"),
+    "provided_state_fields": (
+        "x",
+        "y",
+        "z",
+        "yaw",
+        "speed",
+        "timestamp",
+        "vx_mps",
+        "vy_mps",
+        "yaw_rate_radps",
+        "curvature_1pm",
+        "covariance_diagonal",
+        "raw_state_vector",
+    ),
     "safe_for_autonomous_control": True,
     "active_tracking_supported": True,
     "benchmark_selectable": True,
@@ -503,7 +516,7 @@ class Filter:
         self._max_control_yaw_rate_delta = float(self._tune["max_control_yaw_rate_delta_radps"])
         self._max_control_speed_delta = float(self._tune["max_control_speed_delta_mps"])
 
-        self._latest_state: Optional[EgoState] = None
+        self._latest_state: Optional[VehicleState] = None
         self._latest_gnss_local: Optional[LocalGnssMeasurement] = None
         self._latest_compass_yaw_rad: Optional[float] = None
         self._latest_compass_yaw_deg: Optional[float] = None
@@ -545,7 +558,7 @@ class Filter:
         self._last_imu_frame = None
         self._last_gnss_frame = None
 
-    def process_imu(self, imu: "ImuMeasurement") -> Optional[EgoState]:
+    def process_imu(self, imu: "ImuMeasurement") -> Optional[VehicleState]:
         yaw_rad = yaw_rad_from_compass(float(imu.compass), self._compass_yaw_offset_deg)
         if yaw_rad is not None:
             self._latest_compass_yaw_rad = yaw_rad
@@ -564,7 +577,7 @@ class Filter:
             self._filter.update_yaw_rate(yaw_rate_radps)
         return self._refresh_state_from_filter()
 
-    def process_gnss(self, gnss: "GnssMeasurement") -> Optional[EgoState]:
+    def process_gnss(self, gnss: "GnssMeasurement") -> Optional[VehicleState]:
         local = self._gnss_projector.project(gnss)
         if local is None:
             return self._latest_state
@@ -592,7 +605,7 @@ class Filter:
         self._latest_control_input = control_input
         return self._tracking_mode == TRACKING_MODE_ACTIVE and self._enable_control_input_prediction
 
-    def get_state(self) -> Optional[EgoState]:
+    def get_state(self) -> Optional[VehicleState]:
         return self._latest_state
 
     def get_diagnostics(self) -> dict[str, object]:
@@ -609,7 +622,7 @@ class Filter:
             "filter_id": FILTER_INFO["id"],
             "model_type": "CTRV",
             "initialized": self.initialized,
-            "safe_for_autonomous_control": False,
+            "safe_for_autonomous_control": bool(FILTER_INFO["safe_for_autonomous_control"]),
             "state_vector": state_vector,
             "covariance_diagonal": [float(value) for value in np.diag(covariance)],
             "yaw_deg": normalize_angle_deg(math.degrees(snapshot.yaw_rad)) if snapshot is not None else None,
@@ -645,7 +658,7 @@ class Filter:
             "runtime_warning": self._filter.last_runtime_warning,
             "yaw_sign_diagnostic": self._yaw_sign_diagnostic(yaw_innovation),
             "timestamp": snapshot.timestamp if snapshot is not None else None,
-            "note": "CTRV EKF. Uses linear GNSS x/y, compass yaw, and raw gyro z yaw-rate. Autonomous-safe flag is false until validated in turns.",
+            "note": "CTRV EKF. Uses linear GNSS x/y, compass yaw, and raw gyro z yaw-rate. Experimental: verify IMU sign tuning before relying on benchmark scores.",
         }
 
     def _predict_to(self, timestamp: float) -> None:
@@ -714,20 +727,40 @@ class Filter:
         else:
             self._control_prediction_reason = "control prediction rejected by filter core"
 
-    def _refresh_state_from_filter(self) -> Optional[EgoState]:
+    def _refresh_state_from_filter(self) -> Optional[VehicleState]:
         snapshot = self._filter.snapshot()
         if snapshot is None:
             self._latest_state = None
             return None
 
         z = self._latest_gnss_local.z if self._latest_gnss_local is not None else 0.0
-        self._latest_state = EgoState(
+        yaw_deg = normalize_angle_deg(math.degrees(snapshot.yaw_rad))
+        speed = max(0.0, float(snapshot.speed))
+        curvature = self._curvature(snapshot.yaw_rate_radps, speed)
+        state_vector = self._filter.state_vector.reshape(-1)
+        covariance = self._filter.covariance
+        self._latest_state = VehicleState(
             x=float(snapshot.px),
             y=float(snapshot.py),
             z=float(z),
-            yaw=normalize_angle_deg(math.degrees(snapshot.yaw_rad)),
-            speed=max(0.0, float(snapshot.speed)),
+            yaw=yaw_deg,
+            speed=speed,
             timestamp=float(snapshot.timestamp),
+            vx_mps=speed * math.cos(snapshot.yaw_rad),
+            vy_mps=speed * math.sin(snapshot.yaw_rad),
+            yaw_rate_radps=float(snapshot.yaw_rate_radps),
+            curvature_1pm=curvature,
+            covariance_diagonal=tuple(float(value) for value in np.diag(covariance)),
+            source_filter_id=FILTER_INFO["id"],
+            model_type=FILTER_INFO["model_type"],
+            raw_state_vector=tuple(float(value) for value in state_vector),
+            diagnostics_summary={
+                "last_update_type": self._filter.last_update_type,
+                "active_command_used": self._active_command_used_latest_prediction,
+                "control_prediction_reason": self._control_prediction_reason,
+            },
+            safe_for_autonomous_control=bool(FILTER_INFO["safe_for_autonomous_control"]),
+            active_tracking_supported=bool(FILTER_INFO["active_tracking_supported"]),
         )
         return self._latest_state
 

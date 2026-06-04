@@ -27,7 +27,10 @@ from src.control.driving_behavior import (
 from src.control.vehicle_controller import VehicleController
 from src.control.waypoint_tracker import TrackingStatus, WaypointTracker
 from src.core.carla_client import CarlaClientManager
+from src.core.localization_status import LocalizationStatus
 from src.core.simulation import SimulationClock
+from src.core.state_providers import GroundTruthStateProvider
+from src.core.vehicle_state import VehicleState
 from src.evaluation.benchmark_config import (
     BEHAVIOR_PRESETS,
     BenchmarkConfig,
@@ -43,12 +46,6 @@ from src.evaluation.plot_job_worker import BenchmarkPlotJobWorker
 from src.evaluation.route_test_runner import RouteTestRunner
 from src.evaluation.test_route_store import TestRouteStore
 from src.localization.gnss_projection import GnssDiagnostics, GnssLocalProjector
-from src.localization.motion_info import MotionInfo
-from src.localization.state_estimator import (
-    EgoState,
-    GroundTruthStateProvider,
-    LocalizationStatus,
-)
 from src.planning.map_selector import MapSelector
 from src.planning.route_planner import RoutePlanner
 from src.planning.waypoint_manager import WaypointManager
@@ -99,6 +96,14 @@ class RouteActivationState(Enum):
     IDLE = "IDLE"
     WAITING_FOR_LOCALIZATION_STABILITY = "WAITING_FOR_LOCALIZATION_STABILITY"
     ROUTE_ACTIVE = "ROUTE_ACTIVE"
+
+
+class WorldSwitchResult(Enum):
+    """Outcome of an automated benchmark map switch."""
+
+    NOOP = "NOOP"
+    SWITCHED = "SWITCHED"
+    FAILED = "FAILED"
 
 
 class SimulationApp:
@@ -158,11 +163,10 @@ class SimulationApp:
         self._drive_mode = DriveMode.MANUAL
         self._map_selection_active = False
         self._test_route_authoring_active = False
-        self._latest_state: Optional[EgoState] = None
-        self._latest_ground_truth_state: Optional[EgoState] = None
-        self._latest_estimated_state: Optional[EgoState] = None
+        self._latest_state: Optional[VehicleState] = None
+        self._latest_ground_truth_state: Optional[VehicleState] = None
+        self._latest_estimated_state: Optional[VehicleState] = None
         self._latest_localization_status: Optional[LocalizationStatus] = None
-        self._latest_motion_info: Optional[MotionInfo] = None
         self._latest_tracking = self._empty_tracking_status()
         self._latest_speed_plan: SpeedPlan = self.speed_planner.latest_plan
         self._latest_requested_control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.0)
@@ -208,6 +212,8 @@ class SimulationApp:
         self._failure_monitor_deviation_started: Optional[float] = None
         self._last_benchmark_failure_reason = ""
         self._world_context_generation = 0
+        self._world_reload_in_progress = False
+        self._skip_frames_after_world_reload = 0
 
     def _setup(self) -> None:
         """Initialize CARLA world, vehicle, sensors, route tools, and visualization."""
@@ -910,10 +916,16 @@ class SimulationApp:
             return ["Filters:", "Filter manager unavailable"]
         info = manager.get_active_filter_info()
         tune = manager.get_active_filter_tune()
+        estimate = self._latest_estimated_state
+        provided_fields = tuple(info.get("provided_state_fields", ()))
+        state_caps = estimate.capabilities() if estimate is not None else ()
         lines = [
             "Filters:",
             f"Active: {info.get('name', 'none')} ({info.get('id', 'n/a')})",
             f"Model type: {info.get('model_type', 'n/a')}",
+            f"State source: {estimate.source_filter_id if estimate is not None else 'n/a'}",
+            f"State caps: {', '.join(state_caps) if state_caps else 'basic'}",
+            f"Provided fields: {', '.join(provided_fields[:6]) if provided_fields else 'basic'}",
             f"Type: {info.get('type', 'n/a')}",
             f"Safe for autonomous: {'YES' if info.get('safe_for_autonomous_control', True) else 'NO'}",
             f"Benchmark selectable: {'YES' if info.get('benchmark_selectable', info.get('safe_for_autonomous_control', True)) else 'NO'}",
@@ -1147,19 +1159,21 @@ class SimulationApp:
                     break
                 self._client_manager.tick()
                 frame_generation = self._world_context_generation
+                if self._world_reload_in_progress or self._skip_frames_after_world_reload > 0:
+                    self._skip_frames_after_world_reload = max(0, self._skip_frames_after_world_reload - 1)
+                    self._draw_frame_without_camera()
+                    self._clock.tick_pygame()
+                    continue
 
-                ground_truth_provider = self._ground_truth_provider
-                filter_manager = self._filter_manager
-                if ground_truth_provider is None or filter_manager is None:
+                if self._ground_truth_provider is None or self._filter_manager is None:
                     self._draw_frame_without_camera()
                     self._clock.tick_pygame()
                     continue
 
                 try:
-                    self._latest_ground_truth_state = ground_truth_provider.get_state()
-                    self._latest_estimated_state = filter_manager.update()
-                    self._latest_localization_status = filter_manager.get_status(self._latest_ground_truth_state)
-                    self._latest_motion_info = filter_manager.get_motion_info()
+                    self._latest_ground_truth_state = self._ground_truth_provider.get_state()
+                    self._latest_estimated_state = self._filter_manager.update()
+                    self._latest_localization_status = self._filter_manager.get_status(self._latest_ground_truth_state)
                 except RuntimeError as exc:
                     self._planner_status = f"World context unavailable: {exc}"
                     self._control_status_text = self._planner_status
@@ -1176,17 +1190,12 @@ class SimulationApp:
                     self._clock.tick_pygame()
                     continue
 
-                vehicle = self._vehicle
-                manual_controller = self._manual_controller
-                camera_sensor = self._camera_sensor
-                waypoint_manager = self._waypoint_manager
-                display = self._display
                 if (
-                    vehicle is None
-                    or manual_controller is None
-                    or camera_sensor is None
-                    or waypoint_manager is None
-                    or display is None
+                    self._vehicle is None
+                    or self._manual_controller is None
+                    or self._camera_sensor is None
+                    or self._waypoint_manager is None
+                    or self._display is None
                 ):
                     self._draw_frame_without_camera()
                     self._clock.tick_pygame()
@@ -1200,7 +1209,7 @@ class SimulationApp:
                         brake=ROUTE_INITIALIZATION.hold_brake,
                         hand_brake=False,
                     )
-                    if not self._apply_vehicle_control_safely(vehicle, control):
+                    if not self._apply_vehicle_control_safely(control):
                         self._draw_frame_without_camera()
                         self._clock.tick_pygame()
                         continue
@@ -1211,7 +1220,7 @@ class SimulationApp:
                     control_state = self._state_for_tracking_and_control()
                     if control_state is None:
                         control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
-                        if not self._apply_vehicle_control_safely(vehicle, control):
+                        if not self._apply_vehicle_control_safely(control):
                             self._draw_frame_without_camera()
                             self._clock.tick_pygame()
                             continue
@@ -1232,10 +1241,9 @@ class SimulationApp:
                             target_waypoint=self._latest_tracking.target_waypoint,
                             route_completed=self._latest_tracking.completed,
                             target_speed_mps=self._latest_speed_plan.target_speed_mps,
-                            motion_info=self._latest_motion_info,
                         )
                         applied_control = self.actuator_realism.apply(control, dt_seconds)
-                        if not self._apply_vehicle_control_safely(vehicle, applied_control):
+                        if not self._apply_vehicle_control_safely(applied_control):
                             self._draw_frame_without_camera()
                             self._clock.tick_pygame()
                             continue
@@ -1243,7 +1251,7 @@ class SimulationApp:
                         self._feed_filter_control_input(applied_control, source="autonomous_applied")
                 else:
                     try:
-                        control = manual_controller.apply_control()
+                        control = self._manual_controller.apply_control()
                     except RuntimeError as exc:
                         self._planner_status = f"Manual control skipped: {exc}"
                         self._control_status_text = self._planner_status
@@ -1253,10 +1261,10 @@ class SimulationApp:
                     self._set_latest_control(control, control)
                     self.actuator_realism.reset(control)
 
-                camera_surface = camera_sensor.get_latest_surface()
-                display.begin_frame(camera_surface)
+                camera_surface = self._camera_sensor.get_latest_surface()
+                self._display.begin_frame(camera_surface)
                 try:
-                    self._draw_camera_waypoints(waypoint_manager, camera_sensor, vehicle)
+                    self._draw_camera_waypoints()
                 except RuntimeError as exc:
                     self._planner_status = f"Camera overlay skipped: {exc}"
                     self._control_status_text = self._planner_status
@@ -1265,8 +1273,8 @@ class SimulationApp:
                 self._draw_driving_behavior_panels()
                 self._draw_control_panel()
                 self._draw_status_bar()
-                display.set_test_mode_titles(self._test_mode_active())
-                display.end_frame()
+                self._display.set_test_mode_titles(self._test_mode_active())
+                self._display.end_frame()
                 self._clock.tick_pygame()
         finally:
             self.shutdown()
@@ -1285,18 +1293,21 @@ class SimulationApp:
 
     def _apply_vehicle_control_safely(
         self,
-        vehicle: "carla.Vehicle",
         control: "carla.VehicleControl",
     ) -> bool:
+        if self._world_reload_in_progress or self._vehicle is None:
+            self._planner_status = "Vehicle control skipped during world reload"
+            self._control_status_text = self._planner_status
+            return False
         try:
-            vehicle.apply_control(control)
+            self._vehicle.apply_control(control)
             return True
         except RuntimeError as exc:
             self._planner_status = f"Vehicle control skipped: {exc}"
             self._control_status_text = self._planner_status
             return False
 
-    def _state_for_tracking_and_control(self) -> Optional[EgoState]:
+    def _state_for_tracking_and_control(self) -> Optional[VehicleState]:
         """Return GT in manual mode and the active filter state in autonomous mode."""
         if self._drive_mode == DriveMode.AUTONOMOUS:
             return self._latest_estimated_state
@@ -1344,7 +1355,7 @@ class SimulationApp:
         )
         self._filter_manager.process_control(control_input)
 
-    def _filter_control_timestamp(self, estimated_state: Optional[EgoState]) -> float:
+    def _filter_control_timestamp(self, estimated_state: Optional[VehicleState]) -> float:
         if estimated_state is not None:
             return float(estimated_state.timestamp)
         try:
@@ -1614,6 +1625,8 @@ class SimulationApp:
 
     def _respawn_benchmark_localization_sensors(self) -> None:
         """Recreate GNSS/IMU actors so every benchmark attempt starts from the selected noise config."""
+        if self._world_reload_in_progress or self._skip_frames_after_world_reload > 0:
+            return
         try:
             if self._gnss_sensor is not None:
                 self._gnss_sensor.apply_config(self.sensor_noise_config, respawn=True)
@@ -1653,15 +1666,9 @@ class SimulationApp:
 
     def _save_test_report(self) -> None:
         if self._test_runner is not None and self._test_runner.benchmark_folder is not None:
-            try:
-                from src.evaluation.benchmark_plotter import generate_benchmark_plots
-
-                paths = generate_benchmark_plots(self._test_runner.benchmark_folder)
-                self._planner_status = f"Regenerated plots: {len(paths)} files"
-                self._control_status_text = self._planner_status
-            except Exception as exc:
-                self._planner_status = f"Plot generation failed: {exc}"
-                self._control_status_text = self._planner_status
+            queued = self._plot_worker.enqueue_route_plots(self._test_runner.benchmark_folder)
+            self._planner_status = "Plots queued" if queued else "Plot queue unavailable"
+            self._control_status_text = self._planner_status
             return
 
         logger = self._active_performance_logger()
@@ -1671,7 +1678,9 @@ class SimulationApp:
             return
 
         _csv_path, json_path = logger.export()
-        self._planner_status = f"Saved test report: {json_path.name}"
+        queued = self._plot_worker.enqueue_route_plots(json_path.parent)
+        suffix = ", plots queued" if queued else ", plot queue unavailable"
+        self._planner_status = f"Saved test report: {json_path.name}{suffix}"
         self._control_status_text = self._planner_status
 
     def _regenerate_plots(self) -> None:
@@ -1975,18 +1984,19 @@ class SimulationApp:
         self._drive_mode = DriveMode.MANUAL
         self._reset_driving_behavior()
 
-    def _switch_map_for_benchmark(self) -> bool:
+    def _switch_map_for_benchmark(self) -> WorldSwitchResult:
         runner = self._test_runner
         if runner is None or not runner.is_automated:
-            return False
+            return WorldSwitchResult.NOOP
         map_name = runner.required_map_name()
         if not map_name:
-            return False
+            return WorldSwitchResult.NOOP
         load_name = self._client_manager.resolve_map_load_name(map_name)
         runner_state_text = f"Loading map: {display_map_name(load_name)}"
         self._planner_status = runner_state_text
         self._control_status_text = runner_state_text
         self._world_context_generation += 1
+        self._world_reload_in_progress = True
         try:
             self._destroy_world_actors_for_reload()
             self._client_manager.load_world(load_name)
@@ -1997,15 +2007,18 @@ class SimulationApp:
                 route_store=self._test_route_store,
                 selected_map_load_name=map_name,
             )
-            runner.begin_current_route(self._active_map_name)
             self._drive_mode = DriveMode.AUTONOMOUS
+            self._skip_frames_after_world_reload = 1
             self._planner_status = runner.status_text
             self._control_status_text = runner.status_text
+            return WorldSwitchResult.SWITCHED
         except Exception as exc:
             runner.stop(aborted=True, reason=f"Map switch failed: {exc}")
             self._planner_status = runner.status_text
             self._control_status_text = runner.status_text
-        return True
+            return WorldSwitchResult.FAILED
+        finally:
+            self._world_reload_in_progress = False
 
     def _destroy_world_actors_for_reload(self) -> None:
         if self._vehicle is not None:
@@ -2037,7 +2050,6 @@ class SimulationApp:
         self._latest_ground_truth_state = None
         self._latest_estimated_state = None
         self._latest_localization_status = None
-        self._latest_motion_info = None
         self._latest_gnss_diagnostics = None
         self._latest_gnss_frame = None
         self._gnss_trail_xy.clear()
@@ -2126,30 +2138,35 @@ class SimulationApp:
             completed=False,
         )
 
-    def _draw_camera_waypoints(
-        self,
-        waypoint_manager: WaypointManager,
-        camera_sensor: CameraSensor,
-        vehicle: "carla.Vehicle",
-    ) -> None:
+    def _draw_camera_waypoints(self) -> None:
+        if (
+            self._world_reload_in_progress
+            or self._display is None
+            or self._waypoint_manager is None
+            or self._camera_sensor is None
+            or self._vehicle is None
+        ):
+            return
         if self.route_planner is not None and self.route_planner.get_route():
             overlay_waypoints = self.waypoint_tracker.get_preview_waypoints()
             target_waypoint = self._latest_tracking.target_waypoint
         else:
-            overlay_waypoints = waypoint_manager.get_future_waypoints(vehicle)
+            overlay_waypoints = self._waypoint_manager.get_future_waypoints(self._vehicle)
             target_waypoint = None
 
         self._overlay_renderer.draw(
             surface=self._display.surface,
             waypoints=overlay_waypoints,
-            camera=camera_sensor.actor,
-            vehicle=vehicle,
+            camera=self._camera_sensor.actor,
+            vehicle=self._vehicle,
             target_waypoint=target_waypoint,
             camera_content_rect=self._display.camera_content_rect,
         )
 
     def _draw_topdown_map(self, update_sensor_diagnostics: bool = True) -> None:
         assert self._display is not None
+        if self._world_reload_in_progress:
+            return
         if self._topdown_renderer is None:
             return
         if update_sensor_diagnostics:
@@ -2364,7 +2381,10 @@ class SimulationApp:
         logger = runner.current_logger
         if logger is None:
             if runner.needs_map_switch(self._active_map_name):
-                return self._switch_map_for_benchmark()
+                return self._switch_map_for_benchmark() != WorldSwitchResult.NOOP
+            runner.update(route_completed=False, route_failed=False, active_map_name=self._active_map_name)
+            self._control_status_text = runner.status_text
+            self._planner_status = runner.status_text
             return False
 
         route_name = runner.current_route_name or "test_route"
@@ -2414,7 +2434,7 @@ class SimulationApp:
             self._control_status_text = runner.status_text
             self._planner_status = runner.status_text
         if runner.needs_map_switch(self._active_map_name):
-            return self._switch_map_for_benchmark()
+            return self._switch_map_for_benchmark() != WorldSwitchResult.NOOP
         return False
 
     def _benchmark_phase(self) -> str:

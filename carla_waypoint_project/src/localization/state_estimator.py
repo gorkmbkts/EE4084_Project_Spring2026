@@ -1,56 +1,24 @@
-"""Ego-state providers and shared localization status types."""
+"""Localization estimator protocols and sensor-update adapter."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
-import time
 from typing import Optional, Protocol, TYPE_CHECKING
 
+from src.core.localization_status import LocalizationStatus
+from src.core.vehicle_state import VehicleState
 from src.localization.gnss_projection import LocalGnssMeasurement
-from src.utils.carla_import import ensure_carla_import
 
 if TYPE_CHECKING:
     from src.sensors.gnss_sensor import GnssMeasurement, GnssSensor
     from src.sensors.imu_sensor import ImuMeasurement, ImuSensor
 
-carla = ensure_carla_import()
 
-@dataclass(frozen=True)
-class EgoState:
-    """Common ego-state abstraction used by tracking and control."""
-
-    x: float
-    y: float
-    z: float
-    yaw: float
-    speed: float
-    timestamp: float
-
-    def distance_xy_to(self, location: "carla.Location") -> float:
-        """Return planar distance from this state to a CARLA location."""
-        return math.hypot(location.x - self.x, location.y - self.y)
-
-
-@dataclass(frozen=True)
-class LocalizationStatus:
-    """Latest estimator state and diagnostics for UI/debugging."""
-
-    filter_name: str
-    initialized: bool
-    estimated_state: Optional[EgoState]
-    ground_truth_state: Optional[EgoState]
-    gnss_local: Optional[LocalGnssMeasurement]
-    position_error_m: Optional[float]
-    last_gnss_frame: Optional[int]
-    last_imu_frame: Optional[int]
-
-
-class EgoStateProvider(Protocol):
+class VehicleStateProvider(Protocol):
     """Interface for state providers consumed by tracking and control."""
 
-    def get_state(self) -> EgoState:
-        """Return the current ego state."""
+    def get_state(self) -> VehicleState:
+        """Return the current vehicle state."""
         ...
 
 
@@ -72,41 +40,14 @@ class StateEstimator(Protocol):
     def reset(self) -> None:
         ...
 
-    def process_imu(self, imu: "ImuMeasurement") -> Optional[EgoState]:
+    def process_imu(self, imu: "ImuMeasurement") -> Optional[VehicleState]:
         ...
 
-    def process_gnss(self, gnss: "GnssMeasurement") -> Optional[EgoState]:
+    def process_gnss(self, gnss: "GnssMeasurement") -> Optional[VehicleState]:
         ...
 
-    def get_state(self) -> Optional[EgoState]:
+    def get_state(self) -> Optional[VehicleState]:
         ...
-
-
-class GroundTruthStateProvider:
-    """Read ego pose and velocity directly from CARLA actor ground truth."""
-
-    def __init__(self, vehicle: "carla.Vehicle") -> None:
-        self._vehicle = vehicle
-
-    def get_state(self) -> EgoState:
-        """Convert CARLA vehicle transform and velocity to ``EgoState``."""
-        transform = self._vehicle.get_transform()
-        velocity = self._vehicle.get_velocity()
-        speed = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z)
-
-        try:
-            timestamp = float(self._vehicle.get_world().get_snapshot().timestamp.elapsed_seconds)
-        except RuntimeError:
-            timestamp = time.monotonic()
-
-        return EgoState(
-            x=float(transform.location.x),
-            y=float(transform.location.y),
-            z=float(transform.location.z),
-            yaw=float(transform.rotation.yaw),
-            speed=float(speed),
-            timestamp=timestamp,
-        )
 
 
 class EstimatedStateProvider:
@@ -144,7 +85,7 @@ class EstimatedStateProvider:
             self._last_imu_frame = None
         self._estimator.reset()
 
-    def update(self) -> Optional[EgoState]:
+    def update(self) -> Optional[VehicleState]:
         """Process any new sensor frames and return the latest estimate."""
         imu = self._imu_sensor.get_latest_measurement()
         if imu is not None and imu.frame != self._last_imu_frame:
@@ -158,14 +99,14 @@ class EstimatedStateProvider:
 
         return self._estimator.get_state()
 
-    def get_state(self) -> EgoState:
+    def get_state(self) -> VehicleState:
         """Return the latest estimated state or raise until GNSS initializes it."""
         state = self.update()
         if state is None:
             raise RuntimeError("Estimated localization state is not initialized yet.")
         return state
 
-    def build_status(self, ground_truth_state: Optional[EgoState]) -> LocalizationStatus:
+    def build_status(self, ground_truth_state: Optional[VehicleState]) -> LocalizationStatus:
         """Build UI/debug status without mutating estimator state."""
         estimated_state = self._estimator.get_state()
         position_error_m = None

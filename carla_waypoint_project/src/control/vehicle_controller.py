@@ -1,4 +1,4 @@
-"""Route-following vehicle controller for an abstract ego state."""
+"""Route-following vehicle controller for a shared vehicle state."""
 
 from __future__ import annotations
 
@@ -6,8 +6,7 @@ import math
 from typing import Optional
 
 from config.settings import AUTONOMOUS_CONTROL
-from src.localization.motion_info import MotionInfo
-from src.localization.state_estimator import EgoState
+from src.core.vehicle_state import VehicleState
 from src.utils.carla_import import ensure_carla_import
 
 carla = ensure_carla_import()
@@ -45,11 +44,11 @@ class VehicleController:
         self._speed_kp = speed_kp
         self._brake_kp = brake_kp
         self._behavior_config = behavior_config
-        self._filtered_motion_curvature: Optional[float] = None
+        self._filtered_model_curvature: Optional[float] = None
         self._latest_model_control_diagnostics: dict[str, object] = {
             "model_aware_control_enabled": False,
-            "motion_info_used": False,
-            "motion_info_ignored_reason": "not evaluated",
+            "model_state_used": False,
+            "model_state_ignored_reason": "not evaluated",
         }
 
     @property
@@ -59,18 +58,19 @@ class VehicleController:
 
     def compute_control(
         self,
-        state: EgoState,
+        state: VehicleState,
         target_waypoint: Optional["carla.Waypoint"],
         route_completed: bool = False,
         target_speed_mps: Optional[float] = None,
-        motion_info: Optional[MotionInfo] = None,
     ) -> "carla.VehicleControl":
         """Compute a CARLA control command for the current route target."""
         if route_completed or target_waypoint is None:
             self._latest_model_control_diagnostics = {
                 "model_aware_control_enabled": self._model_aware_enabled(),
-                "motion_info_used": False,
-                "motion_info_ignored_reason": "route completed or no target waypoint",
+                "model_state_used": False,
+                "model_state_ignored_reason": "route completed or no target waypoint",
+                "state_available_capabilities": state.capabilities(),
+                "state_used_fields": (),
             }
             return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=False)
 
@@ -78,7 +78,6 @@ class VehicleController:
         steer, motion_curvature, diagnostics = self._apply_model_aware_steering(
             state=state,
             pure_pursuit_steer=pure_pursuit_steer,
-            motion_info=motion_info,
         )
         guarded_target_speed = self._model_guarded_target_speed(
             state=state,
@@ -88,6 +87,7 @@ class VehicleController:
             diagnostics=diagnostics,
         )
         throttle, brake = self._compute_speed_control(state, steer, guarded_target_speed)
+        throttle, brake = self._apply_acceleration_feedforward(state, throttle, brake, diagnostics)
         diagnostics.update(
             {
                 "requested_target_speed_mps": target_speed_mps,
@@ -107,7 +107,7 @@ class VehicleController:
             manual_gear_shift=False,
         )
 
-    def _compute_steer(self, state: EgoState, target_waypoint: "carla.Waypoint") -> float:
+    def _compute_steer(self, state: VehicleState, target_waypoint: "carla.Waypoint") -> float:
         target_location = target_waypoint.transform.location
         dx = target_location.x - state.x
         dy = target_location.y - state.y
@@ -130,7 +130,7 @@ class VehicleController:
 
     def _compute_speed_control(
         self,
-        state: EgoState,
+        state: VehicleState,
         steer: float,
         target_speed_mps: Optional[float],
     ) -> tuple[float, float]:
@@ -145,38 +145,40 @@ class VehicleController:
 
     def _apply_model_aware_steering(
         self,
-        state: EgoState,
+        state: VehicleState,
         pure_pursuit_steer: float,
-        motion_info: Optional[MotionInfo],
     ) -> tuple[float, Optional[float], dict[str, object]]:
         enabled = self._model_aware_enabled()
         diagnostics: dict[str, object] = {
             "model_aware_control_enabled": enabled,
-            "motion_info_available": motion_info is not None,
-            "motion_info_used": False,
-            "motion_info_ignored_reason": "",
-            "source_filter_id": motion_info.source_filter_id if motion_info is not None else "",
-            "model_type": motion_info.model_type if motion_info is not None else "",
+            "model_state_available": True,
+            "model_state_used": False,
+            "model_state_ignored_reason": "",
+            "state_available_capabilities": state.capabilities(),
+            "state_used_fields": (),
+            "source_filter_id": state.source_filter_id,
+            "model_type": state.model_type,
+            "safe_for_autonomous_control": state.safe_for_autonomous_control,
             "pure_pursuit_steer": pure_pursuit_steer,
             "model_steer_correction": 0.0,
             "yaw_rate_feedback_active": False,
             "yaw_rate_feedback_note": "yaw-rate feedback is not active without a route desired yaw-rate signal",
         }
         if not enabled:
-            diagnostics["motion_info_ignored_reason"] = "model-aware control disabled"
+            diagnostics["model_state_ignored_reason"] = "model-aware control disabled"
             return pure_pursuit_steer, None, diagnostics
 
-        curvature, reason = self._motion_curvature_for_control(state, motion_info)
+        curvature, used_fields, reason = self._state_curvature_for_control(state)
         if curvature is None:
-            diagnostics["motion_info_ignored_reason"] = reason
+            diagnostics["model_state_ignored_reason"] = reason
             return pure_pursuit_steer, None, diagnostics
 
-        alpha = self._clamp(self._config_value("motion_info_lowpass_alpha", 0.25), 0.02, 1.0)
-        if self._filtered_motion_curvature is None:
+        alpha = self._clamp(self._config_value("model_state_lowpass_alpha", 0.25), 0.02, 1.0)
+        if self._filtered_model_curvature is None:
             filtered_curvature = curvature
         else:
-            filtered_curvature = self._filtered_motion_curvature + alpha * (curvature - self._filtered_motion_curvature)
-        self._filtered_motion_curvature = filtered_curvature
+            filtered_curvature = self._filtered_model_curvature + alpha * (curvature - self._filtered_model_curvature)
+        self._filtered_model_curvature = filtered_curvature
 
         steer_ff_angle = math.atan(self._wheel_base_m * filtered_curvature)
         steer_ff_normalized = steer_ff_angle / max(1.0e-6, self._max_steer_angle_rad)
@@ -187,10 +189,11 @@ class VehicleController:
 
         diagnostics.update(
             {
-                "motion_info_used": True,
-                "motion_info_ignored_reason": "",
-                "motion_curvature_1pm": curvature,
-                "filtered_motion_curvature_1pm": filtered_curvature,
+                "model_state_used": True,
+                "model_state_ignored_reason": "",
+                "state_used_fields": tuple(used_fields),
+                "model_curvature_1pm": curvature,
+                "filtered_model_curvature_1pm": filtered_curvature,
                 "model_steer_ff_angle_rad": steer_ff_angle,
                 "model_steer_ff_normalized": steer_ff_normalized,
                 "model_steer_correction": correction,
@@ -200,7 +203,7 @@ class VehicleController:
 
     def _model_guarded_target_speed(
         self,
-        state: EgoState,
+        state: VehicleState,
         steer: float,
         target_speed_mps: Optional[float],
         motion_curvature: Optional[float],
@@ -228,36 +231,62 @@ class VehicleController:
         diagnostics["model_speed_guard_applied"] = guarded < base_target
         return guarded
 
-    def _motion_curvature_for_control(
+    def _state_curvature_for_control(
         self,
-        state: EgoState,
-        motion_info: Optional[MotionInfo],
-    ) -> tuple[Optional[float], str]:
-        if motion_info is None:
-            return None, "motion info missing"
-        if motion_info.confidence is not None and motion_info.confidence < 0.2:
-            return None, "motion info confidence below threshold"
+        state: VehicleState,
+    ) -> tuple[Optional[float], tuple[str, ...], str]:
+        if not state.safe_for_autonomous_control:
+            return None, (), "state source not marked safe for autonomous control"
+        if state.confidence is not None and state.confidence < 0.2:
+            return None, (), "state confidence below threshold"
 
         min_speed = max(0.0, self._config_value("min_model_control_speed_mps", 1.0))
         if state.speed < min_speed:
-            return None, "speed below model-aware control threshold"
+            return None, (), "speed below model-aware control threshold"
 
-        yaw_rate = motion_info.yaw_rate_radps
+        yaw_rate = state.yaw_rate_radps
         yaw_rate_cap = max(0.01, self._config_value("max_abs_motion_yaw_rate_radps", 2.5))
         if yaw_rate is not None:
             if not math.isfinite(float(yaw_rate)):
-                return None, "non-finite motion yaw-rate"
+                return None, (), "non-finite state yaw-rate"
             if abs(float(yaw_rate)) > yaw_rate_cap:
-                return None, "motion yaw-rate exceeds configured cap"
+                return None, (), "state yaw-rate exceeds configured cap"
 
-        curvature = motion_info.curvature_1pm
+        curvature = state.curvature_1pm
+        used_fields: tuple[str, ...] = ("curvature_1pm",) if curvature is not None else ()
         if curvature is None and yaw_rate is not None:
             curvature = float(yaw_rate) / max(float(state.speed), min_speed, 1.0e-6)
+            used_fields = ("yaw_rate_radps", "speed")
         if curvature is None:
-            return None, "motion curvature unavailable"
+            return None, (), "state curvature unavailable"
         if not math.isfinite(float(curvature)):
-            return None, "non-finite motion curvature"
-        return float(curvature), ""
+            return None, (), "non-finite state curvature"
+        return float(curvature), used_fields, ""
+
+    def _apply_acceleration_feedforward(
+        self,
+        state: VehicleState,
+        throttle: float,
+        brake: float,
+        diagnostics: dict[str, object],
+    ) -> tuple[float, float]:
+        diagnostics["acceleration_feedforward_enabled"] = self._flag_value("enable_acceleration_feedforward", False)
+        diagnostics["acceleration_feedforward_used"] = False
+        diagnostics["acceleration_feedforward_delta"] = 0.0
+        if not self._flag_value("enable_acceleration_feedforward", False):
+            return throttle, brake
+        accel = state.longitudinal_accel_mps2 if state.longitudinal_accel_mps2 is not None else state.acceleration_mps2
+        if accel is None or not math.isfinite(float(accel)):
+            diagnostics["acceleration_feedforward_ignored_reason"] = "acceleration unavailable"
+            return throttle, brake
+        gain = self._config_value("acceleration_feedforward_gain", 0.0)
+        max_delta = max(0.0, self._config_value("max_acceleration_feedforward_delta", 0.15))
+        delta = self._clamp(-gain * float(accel), -max_delta, max_delta)
+        diagnostics["acceleration_feedforward_used"] = abs(delta) > 1.0e-9
+        diagnostics["acceleration_feedforward_delta"] = delta
+        if delta >= 0.0:
+            return self._clamp(throttle + delta, 0.0, self._max_throttle), brake
+        return throttle, self._clamp(brake - delta, 0.0, self._max_brake)
 
     def _model_aware_enabled(self) -> bool:
         return self._flag_value("enable_model_aware_control", False)

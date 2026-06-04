@@ -14,7 +14,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.KalmanLab.filters import ctra_ekf, ctrv_ekf
 from src.KalmanLab.registry import discover_filters
 from src.localization.gnss_projection import LocalGnssMeasurement
-from src.localization.motion_info import motion_info_from_diagnostics
 
 
 def assert_close(actual: float, expected: float, tolerance: float = 1.0e-6) -> None:
@@ -100,10 +99,12 @@ def test_filter_wrappers_initialize_from_gnss_and_imu() -> None:
         state = filt.process_gnss(gnss)
         if state is None:
             raise AssertionError(f"{module.__name__} did not initialize")
-        diagnostics = filt.get_diagnostics()
-        info = motion_info_from_diagnostics(diagnostics)
-        if info is None or info.yaw_rate_radps is None:
-            raise AssertionError(f"{module.__name__} did not expose MotionInfo")
+        if state.yaw_rate_radps is None:
+            raise AssertionError(f"{module.__name__} did not expose yaw-rate state")
+        if state.curvature_1pm is not None and not math.isfinite(state.curvature_1pm):
+            raise AssertionError(f"{module.__name__} exposed non-finite curvature")
+        if module is ctra_ekf and state.longitudinal_accel_mps2 is None:
+            raise AssertionError("CTRA did not expose longitudinal acceleration")
 
 
 def test_registry_capabilities() -> None:
@@ -116,6 +117,9 @@ def test_registry_capabilities() -> None:
             raise AssertionError(f"{filter_id} not benchmark selectable")
         if not record.active_tracking_supported:
             raise AssertionError(f"{filter_id} does not advertise active tracking")
+        provided = set(record.provided_state_fields)
+        if "yaw_rate_radps" not in provided:
+            raise AssertionError(f"{filter_id} does not advertise yaw-rate state")
         if record.filter_class is None or not hasattr(record.filter_class, "process_control"):
             raise AssertionError(f"{filter_id} has no process_control")
 
@@ -128,15 +132,13 @@ def test_startup_setup_does_not_hide_experimental_filters() -> None:
         raise AssertionError("startup setup no longer filters valid plugins")
 
 
-def test_motion_info_uses_plugin_model_type() -> None:
-    info = motion_info_from_diagnostics(
-        {"filter_id": "new_plugin", "yaw_rate_radps": 0.4},
-        {"id": "new_plugin", "model_type": "BICYCLE_EKF"},
-    )
-    if info is None:
-        raise AssertionError("motion info was not extracted")
-    if info.model_type != "BICYCLE_EKF":
-        raise AssertionError(f"unexpected model type: {info.model_type}")
+def test_state_uses_plugin_model_type() -> None:
+    state = ctra_ekf.Filter(type("Projector", (), {"project": lambda self, gnss: None})()).get_state()
+    if state is not None:
+        raise AssertionError("new filter instance unexpectedly had state")
+    records = {record.filter_id: record for record in discover_filters() if record.valid}
+    if records["ctra_ekf"].filter_info.get("model_type") != "CTRA":
+        raise AssertionError("CTRA registry model type missing")
 
 
 def test_filter_control_input_avoids_ground_truth_speed_yaw() -> None:
@@ -160,7 +162,7 @@ def run_all() -> None:
     test_filter_wrappers_initialize_from_gnss_and_imu()
     test_registry_capabilities()
     test_startup_setup_does_not_hide_experimental_filters()
-    test_motion_info_uses_plugin_model_type()
+    test_state_uses_plugin_model_type()
     test_filter_control_input_avoids_ground_truth_speed_yaw()
 
 

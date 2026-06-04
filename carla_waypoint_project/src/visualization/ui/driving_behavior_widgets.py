@@ -11,7 +11,7 @@ import pygame
 
 from config.settings import DASHBOARD
 from src.control.driving_behavior import DrivingBehaviorConfig, SpeedPlan
-from src.localization.state_estimator import EgoState
+from src.core.vehicle_state import VehicleState
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,7 @@ class BehaviorTuningPanel:
             _SliderSpec("Yaw-rate FB", "yaw_rate_feedback_gain", 0.0, 1.0, "x", 2),
             _SliderSpec("Model steer cap", "max_model_steer_correction", 0.0, 0.5, "", 2),
             _SliderSpec("Model min speed", "min_model_control_speed_mps", 0.1, 5.0, "m/s", 1),
-            _SliderSpec("Motion alpha", "motion_info_lowpass_alpha", 0.02, 1.0, "", 2),
+            _SliderSpec("State alpha", "model_state_lowpass_alpha", 0.02, 1.0, "", 2),
             _SliderSpec("Motion yaw cap", "max_abs_motion_yaw_rate_radps", 0.2, 5.0, "rad/s", 2),
             _SliderSpec("Model speed guard", "enable_model_speed_guard", 0.0, 1.0, "", 0),
             _SliderSpec("Model speed factor", "model_curvature_speed_factor", 0.1, 1.5, "x", 2),
@@ -436,7 +436,7 @@ class DrivingDiagnosticsWidget:
     def draw(
         self,
         surface: pygame.Surface,
-        state: Optional[EgoState],
+        state: Optional[VehicleState],
         speed_plan: Optional[SpeedPlan],
         applied_control: Optional[object],
     ) -> None:
@@ -491,7 +491,7 @@ class DrivingDiagnosticsWidget:
         graph_rect = pygame.Rect(content.left, graph_top, content.width, max(58, content.bottom - graph_top))
         self._draw_speed_graph(surface, graph_rect)
 
-    def _update_history(self, state: Optional[EgoState], speed_plan: Optional[SpeedPlan]) -> None:
+    def _update_history(self, state: Optional[VehicleState], speed_plan: Optional[SpeedPlan]) -> None:
         if state is None or speed_plan is None:
             return
         timestamp = float(state.timestamp)

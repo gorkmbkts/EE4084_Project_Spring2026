@@ -78,7 +78,10 @@ def _validate_module(path: Path, module_name: str, module: ModuleType) -> Filter
     normalized_info.setdefault("benchmark_selectable", safe_for_autonomous)
     normalized_info.setdefault("experimental", False)
     normalized_info.setdefault("requires_raw_imu", False)
-    normalized_info.setdefault("motion_info_fields", ())
+    provided_fields = normalized_info.get("provided_state_fields")
+    if not isinstance(provided_fields, (tuple, list)):
+        provided_fields = ()
+    normalized_info["provided_state_fields"] = tuple(str(field) for field in provided_fields)
     normalized_info.setdefault("model_type", str(normalized_info.get("id") or module_name))
     return FilterPluginRecord(
         module_name=module_name,

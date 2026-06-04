@@ -8,7 +8,7 @@ import math
 from typing import List, Optional, Sequence
 
 from config.settings import WAYPOINT_TRACKER
-from src.localization.state_estimator import EgoState
+from src.core.vehicle_state import VehicleState
 from src.utils.carla_import import ensure_carla_import
 
 carla = ensure_carla_import()
@@ -95,7 +95,7 @@ class WaypointTracker:
         """Clear route and tracking state."""
         self.set_route([])
 
-    def update(self, state: EgoState) -> TrackingStatus:
+    def update(self, state: VehicleState) -> TrackingStatus:
         """Update closest and lookahead target waypoints for the ego state."""
         if not self._route:
             self._completed = False
@@ -132,7 +132,7 @@ class WaypointTracker:
         end_index = min(len(self._route), self._closest_index + max_count)
         return self._route[self._closest_index:end_index]
 
-    def _find_closest_index(self, state: EgoState) -> tuple[int, float]:
+    def _find_closest_index(self, state: VehicleState) -> tuple[int, float]:
         best_index = self._closest_index
         best_distance = float("inf")
         search_start, search_end = self._search_window()
@@ -160,7 +160,7 @@ class WaypointTracker:
 
         return progress_index, best_distance
 
-    def _find_target_index(self, state: EgoState) -> int:
+    def _find_target_index(self, state: VehicleState) -> int:
         lookahead_m = max(
             self._lookahead_base_m,
             self._lookahead_base_m + self._lookahead_gain_s * state.speed,
@@ -199,7 +199,7 @@ class WaypointTracker:
             search_end = min(len(self._route), search_start + 1)
         return search_start, search_end
 
-    def _compute_distance_to_goal(self, state: EgoState) -> float:
+    def _compute_distance_to_goal(self, state: VehicleState) -> float:
         goal_location = self._route[-1].transform.location
         return math.hypot(goal_location.x - state.x, goal_location.y - state.y)
 
@@ -212,7 +212,7 @@ class WaypointTracker:
 
     @staticmethod
     def _compute_heading_error(
-        state: EgoState,
+        state: VehicleState,
         target_waypoint: Optional["carla.Waypoint"],
     ) -> Optional[float]:
         if target_waypoint is None:

@@ -182,10 +182,13 @@ BEHAVIOR_SPECS: tuple[ParameterSpec, ...] = (
     ParameterSpec("yaw_rate_feedback_gain", "Yaw-rate FB", 0.0, 1.0, "x", 2, "Model-aware control"),
     ParameterSpec("max_model_steer_correction", "Model steer cap", 0.0, 0.5, "", 2, "Model-aware control"),
     ParameterSpec("min_model_control_speed_mps", "Model min speed", 0.1, 5.0, "m/s", 1, "Model-aware control"),
-    ParameterSpec("motion_info_lowpass_alpha", "Motion alpha", 0.02, 1.0, "", 2, "Model-aware control"),
+    ParameterSpec("model_state_lowpass_alpha", "State alpha", 0.02, 1.0, "", 2, "Model-aware control"),
     ParameterSpec("max_abs_motion_yaw_rate_radps", "Motion yaw cap", 0.2, 5.0, "rad/s", 2, "Model-aware control"),
     ParameterSpec("enable_model_speed_guard", "Model speed guard", 0.0, 1.0, "", 0, "Model-aware control"),
     ParameterSpec("model_curvature_speed_factor", "Model speed factor", 0.1, 1.5, "x", 2, "Model-aware control"),
+    ParameterSpec("enable_acceleration_feedforward", "Accel FF", 0.0, 1.0, "", 0, "Model-aware control"),
+    ParameterSpec("acceleration_feedforward_gain", "Accel FF gain", 0.0, 1.0, "x", 2, "Model-aware control"),
+    ParameterSpec("max_acceleration_feedforward_delta", "Accel FF cap", 0.0, 0.5, "", 2, "Model-aware control"),
 )
 
 
@@ -239,10 +242,13 @@ def _base_behavior_values() -> dict[str, float]:
         "yaw_rate_feedback_gain": 0.0,
         "max_model_steer_correction": 0.15,
         "min_model_control_speed_mps": 1.0,
-        "motion_info_lowpass_alpha": 0.25,
+        "model_state_lowpass_alpha": 0.25,
         "max_abs_motion_yaw_rate_radps": 2.5,
         "enable_model_speed_guard": 0.0,
         "model_curvature_speed_factor": 0.5,
+        "enable_acceleration_feedforward": 0.0,
+        "acceleration_feedforward_gain": 0.0,
+        "max_acceleration_feedforward_delta": 0.15,
     }
 
 

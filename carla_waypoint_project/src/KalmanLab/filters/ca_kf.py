@@ -10,9 +10,9 @@ import numpy as np
 
 from src.KalmanLab.control_model import estimate_command_motion
 from src.KalmanLab.filter_base import FilterControlInput, TRACKING_MODE_ACTIVE, normalize_tracking_mode
+from src.core.vehicle_state import VehicleState
 from src.evaluation.benchmark_config import ParameterSpec
 from src.localization.gnss_projection import GnssLocalProjector, LocalGnssMeasurement
-from src.localization.state_estimator import EgoState
 
 if TYPE_CHECKING:
     from src.sensors.gnss_sensor import GnssMeasurement
@@ -28,7 +28,21 @@ FILTER_INFO = {
     "measurement_model": "GNSS position x/y + IMU acceleration x/y",
     "description": "Linear constant-acceleration Kalman filter using noisy GNSS and IMU acceleration.",
     "model_type": "CA",
-    "motion_info_fields": (),
+    "provided_state_fields": (
+        "x",
+        "y",
+        "z",
+        "yaw",
+        "speed",
+        "timestamp",
+        "vx_mps",
+        "vy_mps",
+        "acceleration_mps2",
+        "longitudinal_accel_mps2",
+        "lateral_accel_mps2",
+        "covariance_diagonal",
+        "raw_state_vector",
+    ),
     "safe_for_autonomous_control": True,
     "active_tracking_supported": True,
     "benchmark_selectable": True,
@@ -297,7 +311,7 @@ class Filter:
         self._max_prediction_dt_s = float(self._tune["max_prediction_dt_s"])
         self._command_accel_stddev = float(self._tune["command_accel_stddev_mps2"])
 
-        self._latest_state: Optional[EgoState] = None
+        self._latest_state: Optional[VehicleState] = None
         self._latest_gnss_local: Optional[LocalGnssMeasurement] = None
         self._pending_acceleration_xy: Optional[tuple[float, float]] = None
         self._latest_imu_yaw_deg: Optional[float] = None
@@ -337,7 +351,7 @@ class Filter:
         self._latest_control_input = control_input
         return self._tracking_mode == TRACKING_MODE_ACTIVE
 
-    def process_imu(self, imu: "ImuMeasurement") -> Optional[EgoState]:
+    def process_imu(self, imu: "ImuMeasurement") -> Optional[VehicleState]:
         yaw_deg = self._yaw_deg_from_compass(imu.compass)
         if yaw_deg is not None:
             self._latest_imu_yaw_deg = yaw_deg
@@ -353,7 +367,7 @@ class Filter:
         self._filter.update_acceleration(acceleration_xy)
         return self._refresh_state_from_filter()
 
-    def process_gnss(self, gnss: "GnssMeasurement") -> Optional[EgoState]:
+    def process_gnss(self, gnss: "GnssMeasurement") -> Optional[VehicleState]:
         local = self._gnss_projector.project(gnss)
         if local is None:
             return self._latest_state
@@ -374,7 +388,7 @@ class Filter:
         self._filter.update_position((local.x, local.y))
         return self._refresh_state_from_filter()
 
-    def get_state(self) -> Optional[EgoState]:
+    def get_state(self) -> Optional[VehicleState]:
         return self._latest_state
 
     def get_diagnostics(self) -> dict[str, object]:
@@ -443,7 +457,7 @@ class Filter:
         )
         self._active_command_used_latest_prediction = True
 
-    def _refresh_state_from_filter(self) -> Optional[EgoState]:
+    def _refresh_state_from_filter(self) -> Optional[VehicleState]:
         snapshot = self._filter.snapshot()
         if snapshot is None:
             self._latest_state = None
@@ -452,13 +466,33 @@ class Filter:
         speed = math.hypot(snapshot.vx, snapshot.vy)
         yaw = self._derive_yaw_deg(snapshot.vx, snapshot.vy, speed)
         z = self._latest_gnss_local.z if self._latest_gnss_local is not None else 0.0
-        self._latest_state = EgoState(
+        yaw_rad = math.radians(yaw)
+        longitudinal_accel = math.cos(yaw_rad) * snapshot.ax + math.sin(yaw_rad) * snapshot.ay
+        lateral_accel = -math.sin(yaw_rad) * snapshot.ax + math.cos(yaw_rad) * snapshot.ay
+        state_vector = self._filter.state_vector.reshape(-1)
+        covariance = self._filter.covariance
+        self._latest_state = VehicleState(
             x=snapshot.px,
             y=snapshot.py,
             z=float(z),
             yaw=yaw,
             speed=float(speed),
             timestamp=snapshot.timestamp,
+            vx_mps=snapshot.vx,
+            vy_mps=snapshot.vy,
+            acceleration_mps2=math.hypot(snapshot.ax, snapshot.ay),
+            longitudinal_accel_mps2=longitudinal_accel,
+            lateral_accel_mps2=lateral_accel,
+            covariance_diagonal=tuple(float(value) for value in np.diag(covariance)),
+            source_filter_id=FILTER_INFO["id"],
+            model_type=FILTER_INFO["model_type"],
+            raw_state_vector=tuple(float(value) for value in state_vector),
+            diagnostics_summary={
+                "last_update_type": self._filter.last_update_type,
+                "active_command_used": self._active_command_used_latest_prediction,
+            },
+            safe_for_autonomous_control=bool(FILTER_INFO["safe_for_autonomous_control"]),
+            active_tracking_supported=bool(FILTER_INFO["active_tracking_supported"]),
         )
         return self._latest_state
 

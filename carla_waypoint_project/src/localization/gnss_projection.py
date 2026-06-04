@@ -12,7 +12,7 @@ from src.utils.carla_import import ensure_carla_import
 carla = ensure_carla_import()
 
 if TYPE_CHECKING:
-    from src.localization.state_estimator import EgoState
+    from src.core.vehicle_state import VehicleState
 
 METERS_PER_DEGREE_LAT = 111_320.0
 
@@ -117,7 +117,7 @@ class GnssLocalProjector:
     def diagnostics(
         self,
         gnss: Optional[GnssMeasurement],
-        state: Optional[EgoState],
+        state: Optional["VehicleState"],
     ) -> Optional[GnssDiagnostics]:
         """Build GNSS-vs-ground-truth diagnostics if both values are available."""
         if gnss is None or state is None:

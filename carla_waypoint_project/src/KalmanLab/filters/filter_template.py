@@ -18,10 +18,14 @@ defines:
     ``reset()``, ``process_imu(imu)``, ``process_gnss(gnss)``,
     ``get_state()``, and ``get_diagnostics()``.
 
-``get_state()`` should return ``src.localization.state_estimator.EgoState`` or
+``get_state()`` should return ``src.core.vehicle_state.VehicleState`` or
 ``None`` until initialized. Diagnostics should be a small dictionary. Include
 covariance diagonals, innovation vectors, NIS, or other filter-specific details
 when available.
+
+Put control-relevant estimated quantities such as yaw rate, acceleration,
+curvature, covariance, model type, and source filter id on ``VehicleState``.
+Keep only verbose debug details in diagnostics.
 
 Set ``"safe_for_autonomous_control": False`` in ``FILTER_INFO`` for filters
 that should be benchmark baselines only, such as raw GNSS.
@@ -38,6 +42,8 @@ FILTER_INFO = {
     "process_model": "Describe prediction model",
     "measurement_model": "Describe fused sensors",
     "description": "One sentence explaining the filter.",
+    "model_type": "MY_MODEL",
+    "provided_state_fields": ("x", "y", "z", "yaw", "speed", "timestamp"),
     "safe_for_autonomous_control": True,
 }
 
@@ -71,7 +77,7 @@ class Filter:
         if local is None:
             return self._latest_state
         self._latest_gnss_local = local
-        # Build and assign an EgoState here.
+        # Build and assign a VehicleState here.
         self.initialized = True
         return self._latest_state
 

@@ -6,9 +6,9 @@ import math
 from typing import Optional, TYPE_CHECKING
 
 from src.KalmanLab.filter_base import normalize_tracking_mode
+from src.core.vehicle_state import VehicleState
 from src.evaluation.benchmark_config import ParameterSpec
 from src.localization.gnss_projection import GnssLocalProjector, LocalGnssMeasurement
-from src.localization.state_estimator import EgoState
 
 if TYPE_CHECKING:
     from src.sensors.gnss_sensor import GnssMeasurement
@@ -24,7 +24,7 @@ FILTER_INFO = {
     "measurement_model": "Projected GNSS latitude/longitude",
     "description": "Projected raw GNSS position with speed and yaw estimated from successive fixes.",
     "model_type": "RAW_GNSS",
-    "motion_info_fields": (),
+    "provided_state_fields": ("x", "y", "z", "yaw", "speed", "timestamp"),
     "safe_for_autonomous_control": False,
     "active_tracking_supported": False,
     "benchmark_selectable": False,
@@ -46,7 +46,7 @@ TUNE_SPECS = (
 
 
 class Filter:
-    """Use raw projected GNSS as an EgoState-producing baseline filter."""
+    """Use raw projected GNSS as a state-producing baseline filter."""
 
     def __init__(
         self,
@@ -59,7 +59,7 @@ class Filter:
         if tune:
             self._tune.update(dict(tune))
         self._tracking_mode = normalize_tracking_mode(tracking_mode)
-        self._latest_state: Optional[EgoState] = None
+        self._latest_state: Optional[VehicleState] = None
         self._latest_gnss_local: Optional[LocalGnssMeasurement] = None
         self._previous_gnss_local: Optional[LocalGnssMeasurement] = None
         self._latest_imu_yaw_deg: Optional[float] = None
@@ -86,7 +86,7 @@ class Filter:
         self._last_gnss_frame = None
         self._last_imu_frame = None
 
-    def process_imu(self, imu: "ImuMeasurement") -> Optional[EgoState]:
+    def process_imu(self, imu: "ImuMeasurement") -> Optional[VehicleState]:
         yaw_deg = self._yaw_deg_from_compass(imu.compass)
         if yaw_deg is not None:
             self._latest_imu_yaw_deg = yaw_deg
@@ -95,7 +95,7 @@ class Filter:
         self._last_imu_frame = int(imu.frame)
         return self._latest_state
 
-    def process_gnss(self, gnss: "GnssMeasurement") -> Optional[EgoState]:
+    def process_gnss(self, gnss: "GnssMeasurement") -> Optional[VehicleState]:
         local = self._gnss_projector.project(gnss)
         if local is None:
             return self._latest_state
@@ -105,17 +105,22 @@ class Filter:
         self._latest_gnss_local = local
         self._speed_mps = speed
         self._last_gnss_frame = int(gnss.frame)
-        self._latest_state = EgoState(
+        self._latest_state = VehicleState(
             x=float(local.x),
             y=float(local.y),
             z=float(local.z),
             yaw=float(yaw),
             speed=float(speed),
             timestamp=float(local.timestamp),
+            source_filter_id=FILTER_INFO["id"],
+            model_type=FILTER_INFO["model_type"],
+            diagnostics_summary={"warning": "Raw GNSS is noisy and may be unsafe for closed-loop control."},
+            safe_for_autonomous_control=False,
+            active_tracking_supported=False,
         )
         return self._latest_state
 
-    def get_state(self) -> Optional[EgoState]:
+    def get_state(self) -> Optional[VehicleState]:
         return self._latest_state
 
     def get_diagnostics(self) -> dict[str, object]:
