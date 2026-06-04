@@ -8,7 +8,8 @@ from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 
-from src.KalmanLab.filter_base import normalize_tracking_mode
+from config.settings import AUTONOMOUS_CONTROL
+from src.KalmanLab.filter_base import FilterControlInput, TRACKING_MODE_ACTIVE, normalize_tracking_mode
 from src.evaluation.benchmark_config import ParameterSpec
 from src.localization.gnss_projection import GnssLocalProjector, LocalGnssMeasurement
 from src.localization.state_estimator import EgoState
@@ -26,9 +27,14 @@ FILTER_INFO = {
     "process_model": "Constant Turn Rate and Velocity",
     "measurement_model": "GNSS position x/y + IMU compass yaw + IMU gyro z yaw-rate",
     "description": "Nonlinear CTRV EKF using projected GNSS and raw IMU heading/yaw-rate measurements.",
-    "safe_for_autonomous_control": False,
-    "active_tracking_supported": False,
-    "autonomous_control_note": "CTRV EKF is selectable but not marked safe for autonomous control until turn-direction validation is complete.",
+    "model_type": "CTRV",
+    "motion_info_fields": ("yaw_rate_radps", "curvature_1pm"),
+    "safe_for_autonomous_control": True,
+    "active_tracking_supported": True,
+    "benchmark_selectable": True,
+    "experimental": True,
+    "requires_raw_imu": True,
+    "autonomous_control_note": "CTRV EKF is experimental; verify gyro_z_sign and compass_yaw_offset_deg on turns before relying on benchmark scores.",
 }
 
 
@@ -50,6 +56,13 @@ TUNE = {
     "compass_yaw_offset_deg": -90.0,
     "max_abs_yaw_rate_radps": 2.5,
     "max_speed_mps": 50.0,
+    "enable_control_input_prediction": 1.0,
+    "control_accel_gain_mps2": 1.2,
+    "control_brake_decel_gain_mps2": 2.4,
+    "control_steer_to_yaw_rate_gain": 0.25,
+    "control_input_timeout_s": 0.35,
+    "max_control_yaw_rate_delta_radps": 0.12,
+    "max_control_speed_delta_mps": 0.35,
 }
 
 
@@ -71,6 +84,13 @@ TUNE_SPECS = (
     ParameterSpec("compass_yaw_offset_deg", "Compass offset", -180.0, 180.0, "deg", 0, "IMU convention"),
     ParameterSpec("max_abs_yaw_rate_radps", "Yaw-rate cap", 0.2, 5.0, "rad/s", 2, "Guards"),
     ParameterSpec("max_speed_mps", "Speed cap", 5.0, 80.0, "m/s", 1, "Guards"),
+    ParameterSpec("enable_control_input_prediction", "Use control input", 0.0, 1.0, "", 0, "Active tracking"),
+    ParameterSpec("control_accel_gain_mps2", "Control accel", 0.0, 5.0, "m/s2", 2, "Active tracking"),
+    ParameterSpec("control_brake_decel_gain_mps2", "Control brake", 0.0, 8.0, "m/s2", 2, "Active tracking"),
+    ParameterSpec("control_steer_to_yaw_rate_gain", "Steer yaw gain", 0.0, 1.0, "x", 2, "Active tracking"),
+    ParameterSpec("control_input_timeout_s", "Control timeout", 0.02, 1.0, "s", 2, "Active tracking"),
+    ParameterSpec("max_control_yaw_rate_delta_radps", "Control yaw delta", 0.0, 1.0, "rad/s", 2, "Active tracking"),
+    ParameterSpec("max_control_speed_delta_mps", "Control speed delta", 0.0, 2.0, "m/s", 2, "Active tracking"),
 )
 
 
@@ -318,6 +338,23 @@ class _CtrvEkfCore:
         r = np.array([[self._yaw_rate_var]], dtype=float)
         self.safe_update(z, h, r, "imu_yaw_rate")
 
+    def apply_control_prediction(self, speed_delta_mps: float, yaw_rate_delta_radps: float) -> bool:
+        """Apply a bounded active-tracking prediction nudge, not a measurement."""
+        if not self.initialized:
+            return False
+        if not math.isfinite(float(speed_delta_mps)) or not math.isfinite(float(yaw_rate_delta_radps)):
+            self.last_runtime_warning = "control prediction skipped: non-finite delta"
+            return False
+
+        next_x = self._x.copy()
+        next_x[3, 0] = float(next_x[3, 0]) + float(speed_delta_mps)
+        next_x[4, 0] = float(next_x[4, 0]) + float(yaw_rate_delta_radps)
+        next_x = self._sanitize_state(next_x)
+        next_p = self._p.copy()
+        next_p[3, 3] += max(1.0e-9, abs(float(speed_delta_mps)) * 0.05)
+        next_p[4, 4] += max(1.0e-9, abs(float(yaw_rate_delta_radps)) * 0.05)
+        return self._set_state_and_covariance(next_x, next_p, "control_prediction")
+
     def snapshot(self) -> Optional[_CtrvSnapshot]:
         if not self.initialized or self._timestamp is None:
             return None
@@ -458,6 +495,13 @@ class Filter:
         self._gyro_z_sign = float(self._tune["gyro_z_sign"])
         self._compass_yaw_offset_deg = float(self._tune["compass_yaw_offset_deg"])
         self._max_abs_yaw_rate = float(self._tune["max_abs_yaw_rate_radps"])
+        self._enable_control_input_prediction = bool(float(self._tune["enable_control_input_prediction"]) >= 0.5)
+        self._control_timeout_s = float(self._tune["control_input_timeout_s"])
+        self._control_accel_gain = float(self._tune["control_accel_gain_mps2"])
+        self._control_brake_decel_gain = float(self._tune["control_brake_decel_gain_mps2"])
+        self._control_steer_yaw_gain = float(self._tune["control_steer_to_yaw_rate_gain"])
+        self._max_control_yaw_rate_delta = float(self._tune["max_control_yaw_rate_delta_radps"])
+        self._max_control_speed_delta = float(self._tune["max_control_speed_delta_mps"])
 
         self._latest_state: Optional[EgoState] = None
         self._latest_gnss_local: Optional[LocalGnssMeasurement] = None
@@ -466,6 +510,12 @@ class Filter:
         self._latest_gyro_z_radps: Optional[float] = None
         self._latest_signed_gyro_z_radps: Optional[float] = None
         self._gyro_yaw_rate_clamped = False
+        self._latest_control_input: Optional[FilterControlInput] = None
+        self._active_command_used_latest_prediction = False
+        self._control_predicted_accel_mps2: Optional[float] = None
+        self._control_predicted_yaw_rate_radps: Optional[float] = None
+        self._control_input_age_s: Optional[float] = None
+        self._control_prediction_reason = "waiting for active prediction"
         self._last_imu_frame: Optional[int] = None
         self._last_gnss_frame: Optional[int] = None
 
@@ -486,6 +536,12 @@ class Filter:
         self._latest_gyro_z_radps = None
         self._latest_signed_gyro_z_radps = None
         self._gyro_yaw_rate_clamped = False
+        self._latest_control_input = None
+        self._active_command_used_latest_prediction = False
+        self._control_predicted_accel_mps2 = None
+        self._control_predicted_yaw_rate_radps = None
+        self._control_input_age_s = None
+        self._control_prediction_reason = "reset"
         self._last_imu_frame = None
         self._last_gnss_frame = None
 
@@ -532,6 +588,10 @@ class Filter:
         self._filter.update_gnss_position((local.x, local.y))
         return self._refresh_state_from_filter()
 
+    def process_control(self, control_input: FilterControlInput) -> bool:
+        self._latest_control_input = control_input
+        return self._tracking_mode == TRACKING_MODE_ACTIVE and self._enable_control_input_prediction
+
     def get_state(self) -> Optional[EgoState]:
         return self._latest_state
 
@@ -576,7 +636,12 @@ class Filter:
             "last_gnss_frame": self._last_gnss_frame,
             "last_imu_frame": self._last_imu_frame,
             "tracking_mode": self._tracking_mode,
-            "active_tracking_supported": False,
+            "active_tracking_supported": True,
+            "active_command_used_latest_prediction": self._active_command_used_latest_prediction,
+            "control_predicted_accel_mps2": self._control_predicted_accel_mps2,
+            "control_predicted_yaw_rate_radps": self._control_predicted_yaw_rate_radps,
+            "control_input_age_s": self._control_input_age_s,
+            "control_prediction_reason": self._control_prediction_reason,
             "runtime_warning": self._filter.last_runtime_warning,
             "yaw_sign_diagnostic": self._yaw_sign_diagnostic(yaw_innovation),
             "timestamp": snapshot.timestamp if snapshot is not None else None,
@@ -594,6 +659,60 @@ class Filter:
 
         clipped_dt = min(dt, self._max_prediction_dt_s)
         self._filter.predict(dt=clipped_dt, timestamp=timestamp)
+        self._apply_control_prediction(clipped_dt, timestamp)
+
+    def _apply_control_prediction(self, dt: float, timestamp: float) -> None:
+        self._active_command_used_latest_prediction = False
+        self._control_predicted_accel_mps2 = None
+        self._control_predicted_yaw_rate_radps = None
+        self._control_input_age_s = None
+        if self._tracking_mode != TRACKING_MODE_ACTIVE:
+            self._control_prediction_reason = "passive tracking mode"
+            return
+        if not self._enable_control_input_prediction:
+            self._control_prediction_reason = "control input prediction disabled"
+            return
+        if self._latest_control_input is None:
+            self._control_prediction_reason = "no control input"
+            return
+
+        age = max(0.0, float(timestamp) - float(self._latest_control_input.timestamp))
+        self._control_input_age_s = age
+        if age > max(0.0, self._control_timeout_s):
+            self._control_prediction_reason = "control input timed out"
+            return
+
+        snapshot = self._filter.snapshot()
+        if snapshot is None:
+            self._control_prediction_reason = "filter not initialized"
+            return
+
+        throttle = self._clamp(float(self._latest_control_input.throttle), 0.0, 1.0)
+        brake = self._clamp(float(self._latest_control_input.brake), 0.0, 1.0)
+        steer = self._clamp(float(self._latest_control_input.steer), -1.0, 1.0)
+        accel = throttle * max(0.0, self._control_accel_gain) - brake * max(0.0, self._control_brake_decel_gain)
+        if self._latest_control_input.reverse:
+            accel = -accel
+        speed_delta = self._clamp(accel * max(0.0, dt), -self._max_control_speed_delta, self._max_control_speed_delta)
+
+        steer_angle_rad = steer * math.radians(AUTONOMOUS_CONTROL.max_steer_angle_deg)
+        yaw_rate_target = 0.0
+        if abs(steer_angle_rad) > 1.0e-6 and snapshot.speed > 0.05:
+            yaw_rate_target = snapshot.speed / max(0.1, float(AUTONOMOUS_CONTROL.wheel_base_m)) * math.tan(steer_angle_rad)
+        yaw_rate_delta = (yaw_rate_target - snapshot.yaw_rate_radps) * max(0.0, self._control_steer_yaw_gain)
+        yaw_rate_delta = self._clamp(
+            yaw_rate_delta,
+            -self._max_control_yaw_rate_delta,
+            self._max_control_yaw_rate_delta,
+        )
+
+        if self._filter.apply_control_prediction(speed_delta, yaw_rate_delta):
+            self._active_command_used_latest_prediction = True
+            self._control_predicted_accel_mps2 = accel
+            self._control_predicted_yaw_rate_radps = snapshot.yaw_rate_radps + yaw_rate_delta
+            self._control_prediction_reason = "control prediction applied"
+        else:
+            self._control_prediction_reason = "control prediction rejected by filter core"
 
     def _refresh_state_from_filter(self) -> Optional[EgoState]:
         snapshot = self._filter.snapshot()

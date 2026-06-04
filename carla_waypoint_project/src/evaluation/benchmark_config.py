@@ -390,7 +390,7 @@ def validate_benchmark_config(
     if not config.selected_filter:
         errors.append("Select a filter.")
     elif config.selected_filter not in set(valid_filter_ids):
-        errors.append(f"Unsupported filter: {config.selected_filter}.")
+        errors.append(f"Filter is not benchmark-selectable: {config.selected_filter}.")
     if not config.selected_routes:
         errors.append("Select at least one saved test route.")
     if _normalize_tracking_mode(config.tracking_mode) != config.tracking_mode:

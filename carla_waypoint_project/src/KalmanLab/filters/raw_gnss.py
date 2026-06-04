@@ -23,7 +23,13 @@ FILTER_INFO = {
     "process_model": "None",
     "measurement_model": "Projected GNSS latitude/longitude",
     "description": "Projected raw GNSS position with speed and yaw estimated from successive fixes.",
+    "model_type": "RAW_GNSS",
+    "motion_info_fields": (),
     "safe_for_autonomous_control": False,
+    "active_tracking_supported": False,
+    "benchmark_selectable": False,
+    "experimental": False,
+    "requires_raw_imu": False,
 }
 
 

@@ -24,7 +24,6 @@ from src.control.driving_behavior import (
     DrivingBehaviorConfig,
     SpeedPlan,
 )
-from src.control.motion_info import MotionInfo
 from src.control.vehicle_controller import VehicleController
 from src.control.waypoint_tracker import TrackingStatus, WaypointTracker
 from src.core.carla_client import CarlaClientManager
@@ -43,6 +42,7 @@ from src.evaluation.filter_performance import FilterPerformanceLogger
 from src.evaluation.route_test_runner import RouteTestRunner
 from src.evaluation.test_route_store import TestRouteStore
 from src.localization.gnss_projection import GnssDiagnostics, GnssLocalProjector
+from src.localization.motion_info import MotionInfo
 from src.localization.state_estimator import (
     EgoState,
     GroundTruthStateProvider,
@@ -762,7 +762,12 @@ class SimulationApp:
         ]
         line_y = summary_rect.top + 7
         for line in summary_lines:
-            color = DASHBOARD.warning_color if "unsafe" in line.lower() or "unsupported" in line.lower() else DASHBOARD.text_color
+            lower_line = line.lower()
+            color = (
+                DASHBOARD.warning_color
+                if "unsafe" in lower_line or "unsupported" in lower_line or "experimental" in lower_line
+                else DASHBOARD.text_color
+            )
             self._draw_overlay_text(surface, line, (summary_rect.left + 8, line_y), self._filter_overlay_small_font, color, summary_rect.width - 16)
             line_y += 17
         y = summary_rect.bottom + 8
@@ -903,8 +908,12 @@ class SimulationApp:
         lines = [
             "Filters:",
             f"Active: {info.get('name', 'none')} ({info.get('id', 'n/a')})",
+            f"Model type: {info.get('model_type', 'n/a')}",
             f"Type: {info.get('type', 'n/a')}",
             f"Safe for autonomous: {'YES' if info.get('safe_for_autonomous_control', True) else 'NO'}",
+            f"Benchmark selectable: {'YES' if info.get('benchmark_selectable', info.get('safe_for_autonomous_control', True)) else 'NO'}",
+            f"Active tracking supported: {'YES' if info.get('active_tracking_supported', False) else 'NO'}",
+            f"Experimental: {'YES' if info.get('experimental', False) else 'NO'}",
         ]
         warning = self._active_filter_warning()
         if warning:
@@ -1083,10 +1092,12 @@ class SimulationApp:
         tracking_message = self._filter_manager.tracking_mode_message
         if "unsupported" in tracking_message.lower():
             return tracking_message
-        if self._active_filter_safe_for_autonomous():
-            return ""
         info = self._filter_manager.get_active_filter_info()
         note = str(info.get("autonomous_control_note") or "")
+        if self._active_filter_safe_for_autonomous() and bool(info.get("experimental", False)):
+            return note or "Selected filter is experimental; validate signs/tuning before relying on benchmark scores."
+        if self._active_filter_safe_for_autonomous():
+            return ""
         if note:
             return note
         filter_name = str(info.get("name") or self._filter_manager.active_filter_id or "Active filter")
@@ -1240,8 +1251,10 @@ class SimulationApp:
     def _feed_filter_control_input(self, applied_control: "carla.VehicleControl", source: str) -> None:
         if self._filter_manager is None:
             return
-        state = self._latest_ground_truth_state
-        timestamp = state.timestamp if state is not None else time.monotonic()
+        # Avoid ground-truth leakage: active-tracking filters may use this as a
+        # control input, so speed/yaw come only from the current estimate.
+        state = self._latest_estimated_state
+        timestamp = self._filter_control_timestamp(state)
         control_input = FilterControlInput(
             timestamp=float(timestamp),
             throttle=float(getattr(applied_control, "throttle", 0.0)),
@@ -1254,6 +1267,14 @@ class SimulationApp:
             yaw_deg=float(state.yaw) if state is not None else None,
         )
         self._filter_manager.process_control(control_input)
+
+    def _filter_control_timestamp(self, estimated_state: Optional[EgoState]) -> float:
+        if estimated_state is not None:
+            return float(estimated_state.timestamp)
+        try:
+            return float(self._client_manager.world.get_snapshot().timestamp.elapsed_seconds)
+        except Exception:
+            return time.monotonic()
 
     def _reset_driving_behavior(self) -> None:
         initial_speed = self._latest_ground_truth_state.speed if self._latest_ground_truth_state is not None else 0.0

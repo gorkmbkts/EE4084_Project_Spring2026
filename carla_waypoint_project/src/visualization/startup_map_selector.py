@@ -572,10 +572,10 @@ class StartupMapSelector:
         return None
 
     def _refresh_test_setup(self) -> None:
-        self._setup_filter_records = [
-            record for record in discover_filters() if record.valid and record.safe_for_autonomous_control
-        ]
-        if self._setup_filter_records and not self._selected_filter_id:
+        self._setup_filter_records = [record for record in discover_filters() if record.valid]
+        if self._setup_filter_records and not any(
+            record.filter_id == self._selected_filter_id for record in self._setup_filter_records
+        ):
             self._selected_filter_id = self._setup_filter_records[0].filter_id
         self._ensure_filter_tune_editor()
         self._route_items = load_available_test_routes([option.load_name or option.detail for option in self._options])
@@ -791,36 +791,56 @@ class StartupMapSelector:
         y = content.top + 34
         self._setup_filter_buttons.clear()
         if not self._setup_filter_records:
-            self._draw_text("No autonomous-safe filters found.", (content.left, y), self._font, DASHBOARD.warning_color, content.width)
+            self._draw_text("No valid filters found.", (content.left, y), self._font, DASHBOARD.warning_color, content.width)
             return
         for record in self._setup_filter_records:
-            button = pygame.Rect(content.left, y, content.width, 34)
+            button = pygame.Rect(content.left, y, content.width, 44)
             self._setup_filter_buttons[record.filter_id] = button
             active = record.filter_id == self._selected_filter_id
             pygame.draw.rect(self._surface, (35, 73, 53) if active else (24, 30, 39), button, border_radius=5)
             pygame.draw.rect(self._surface, DASHBOARD.success_color if active else DASHBOARD.panel_border_color, button, width=1, border_radius=5)
             label = f"{record.display_name} ({record.filter_id})"
-            self._draw_text(label, (button.left + 10, button.top + 8), self._button_font, DASHBOARD.title_color, button.width - 20)
-            y += 42
+            self._draw_text(label, (button.left + 10, button.top + 6), self._button_font, DASHBOARD.title_color, button.width - 20)
+            status = self._filter_capability_summary(record)
+            status_color = DASHBOARD.warning_color if "experimental" in status.lower() or "not safe" in status.lower() else DASHBOARD.muted_text_color
+            self._draw_text(status, (button.left + 10, button.top + 25), self._small_font, status_color, button.width - 20)
+            y += 52
         y += 8
         active = next((record for record in self._setup_filter_records if record.filter_id == self._selected_filter_id), None)
         if active is not None:
             lines = [
+                f"Model type: {active.filter_info.get('model_type', 'n/a')}",
                 f"Type: {active.filter_info.get('type')}",
                 f"State: {active.filter_info.get('state_vector')}",
                 f"Model: {active.filter_info.get('process_model')}",
                 f"Measurement: {active.filter_info.get('measurement_model')}",
+                f"Safe autonomous: {'YES' if active.safe_for_autonomous_control else 'NO'}",
+                f"Active tracking: {'YES' if active.active_tracking_supported else 'NO'}",
+                f"Benchmark selectable: {'YES' if active.benchmark_selectable else 'NO'}",
+                f"Experimental: {'YES' if active.experimental else 'NO'}",
             ]
+            note = str(active.filter_info.get("autonomous_control_note") or "")
+            if note:
+                lines.append(note)
             for line in lines:
                 if y + 16 > content.bottom:
                     break
-                self._draw_text(line, (content.left, y), self._small_font, DASHBOARD.text_color, content.width)
+                color = DASHBOARD.warning_color if "NO" in line or "Experimental: YES" in line else DASHBOARD.text_color
+                self._draw_text(line, (content.left, y), self._small_font, color, content.width)
                 y += 18
         if y + 58 <= content.bottom:
             y += 8
             self._draw_text("Tracking Mode", (content.left, y), self._small_font, DASHBOARD.muted_text_color, content.width)
             y += 20
             self._draw_tracking_mode_buttons(pygame.Rect(content.left, y, content.width, 28))
+
+    @staticmethod
+    def _filter_capability_summary(record: object) -> str:
+        safe = "safe" if getattr(record, "safe_for_autonomous_control", False) else "not safe"
+        tracking = "active" if getattr(record, "active_tracking_supported", False) else "passive"
+        selectable = "bench" if getattr(record, "benchmark_selectable", False) else "no bench"
+        experimental = "experimental" if getattr(record, "experimental", False) else "stable"
+        return f"{safe} | {tracking} | {selectable} | {experimental}"
 
     def _draw_filter_tune_panel(self, rect: pygame.Rect) -> None:
         self._filter_tune_panel_rect = rect.copy()
@@ -951,7 +971,7 @@ class StartupMapSelector:
         )
         errors = validate_benchmark_config(
             config,
-            valid_filter_ids=[record.filter_id for record in self._setup_filter_records],
+            valid_filter_ids=[record.filter_id for record in self._setup_filter_records if record.benchmark_selectable],
             available_maps=[option.load_name or option.detail for option in self._options],
         )
         if errors:

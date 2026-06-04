@@ -44,8 +44,13 @@ FILTER_INFO = {
     "process_model": "Constant Velocity with optional IMU acceleration control input",
     "measurement_model": "GNSS position x/y",
     "description": "Linear constant-velocity Kalman filter using noisy GNSS position and optional IMU-assisted prediction.",
+    "model_type": "CV",
+    "motion_info_fields": (),
     "safe_for_autonomous_control": True,
     "active_tracking_supported": True,
+    "benchmark_selectable": True,
+    "experimental": False,
+    "requires_raw_imu": False,
 }
 
 

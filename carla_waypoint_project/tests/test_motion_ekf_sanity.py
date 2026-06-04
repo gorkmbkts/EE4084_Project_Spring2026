@@ -12,8 +12,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.KalmanLab.filters import ctra_ekf, ctrv_ekf
-from src.control.motion_info import motion_info_from_diagnostics
+from src.KalmanLab.registry import discover_filters
 from src.localization.gnss_projection import LocalGnssMeasurement
+from src.localization.motion_info import motion_info_from_diagnostics
 
 
 def assert_close(actual: float, expected: float, tolerance: float = 1.0e-6) -> None:
@@ -105,6 +106,50 @@ def test_filter_wrappers_initialize_from_gnss_and_imu() -> None:
             raise AssertionError(f"{module.__name__} did not expose MotionInfo")
 
 
+def test_registry_capabilities() -> None:
+    records = {record.filter_id: record for record in discover_filters() if record.valid}
+    for filter_id in ("ctrv_ekf", "ctra_ekf"):
+        record = records.get(filter_id)
+        if record is None:
+            raise AssertionError(f"{filter_id} not discovered")
+        if not record.benchmark_selectable:
+            raise AssertionError(f"{filter_id} not benchmark selectable")
+        if not record.active_tracking_supported:
+            raise AssertionError(f"{filter_id} does not advertise active tracking")
+        if record.filter_class is None or not hasattr(record.filter_class, "process_control"):
+            raise AssertionError(f"{filter_id} has no process_control")
+
+
+def test_startup_setup_does_not_hide_experimental_filters() -> None:
+    startup_source = (PROJECT_ROOT / "src" / "visualization" / "startup_map_selector.py").read_text(encoding="utf-8")
+    if "record.valid and record.safe_for_autonomous_control" in startup_source:
+        raise AssertionError("startup setup still filters by autonomous safety")
+    if "record.valid" not in startup_source:
+        raise AssertionError("startup setup no longer filters valid plugins")
+
+
+def test_motion_info_uses_plugin_model_type() -> None:
+    info = motion_info_from_diagnostics(
+        {"filter_id": "new_plugin", "yaw_rate_radps": 0.4},
+        {"id": "new_plugin", "model_type": "BICYCLE_EKF"},
+    )
+    if info is None:
+        raise AssertionError("motion info was not extracted")
+    if info.model_type != "BICYCLE_EKF":
+        raise AssertionError(f"unexpected model type: {info.model_type}")
+
+
+def test_filter_control_input_avoids_ground_truth_speed_yaw() -> None:
+    app_source = (PROJECT_ROOT / "src" / "core" / "app.py").read_text(encoding="utf-8")
+    start = app_source.index("def _feed_filter_control_input")
+    end = app_source.index("    def _filter_control_timestamp", start)
+    body = app_source[start:end]
+    if "_latest_ground_truth_state" in body:
+        raise AssertionError("_feed_filter_control_input references ground truth")
+    if "_latest_estimated_state" not in body:
+        raise AssertionError("_feed_filter_control_input does not use estimated state")
+
+
 def run_all() -> None:
     test_angle_wrapping()
     test_ctrv_straight_motion()
@@ -113,6 +158,10 @@ def run_all() -> None:
     test_wrapped_yaw_update()
     test_gyro_yaw_rate_update()
     test_filter_wrappers_initialize_from_gnss_and_imu()
+    test_registry_capabilities()
+    test_startup_setup_does_not_hide_experimental_filters()
+    test_motion_info_uses_plugin_model_type()
+    test_filter_control_input_avoids_ground_truth_speed_yaw()
 
 
 if __name__ == "__main__":

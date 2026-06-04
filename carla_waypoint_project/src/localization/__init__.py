@@ -1,5 +1,6 @@
 """Localization interfaces and providers."""
 
+from .motion_info import MotionInfo, motion_info_from_diagnostics
 from .state_estimator import (
     EgoState,
     EgoStateProvider,
@@ -15,5 +16,7 @@ __all__ = [
     "EstimatedStateProvider",
     "GroundTruthStateProvider",
     "LocalizationStatus",
+    "MotionInfo",
     "StateEstimator",
+    "motion_info_from_diagnostics",
 ]

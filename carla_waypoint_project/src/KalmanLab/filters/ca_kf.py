@@ -27,8 +27,13 @@ FILTER_INFO = {
     "process_model": "Constant Acceleration",
     "measurement_model": "GNSS position x/y + IMU acceleration x/y",
     "description": "Linear constant-acceleration Kalman filter using noisy GNSS and IMU acceleration.",
+    "model_type": "CA",
+    "motion_info_fields": (),
     "safe_for_autonomous_control": True,
     "active_tracking_supported": True,
+    "benchmark_selectable": True,
+    "experimental": False,
+    "requires_raw_imu": False,
 }
 
 

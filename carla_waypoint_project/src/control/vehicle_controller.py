@@ -6,7 +6,7 @@ import math
 from typing import Optional
 
 from config.settings import AUTONOMOUS_CONTROL
-from src.control.motion_info import MotionInfo
+from src.localization.motion_info import MotionInfo
 from src.localization.state_estimator import EgoState
 from src.utils.carla_import import ensure_carla_import
 

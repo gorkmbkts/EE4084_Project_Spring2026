@@ -34,8 +34,13 @@ FILTER_INFO = {
     "process_model": "Nonlinear constant-heading constant-speed kinematic model",
     "measurement_model": "GNSS position x/y + IMU compass yaw",
     "description": "EKF using an EgoState-like state with nonlinear x/y propagation from yaw and speed.",
+    "model_type": "EGO_KINEMATIC",
+    "motion_info_fields": (),
     "safe_for_autonomous_control": True,
     "active_tracking_supported": False,
+    "benchmark_selectable": True,
+    "experimental": False,
+    "requires_raw_imu": False,
 }
 
 

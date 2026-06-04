@@ -70,7 +70,16 @@ def _validate_module(path: Path, module_name: str, module: ModuleType) -> Filter
         return _invalid_record(path, module_name, f"FILTER_INFO missing fields: {', '.join(missing)}.")
 
     normalized_info: dict[str, Any] = dict(filter_info)
-    normalized_info.setdefault("safe_for_autonomous_control", True)
+    safe_for_autonomous = bool(normalized_info.get("safe_for_autonomous_control", True))
+    normalized_info["safe_for_autonomous_control"] = safe_for_autonomous
+    normalized_info.setdefault("active_tracking_supported", hasattr(filter_class, "process_control"))
+    # For older filters, benchmark selection followed autonomous safety.  New
+    # experimental filters can opt in explicitly without changing UI code.
+    normalized_info.setdefault("benchmark_selectable", safe_for_autonomous)
+    normalized_info.setdefault("experimental", False)
+    normalized_info.setdefault("requires_raw_imu", False)
+    normalized_info.setdefault("motion_info_fields", ())
+    normalized_info.setdefault("model_type", str(normalized_info.get("id") or module_name))
     return FilterPluginRecord(
         module_name=module_name,
         file_path=path,

@@ -53,6 +53,12 @@ def build_benchmark_metadata(
     active_filter_process_model = str(filter_info.get("process_model") or "n/a")
     active_filter_measurement_model = str(filter_info.get("measurement_model") or "n/a")
     active_filter_description = str(filter_info.get("description") or "")
+    active_filter_model_type = str(filter_info.get("model_type") or "n/a")
+    active_filter_safe = bool(filter_info.get("safe_for_autonomous_control", True))
+    active_filter_active_tracking = bool(filter_info.get("active_tracking_supported", False))
+    active_filter_benchmark_selectable = bool(filter_info.get("benchmark_selectable", active_filter_safe))
+    active_filter_experimental = bool(filter_info.get("experimental", False))
+    active_filter_requires_raw_imu = bool(filter_info.get("requires_raw_imu", False))
     raw_gnss_note = "Raw noisy GNSS is logged as a localization baseline and is not the default closed-loop control filter."
     normalized_active_map_id = active_map_id or normalize_map_name(map_name)
     normalized_route_map_id = normalize_map_name(route.map_name)
@@ -92,21 +98,33 @@ def build_benchmark_metadata(
         "active_filter_id": active_filter_id,
         "active_filter_name": active_filter_name,
         "active_filter_type": active_filter_type,
+        "active_filter_model_type": active_filter_model_type,
         "active_filter_state_vector": active_filter_state_vector,
         "active_filter_process_model": active_filter_process_model,
         "active_filter_measurement_model": active_filter_measurement_model,
         "active_filter_description": active_filter_description,
+        "active_filter_safe_for_autonomous_control": active_filter_safe,
+        "active_filter_active_tracking_supported": active_filter_active_tracking,
+        "active_filter_benchmark_selectable": active_filter_benchmark_selectable,
+        "active_filter_experimental": active_filter_experimental,
+        "active_filter_requires_raw_imu": active_filter_requires_raw_imu,
         "active_filter_tune": filter_tune,
         "raw_gnss_baseline_note": raw_gnss_note,
         "active_filter": {
             "id": active_filter_id,
             "name": active_filter_name,
             "type": active_filter_type,
+            "model_type": active_filter_model_type,
             "state_vector": active_filter_state_vector,
             "process_model": active_filter_process_model,
             "measurement_model": active_filter_measurement_model,
             "description": active_filter_description,
-            "safe_for_autonomous_control": bool(filter_info.get("safe_for_autonomous_control", True)),
+            "safe_for_autonomous_control": active_filter_safe,
+            "active_tracking_supported": active_filter_active_tracking,
+            "benchmark_selectable": active_filter_benchmark_selectable,
+            "experimental": active_filter_experimental,
+            "requires_raw_imu": active_filter_requires_raw_imu,
+            "motion_info_fields": tuple(filter_info.get("motion_info_fields", ())),
             "tracking_mode": tracking_mode,
             "active_control_input_used": bool(active_control_input_used),
             "recommendation_applied": bool(filter_info.get("recommendation_applied", False)),

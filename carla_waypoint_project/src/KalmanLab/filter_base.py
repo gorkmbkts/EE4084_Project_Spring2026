@@ -76,6 +76,18 @@ class FilterPluginRecord:
     def safe_for_autonomous_control(self) -> bool:
         return bool(self.filter_info.get("safe_for_autonomous_control", True))
 
+    @property
+    def benchmark_selectable(self) -> bool:
+        return bool(self.filter_info.get("benchmark_selectable", self.safe_for_autonomous_control))
+
+    @property
+    def active_tracking_supported(self) -> bool:
+        return bool(self.filter_info.get("active_tracking_supported", False))
+
+    @property
+    def experimental(self) -> bool:
+        return bool(self.filter_info.get("experimental", False))
+
 
 class LocalizationFilter(Protocol):
     """Duck-typed plugin surface consumed by ``FilterManager``."""
