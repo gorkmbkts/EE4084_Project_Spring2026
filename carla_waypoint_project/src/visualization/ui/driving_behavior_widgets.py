@@ -51,6 +51,15 @@ class BehaviorTuningPanel:
             _SliderSpec("Steer smooth", "steering_smoothing", 0.0, 0.9, "", 2),
             _SliderSpec("Actuator delay", "actuator_delay_s", 0.0, 0.35, "s", 2),
             _SliderSpec("Imperfection", "actuator_noise", 0.0, 0.05, "", 3),
+            _SliderSpec("Model-aware ctrl", "enable_model_aware_control", 0.0, 1.0, "", 0),
+            _SliderSpec("Yaw-rate FF", "yaw_rate_feedforward_gain", 0.0, 1.0, "x", 2),
+            _SliderSpec("Yaw-rate FB", "yaw_rate_feedback_gain", 0.0, 1.0, "x", 2),
+            _SliderSpec("Model steer cap", "max_model_steer_correction", 0.0, 0.5, "", 2),
+            _SliderSpec("Model min speed", "min_model_control_speed_mps", 0.1, 5.0, "m/s", 1),
+            _SliderSpec("Motion alpha", "motion_info_lowpass_alpha", 0.02, 1.0, "", 2),
+            _SliderSpec("Motion yaw cap", "max_abs_motion_yaw_rate_radps", 0.2, 5.0, "rad/s", 2),
+            _SliderSpec("Model speed guard", "enable_model_speed_guard", 0.0, 1.0, "", 0),
+            _SliderSpec("Model speed factor", "model_curvature_speed_factor", 0.1, 1.5, "x", 2),
         )
 
     def set_rect(self, rect: pygame.Rect) -> None:

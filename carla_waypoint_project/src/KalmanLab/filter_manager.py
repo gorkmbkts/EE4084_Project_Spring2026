@@ -15,6 +15,7 @@ from src.KalmanLab.filter_base import (
     normalize_tracking_mode,
 )
 from src.KalmanLab.registry import discover_filters
+from src.control.motion_info import MotionInfo, motion_info_from_diagnostics
 from src.localization.gnss_projection import GnssLocalProjector, LocalGnssMeasurement
 from src.localization.state_estimator import EgoState, LocalizationStatus
 
@@ -322,6 +323,10 @@ class FilterManager:
         diagnostics.setdefault("active_control_input_used", self._active_control_input_used)
         diagnostics.setdefault("latest_control_input", self._control_input_dict(self._last_control_input))
         return diagnostics
+
+    def get_motion_info(self) -> Optional[MotionInfo]:
+        """Return optional model-aware motion data from active filter diagnostics."""
+        return motion_info_from_diagnostics(self.get_diagnostics())
 
     def _call_filter_method(self, method_name: str, measurement: object) -> bool:
         if self._active_filter is None:

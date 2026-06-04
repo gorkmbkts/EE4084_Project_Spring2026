@@ -177,6 +177,15 @@ BEHAVIOR_SPECS: tuple[ParameterSpec, ...] = (
     ParameterSpec("steering_response_gain", "Steering gain", 0.4, 1.8, "x", 2, "Actuator"),
     ParameterSpec("max_throttle_rate_per_s", "Throttle rate", 0.2, 4.0, "/s", 1, "Actuator"),
     ParameterSpec("max_brake_rate_per_s", "Brake rate", 0.2, 5.0, "/s", 1, "Actuator"),
+    ParameterSpec("enable_model_aware_control", "Model-aware ctrl", 0.0, 1.0, "", 0, "Model-aware control"),
+    ParameterSpec("yaw_rate_feedforward_gain", "Yaw-rate FF", 0.0, 1.0, "x", 2, "Model-aware control"),
+    ParameterSpec("yaw_rate_feedback_gain", "Yaw-rate FB", 0.0, 1.0, "x", 2, "Model-aware control"),
+    ParameterSpec("max_model_steer_correction", "Model steer cap", 0.0, 0.5, "", 2, "Model-aware control"),
+    ParameterSpec("min_model_control_speed_mps", "Model min speed", 0.1, 5.0, "m/s", 1, "Model-aware control"),
+    ParameterSpec("motion_info_lowpass_alpha", "Motion alpha", 0.02, 1.0, "", 2, "Model-aware control"),
+    ParameterSpec("max_abs_motion_yaw_rate_radps", "Motion yaw cap", 0.2, 5.0, "rad/s", 2, "Model-aware control"),
+    ParameterSpec("enable_model_speed_guard", "Model speed guard", 0.0, 1.0, "", 0, "Model-aware control"),
+    ParameterSpec("model_curvature_speed_factor", "Model speed factor", 0.1, 1.5, "x", 2, "Model-aware control"),
 )
 
 
@@ -225,6 +234,15 @@ def _base_behavior_values() -> dict[str, float]:
         "safe_cornering_factor": 1.0,
         "max_throttle_rate_per_s": 1.8,
         "max_brake_rate_per_s": 2.4,
+        "enable_model_aware_control": 0.0,
+        "yaw_rate_feedforward_gain": 0.25,
+        "yaw_rate_feedback_gain": 0.0,
+        "max_model_steer_correction": 0.15,
+        "min_model_control_speed_mps": 1.0,
+        "motion_info_lowpass_alpha": 0.25,
+        "max_abs_motion_yaw_rate_radps": 2.5,
+        "enable_model_speed_guard": 0.0,
+        "model_curvature_speed_factor": 0.5,
     }
 
 

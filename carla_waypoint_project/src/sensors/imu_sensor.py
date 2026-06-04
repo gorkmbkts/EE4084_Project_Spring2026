@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from threading import Lock
 from typing import Optional
 
@@ -11,6 +12,13 @@ from src.evaluation.benchmark_config import SensorNoiseConfig
 from src.utils.carla_import import ensure_carla_import
 
 carla = ensure_carla_import()
+
+
+def _normalize_angle_rad(angle: float) -> float:
+    wrapped = (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+    if wrapped == -math.pi and angle > 0.0:
+        return math.pi
+    return float(wrapped)
 
 
 @dataclass(frozen=True)
@@ -22,6 +30,33 @@ class ImuMeasurement:
     compass: float
     frame: int
     timestamp: float
+
+    @property
+    def raw_accelerometer(self) -> tuple[float, float, float]:
+        """Return the unmodified CARLA accelerometer tuple."""
+        return self.accelerometer
+
+    @property
+    def raw_gyroscope(self) -> tuple[float, float, float]:
+        """Return the unmodified CARLA gyroscope tuple."""
+        return self.gyroscope
+
+    @property
+    def gyro_z_radps(self) -> float:
+        """Raw CARLA gyroscope z-axis value in rad/s."""
+        return float(self.gyroscope[2])
+
+    @property
+    def accel_x_mps2(self) -> float:
+        """Raw CARLA accelerometer x-axis value in m/s^2."""
+        return float(self.accelerometer[0])
+
+    @property
+    def compass_yaw_rad(self) -> Optional[float]:
+        """CARLA compass converted with the existing yaw convention."""
+        if not math.isfinite(float(self.compass)):
+            return None
+        return _normalize_angle_rad(float(self.compass) - math.pi / 2.0)
 
 
 class ImuSensor:

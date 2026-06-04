@@ -24,6 +24,7 @@ from src.control.driving_behavior import (
     DrivingBehaviorConfig,
     SpeedPlan,
 )
+from src.control.motion_info import MotionInfo
 from src.control.vehicle_controller import VehicleController
 from src.control.waypoint_tracker import TrackingStatus, WaypointTracker
 from src.core.carla_client import CarlaClientManager
@@ -142,13 +143,13 @@ class SimulationApp:
         self._performance_logger = FilterPerformanceLogger()
         self.route_planner: Optional[RoutePlanner] = None
         self.waypoint_tracker = WaypointTracker()
-        self.autonomous_controller = VehicleController()
         self.driving_behavior_config = DrivingBehaviorConfig()
         self.sensor_noise_config = (
             benchmark_config.sensor_noise_config if benchmark_config is not None else SensorNoiseConfig()
         )
         if benchmark_config is not None:
             apply_behavior_values(self.driving_behavior_config, benchmark_config.vehicle_behavior_config)
+        self.autonomous_controller = VehicleController(behavior_config=self.driving_behavior_config)
         self.speed_planner = CurvatureSpeedPlanner(self.driving_behavior_config)
         self.actuator_realism = ActuatorRealism(self.driving_behavior_config)
 
@@ -159,6 +160,7 @@ class SimulationApp:
         self._latest_ground_truth_state: Optional[EgoState] = None
         self._latest_estimated_state: Optional[EgoState] = None
         self._latest_localization_status: Optional[LocalizationStatus] = None
+        self._latest_motion_info: Optional[MotionInfo] = None
         self._latest_tracking = self._empty_tracking_status()
         self._latest_speed_plan: SpeedPlan = self.speed_planner.latest_plan
         self._latest_requested_control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.0)
@@ -1024,6 +1026,9 @@ class SimulationApp:
                 lines.append(f"state: {shown}")
             else:
                 lines.append(f"{key}: {self._format_debug_value(value)}")
+        lines.append("Model-aware control diagnostics:")
+        for key, value in self.autonomous_controller.latest_model_control_diagnostics.items():
+            lines.append(f"{key}: {self._format_debug_value(value)}")
         return lines
 
     def _status_bar_text(self) -> str:
@@ -1080,7 +1085,12 @@ class SimulationApp:
             return tracking_message
         if self._active_filter_safe_for_autonomous():
             return ""
-        return "Raw GNSS is noisy and may be unsafe for closed-loop control."
+        info = self._filter_manager.get_active_filter_info()
+        note = str(info.get("autonomous_control_note") or "")
+        if note:
+            return note
+        filter_name = str(info.get("name") or self._filter_manager.active_filter_id or "Active filter")
+        return f"{filter_name} is not marked safe for closed-loop autonomous control."
 
     @staticmethod
     def _ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
@@ -1132,6 +1142,7 @@ class SimulationApp:
                 self._latest_ground_truth_state = ground_truth_provider.get_state()
                 self._latest_estimated_state = filter_manager.update()
                 self._latest_localization_status = filter_manager.get_status(self._latest_ground_truth_state)
+                self._latest_motion_info = filter_manager.get_motion_info()
                 self._update_route_activation_state()
                 self._latest_state = self._state_for_tracking_and_control()
                 if self._can_update_route_tracking() and self._latest_state is not None:
@@ -1173,6 +1184,7 @@ class SimulationApp:
                             target_waypoint=self._latest_tracking.target_waypoint,
                             route_completed=self._latest_tracking.completed,
                             target_speed_mps=self._latest_speed_plan.target_speed_mps,
+                            motion_info=self._latest_motion_info,
                         )
                         applied_control = self.actuator_realism.apply(control, dt_seconds)
                         vehicle.apply_control(applied_control)
@@ -1442,7 +1454,7 @@ class SimulationApp:
             return
         if not self._active_filter_safe_for_autonomous():
             self._planner_status = "Active filter is unsafe for autonomous benchmark control"
-            self._control_status_text = "Raw GNSS is noisy and may be unsafe for closed-loop control."
+            self._control_status_text = self._active_filter_warning()
             return
 
         route = self._test_route_store.get_current_route()
@@ -1645,7 +1657,7 @@ class SimulationApp:
             return
         if not self._active_filter_safe_for_autonomous():
             self._planner_status = "Autonomous blocked: active filter is unsafe"
-            self._control_status_text = "Raw GNSS is noisy and may be unsafe for closed-loop control."
+            self._control_status_text = self._active_filter_warning()
             return
         if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
             self._pending_start_autonomous = True
@@ -1665,7 +1677,7 @@ class SimulationApp:
             return
         if start_autonomous and not self._active_filter_safe_for_autonomous():
             self._planner_status = "Autonomous blocked: active filter is unsafe"
-            self._control_status_text = "Raw GNSS is noisy and may be unsafe for closed-loop control."
+            self._control_status_text = self._active_filter_warning()
             return
 
         endpoints = self._map_selector.endpoints

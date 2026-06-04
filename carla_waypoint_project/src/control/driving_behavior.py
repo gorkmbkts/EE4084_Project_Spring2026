@@ -38,6 +38,15 @@ class DrivingBehaviorConfig:
     safe_cornering_factor: float = 1.0
     max_throttle_rate_per_s: float = 1.8
     max_brake_rate_per_s: float = 2.4
+    enable_model_aware_control: float = 0.0
+    yaw_rate_feedforward_gain: float = 0.25
+    yaw_rate_feedback_gain: float = 0.0
+    max_model_steer_correction: float = 0.15
+    min_model_control_speed_mps: float = 1.0
+    motion_info_lowpass_alpha: float = 0.25
+    max_abs_motion_yaw_rate_radps: float = 2.5
+    enable_model_speed_guard: float = 0.0
+    model_curvature_speed_factor: float = 0.5
 
 
 @dataclass(frozen=True)
