@@ -7,6 +7,7 @@ import csv
 from datetime import datetime
 from enum import Enum
 import json
+import math
 from pathlib import Path
 import re
 import time
@@ -631,8 +632,9 @@ class RouteTestRunner:
     def _build_aggregate_summary(self) -> dict[str, object]:
         config = self._config.to_dict() if self._config is not None else {}
         successful = [summary for summary in self._route_summaries if summary.get("route_completion_success")]
-        filtered_values = _finite_summary_values(self._route_summaries, "filtered_rmse_m")
-        raw_values = _finite_summary_values(self._route_summaries, "raw_gnss_rmse_m")
+        primary_rows = [_primary_metric_row(summary) for summary in self._route_summaries]
+        filtered_values = _finite_row_values(primary_rows, "filtered_rmse_m")
+        raw_values = _finite_row_values(primary_rows, "raw_gnss_rmse_m")
         return {
             "run_id": self._config.run_id if self._config is not None else self._benchmark_id,
             "created_at": self._config.created_at if self._config is not None else None,
@@ -649,8 +651,13 @@ class RouteTestRunner:
             "vehicle_behavior_config": config.get("vehicle_behavior_config"),
             "random_seed": config.get("random_seed"),
             "project_commit": (config.get("metadata") or {}).get("project_commit") if isinstance(config.get("metadata"), dict) else None,
+            "primary_metric_source": "driving_preferred",
             "mean_filtered_rmse_m": _mean(filtered_values),
             "mean_raw_gnss_rmse_m": _mean(raw_values),
+            "mean_driving_filtered_rmse_m": _mean(_finite_summary_values(self._route_summaries, "driving_filtered_rmse_m")),
+            "mean_driving_raw_gnss_rmse_m": _mean(_finite_summary_values(self._route_summaries, "driving_raw_gnss_rmse_m")),
+            "mean_overall_filtered_rmse_m": _mean(_finite_summary_values(self._route_summaries, "filtered_rmse_m")),
+            "mean_overall_raw_gnss_rmse_m": _mean(_finite_summary_values(self._route_summaries, "raw_gnss_rmse_m")),
             "route_summaries": self._route_summaries,
             "segment_rmse_summary": self._aggregate_segment_metrics(),
         }
@@ -666,6 +673,7 @@ class RouteTestRunner:
             "attempts_used",
             "max_attempts",
             "failure_reasons",
+            "primary_metric_source",
             "filtered_rmse_m",
             "raw_gnss_rmse_m",
             "improvement_percent",
@@ -673,6 +681,20 @@ class RouteTestRunner:
             "yaw_rmse_deg",
             "mean_nees",
             "mean_nis",
+            "driving_filtered_rmse_m",
+            "driving_raw_gnss_rmse_m",
+            "driving_improvement_percent",
+            "driving_speed_rmse_mps",
+            "driving_yaw_rmse_deg",
+            "driving_mean_nees",
+            "driving_mean_nis",
+            "overall_filtered_rmse_m",
+            "overall_raw_gnss_rmse_m",
+            "overall_improvement_percent",
+            "overall_speed_rmse_mps",
+            "overall_yaw_rmse_deg",
+            "overall_mean_nees",
+            "overall_mean_nis",
             "completion_time_s",
             "route_folder",
             "error",
@@ -681,11 +703,7 @@ class RouteTestRunner:
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writeheader()
             for summary in self._route_summaries:
-                filtered = _optional_float(summary.get("filtered_rmse_m"))
-                raw = _optional_float(summary.get("raw_gnss_rmse_m"))
-                improvement = None
-                if raw is not None and raw > 0.0 and filtered is not None:
-                    improvement = 100.0 * (raw - filtered) / raw
+                metrics = _primary_metric_row(summary)
                 writer.writerow(
                     {
                         "route_index": summary.get("route_index"),
@@ -697,13 +715,28 @@ class RouteTestRunner:
                         "attempts_used": summary.get("attempts_used"),
                         "max_attempts": summary.get("max_attempts"),
                         "failure_reasons": _failure_reasons_text(summary.get("failed_attempts")),
-                        "filtered_rmse_m": filtered,
-                        "raw_gnss_rmse_m": raw,
-                        "improvement_percent": improvement,
-                        "speed_rmse_mps": summary.get("speed_rmse_mps"),
-                        "yaw_rmse_deg": summary.get("yaw_rmse_deg"),
-                        "mean_nees": summary.get("mean_nees"),
-                        "mean_nis": summary.get("mean_nis"),
+                        "primary_metric_source": metrics.get("primary_metric_source"),
+                        "filtered_rmse_m": metrics.get("filtered_rmse_m"),
+                        "raw_gnss_rmse_m": metrics.get("raw_gnss_rmse_m"),
+                        "improvement_percent": metrics.get("improvement_percent"),
+                        "speed_rmse_mps": metrics.get("speed_rmse_mps"),
+                        "yaw_rmse_deg": metrics.get("yaw_rmse_deg"),
+                        "mean_nees": metrics.get("mean_nees"),
+                        "mean_nis": metrics.get("mean_nis"),
+                        "driving_filtered_rmse_m": metrics.get("driving_filtered_rmse_m"),
+                        "driving_raw_gnss_rmse_m": metrics.get("driving_raw_gnss_rmse_m"),
+                        "driving_improvement_percent": metrics.get("driving_improvement_percent"),
+                        "driving_speed_rmse_mps": metrics.get("driving_speed_rmse_mps"),
+                        "driving_yaw_rmse_deg": metrics.get("driving_yaw_rmse_deg"),
+                        "driving_mean_nees": metrics.get("driving_mean_nees"),
+                        "driving_mean_nis": metrics.get("driving_mean_nis"),
+                        "overall_filtered_rmse_m": metrics.get("overall_filtered_rmse_m"),
+                        "overall_raw_gnss_rmse_m": metrics.get("overall_raw_gnss_rmse_m"),
+                        "overall_improvement_percent": metrics.get("overall_improvement_percent"),
+                        "overall_speed_rmse_mps": metrics.get("overall_speed_rmse_mps"),
+                        "overall_yaw_rmse_deg": metrics.get("overall_yaw_rmse_deg"),
+                        "overall_mean_nees": metrics.get("overall_mean_nees"),
+                        "overall_mean_nis": metrics.get("overall_mean_nis"),
                         "completion_time_s": summary.get("completion_time_s"),
                         "route_folder": summary.get("route_folder"),
                         "error": summary.get("error"),
@@ -819,6 +852,7 @@ class RouteTestRunner:
             enriched["improvement_percent"] = 100.0 * (raw - filtered) / raw
         else:
             enriched["improvement_percent"] = None
+        enriched["primary_metric_source"] = _primary_metric_row(enriched).get("primary_metric_source")
         return enriched
 
     def _pending_route(self) -> Optional[SavedTestRoute]:
@@ -871,9 +905,58 @@ def _write_json(path: Path, data: dict[str, object]) -> None:
 
 
 def _optional_float(value: object) -> Optional[float]:
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return float(value)
     return None
+
+
+def _improvement_percent(raw_rmse: Optional[float], filtered_rmse: Optional[float]) -> Optional[float]:
+    if raw_rmse is None or raw_rmse <= 0.0 or filtered_rmse is None:
+        return None
+    return 100.0 * (raw_rmse - filtered_rmse) / raw_rmse
+
+
+def _prefer_driving_metric(summary: dict[str, object], driving_key: str, overall_key: str) -> Optional[float]:
+    driving = _optional_float(summary.get(driving_key))
+    if driving is not None:
+        return driving
+    return _optional_float(summary.get(overall_key))
+
+
+def _primary_metric_row(summary: dict[str, object]) -> dict[str, Optional[float] | str]:
+    driving_filtered = _optional_float(summary.get("driving_filtered_rmse_m"))
+    driving_raw = _optional_float(summary.get("driving_raw_gnss_rmse_m"))
+    overall_filtered = _optional_float(summary.get("filtered_rmse_m"))
+    overall_raw = _optional_float(summary.get("raw_gnss_rmse_m"))
+
+    primary_filtered = driving_filtered if driving_filtered is not None else overall_filtered
+    primary_raw = driving_raw if driving_raw is not None else overall_raw
+    primary_source = "driving" if driving_filtered is not None or driving_raw is not None else "overall_fallback"
+
+    return {
+        "primary_metric_source": primary_source,
+        "filtered_rmse_m": primary_filtered,
+        "raw_gnss_rmse_m": primary_raw,
+        "improvement_percent": _improvement_percent(primary_raw, primary_filtered),
+        "speed_rmse_mps": _prefer_driving_metric(summary, "driving_speed_rmse_mps", "speed_rmse_mps"),
+        "yaw_rmse_deg": _prefer_driving_metric(summary, "driving_yaw_rmse_deg", "yaw_rmse_deg"),
+        "mean_nees": _prefer_driving_metric(summary, "driving_mean_nees", "mean_nees"),
+        "mean_nis": _prefer_driving_metric(summary, "driving_mean_nis", "mean_nis"),
+        "driving_filtered_rmse_m": driving_filtered,
+        "driving_raw_gnss_rmse_m": driving_raw,
+        "driving_improvement_percent": _improvement_percent(driving_raw, driving_filtered),
+        "driving_speed_rmse_mps": _optional_float(summary.get("driving_speed_rmse_mps")),
+        "driving_yaw_rmse_deg": _optional_float(summary.get("driving_yaw_rmse_deg")),
+        "driving_mean_nees": _optional_float(summary.get("driving_mean_nees")),
+        "driving_mean_nis": _optional_float(summary.get("driving_mean_nis")),
+        "overall_filtered_rmse_m": overall_filtered,
+        "overall_raw_gnss_rmse_m": overall_raw,
+        "overall_improvement_percent": _improvement_percent(overall_raw, overall_filtered),
+        "overall_speed_rmse_mps": _optional_float(summary.get("speed_rmse_mps")),
+        "overall_yaw_rmse_deg": _optional_float(summary.get("yaw_rmse_deg")),
+        "overall_mean_nees": _optional_float(summary.get("mean_nees")),
+        "overall_mean_nis": _optional_float(summary.get("mean_nis")),
+    }
 
 
 def _failure_reasons_text(value: object) -> str:
@@ -893,6 +976,15 @@ def _finite_summary_values(summaries: Sequence[dict[str, object]], key: str) -> 
     values = []
     for summary in summaries:
         value = _optional_float(summary.get(key))
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _finite_row_values(rows: Sequence[dict[str, object]], key: str) -> list[float]:
+    values = []
+    for row in rows:
+        value = _optional_float(row.get(key))
         if value is not None:
             values.append(value)
     return values

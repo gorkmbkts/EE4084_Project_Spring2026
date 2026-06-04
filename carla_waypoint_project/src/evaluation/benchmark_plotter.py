@@ -17,6 +17,7 @@ from config.settings import BENCHMARK
 
 DRIVING_PHASES = ("driving", "completed")
 STABILIZATION_PHASES = ("stabilization",)
+LOCALIZATION_ERROR_FIELDS = ("filtered_position_error_m", "raw_gnss_error_m")
 RouteBounds = tuple[float, float, float, float]
 
 
@@ -381,8 +382,10 @@ def _draw_trajectory_panel(
 
 def _draw_localization_error_panel(ax, samples: list[dict[str, object]]) -> None:
     driving_samples = _filter_by_phase(samples, DRIVING_PHASES)
+    plotted_samples = samples
     if BENCHMARK.metrics_use_driving_phase_only:
         base_samples = driving_samples
+        stabilization_samples: list[dict[str, object]] = []
         if BENCHMARK.collect_stabilization_samples:
             stabilization_samples = _filter_by_phase(samples, STABILIZATION_PHASES)
             base_time = _base_timestamp(samples)
@@ -424,11 +427,17 @@ def _draw_localization_error_panel(ax, samples: list[dict[str, object]]) -> None
         )
         title_suffix = " (Driving Phase)"
         warning_samples = driving_samples
+        plotted_samples = stabilization_samples + driving_samples
     else:
         _plot_series(ax, samples, "filtered_position_error_m", "Filtered position error")
         _plot_series(ax, samples, "raw_gnss_error_m", "Raw GNSS baseline error", linestyle=":")
         title_suffix = " (All Phases)"
         warning_samples = samples
+
+    robust_ymax = _robust_error_ymax(driving_samples, plotted_samples)
+    if robust_ymax is not None:
+        ax.set_ylim(bottom=0.0, top=robust_ymax)
+        _annotate_clipped_error_samples(ax, plotted_samples, robust_ymax)
 
     ax.set_title(f"Localization Error Over Time{title_suffix}")
     ax.set_xlabel("Time since benchmark start (s)")
@@ -723,6 +732,92 @@ def _samples_for_metric_plots(samples: list[dict[str, object]]) -> list[dict[str
 
 def _filter_by_phase(samples: list[dict[str, object]], phases: tuple[str, ...]) -> list[dict[str, object]]:
     return [sample for sample in samples if sample.get("phase") in phases]
+
+
+def _finite_error_values(samples: list[dict[str, object]], fields: tuple[str, ...]) -> list[float]:
+    values: list[float] = []
+    for sample in samples:
+        for field in fields:
+            value = sample.get(field)
+            if _finite(value):
+                values.append(float(value))
+    return values
+
+
+def _percentile_linear_or_existing(values: list[float], percentile: float) -> Optional[float]:
+    finite_values = sorted(value for value in values if math.isfinite(value))
+    if not finite_values:
+        return None
+    if len(finite_values) == 1:
+        return finite_values[0]
+    percentile = min(100.0, max(0.0, float(percentile)))
+    position = (len(finite_values) - 1) * percentile / 100.0
+    lower_index = int(math.floor(position))
+    upper_index = int(math.ceil(position))
+    if lower_index == upper_index:
+        return finite_values[lower_index]
+    fraction = position - lower_index
+    lower_value = finite_values[lower_index]
+    upper_value = finite_values[upper_index]
+    return lower_value + (upper_value - lower_value) * fraction
+
+
+def _nice_ceiling(value: float) -> Optional[float]:
+    if not math.isfinite(value) or value <= 0.0:
+        return None
+    magnitude = 10.0 ** math.floor(math.log10(value))
+    normalized = value / magnitude
+    for step in (1.0, 1.5, 2.0, 2.5, 5.0, 7.5, 10.0):
+        if normalized <= step:
+            return step * magnitude
+    return 10.0 * magnitude
+
+
+def _robust_error_ymax(
+    driving_samples: list[dict[str, object]],
+    fallback_samples: list[dict[str, object]],
+) -> Optional[float]:
+    values = _finite_error_values(driving_samples, LOCALIZATION_ERROR_FIELDS)
+    if not values:
+        values = _finite_error_values(fallback_samples, LOCALIZATION_ERROR_FIELDS)
+    if not values:
+        return None
+
+    if len(values) >= 20:
+        p95 = _percentile_linear_or_existing(values, 95.0)
+        p99 = _percentile_linear_or_existing(values, 99.0)
+        if p95 is not None and p99 is not None:
+            ymax = max(p95 * 1.35, p99 * 1.15)
+        else:
+            ymax = max(values) * 1.10
+    else:
+        ymax = max(values) * 1.10
+    if ymax <= 0.0:
+        ymax = 1.0
+    return _nice_ceiling(ymax)
+
+
+def _annotate_clipped_error_samples(ax, samples: list[dict[str, object]], ymax: float) -> None:
+    values = _finite_error_values(samples, LOCALIZATION_ERROR_FIELDS)
+    if not values or not math.isfinite(ymax):
+        return
+    clipped = [value for value in values if value > ymax]
+    if not clipped:
+        return
+    message = f"Outliers clipped visually: {len(clipped)} samples; max error {max(clipped):.2f} m"
+    if len(clipped) / len(values) > 0.10:
+        message += "\nMany samples exceed visible range; filter may be unstable."
+    ax.text(
+        0.02,
+        0.96,
+        message,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+        color="darkred",
+        bbox={"facecolor": "white", "edgecolor": "darkred", "alpha": 0.85},
+    )
 
 
 def _plot_series(

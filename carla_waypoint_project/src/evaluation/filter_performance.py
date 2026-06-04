@@ -228,6 +228,8 @@ class FilterPerformanceLogger:
         overall_metrics = self._metrics_for_samples(self._samples)
         driving_samples = [sample for sample in self._samples if sample.phase in ("driving", "completed")]
         driving_metrics = self._metrics_for_samples(driving_samples)
+        stabilization_samples = [sample for sample in self._samples if sample.phase == "stabilization"]
+        stabilization_metrics = self._metrics_for_samples(stabilization_samples)
 
         filtered_rmse = overall_metrics["filtered_rmse_m"]
         raw_gnss_rmse = overall_metrics["raw_gnss_rmse_m"]
@@ -240,6 +242,7 @@ class FilterPerformanceLogger:
         completion_time = None
         if len(self._samples) >= 2:
             completion_time = self._samples[-1].timestamp - self._samples[0].timestamp
+        diagnostic_notes = self._diagnostic_notes(stabilization_metrics, driving_metrics)
 
         return {
             "benchmark_id": self._benchmark_id,
@@ -313,6 +316,12 @@ class FilterPerformanceLogger:
             "driving_mean_nis": driving_metrics["mean_nis"],
             "driving_mean_nees": driving_metrics["mean_nees"],
             "driving_segment_metrics": self._segment_metrics(driving_samples),
+            "stabilization_sample_count": len(stabilization_samples),
+            "stabilization_filtered_max_error_m": stabilization_metrics["filtered_max_error_m"],
+            "stabilization_filtered_p95_error_m": stabilization_metrics["filtered_p95_error_m"],
+            "stabilization_raw_gnss_max_error_m": stabilization_metrics["raw_gnss_max_error_m"],
+            "stabilization_raw_gnss_p95_error_m": stabilization_metrics["raw_gnss_p95_error_m"],
+            "diagnostic_notes": diagnostic_notes,
             "excluded_filtered_plot_sample_count": self._excluded_filtered_plot_sample_count(driving_samples),
             "excluded_kalman_plot_sample_count": self._excluded_filtered_plot_sample_count(driving_samples),
         }
@@ -489,6 +498,27 @@ class FilterPerformanceLogger:
             "within_2sigma_x_pct": cls._boolean_percentage(sample.within_2sigma_x for sample in sample_list),
             "within_2sigma_y_pct": cls._boolean_percentage(sample.within_2sigma_y for sample in sample_list),
         }
+
+    @staticmethod
+    def _diagnostic_notes(
+        stabilization_metrics: dict[str, Optional[float]],
+        driving_metrics: dict[str, Optional[float]],
+    ) -> list[str]:
+        stabilization_max = stabilization_metrics.get("filtered_max_error_m")
+        driving_p95 = driving_metrics.get("filtered_p95_error_m")
+        if not isinstance(stabilization_max, (int, float)) or not math.isfinite(float(stabilization_max)):
+            return []
+        large_relative_spike = (
+            isinstance(driving_p95, (int, float))
+            and math.isfinite(float(driving_p95))
+            and float(driving_p95) > 0.0
+            and float(stabilization_max) > 10.0 * float(driving_p95)
+        )
+        if float(stabilization_max) > 100.0 or large_relative_spike:
+            return [
+                "Large stabilization transient detected. Driving-phase metrics should be used for route performance comparison."
+            ]
+        return []
 
     @classmethod
     def _segment_metrics(cls, samples: Iterable[FilterPerformanceSample]) -> dict[str, dict[str, Optional[float]]]:
