@@ -55,6 +55,8 @@ class RouteTestRunner:
         active_filter_tune_callback: Callable[[], dict[str, object]],
         tracking_mode_callback: Callable[[], str] | None = None,
         active_control_used_callback: Callable[[], bool] | None = None,
+        enqueue_route_plots_callback: Callable[[Path], bool] | None = None,
+        enqueue_aggregate_plots_callback: Callable[[Path], bool] | None = None,
         selected_map_load_name: Optional[str] = None,
     ) -> None:
         self._world_map = world_map
@@ -68,6 +70,8 @@ class RouteTestRunner:
         self._active_filter_tune_callback = active_filter_tune_callback
         self._tracking_mode_callback = tracking_mode_callback or (lambda: "passive")
         self._active_control_used_callback = active_control_used_callback or (lambda: False)
+        self._enqueue_route_plots_callback = enqueue_route_plots_callback
+        self._enqueue_aggregate_plots_callback = enqueue_aggregate_plots_callback
         self._selected_map_load_name = selected_map_load_name
 
         self._active = False
@@ -321,7 +325,7 @@ class RouteTestRunner:
             )
 
         if route_completed:
-            finished = self._finish_current_route(aborted=False, timeout=False, reason="Benchmark completed: plots saved")
+            finished = self._finish_current_route(aborted=False, timeout=False, reason="Benchmark completed")
             if self._automated:
                 self._advance_after_route(active_map_name)
             return finished
@@ -383,6 +387,14 @@ class RouteTestRunner:
         if target is None:
             self._status_text = "No benchmark output to plot"
             return False
+        if self._automated and self._enqueue_aggregate_plots_callback is not None:
+            try:
+                queued = self._enqueue_aggregate_plots_callback(target)
+            except Exception as exc:  # pragma: no cover - callback defensive guard.
+                self._status_text = f"Plot queue failed: {exc}"
+                return False
+            self._status_text = f"Plots queued: {target.name}" if queued else "Plot queue unavailable"
+            return queued
         try:
             if self._automated:
                 from src.evaluation.benchmark_plotter import generate_aggregate_benchmark_plots
@@ -564,13 +576,23 @@ class RouteTestRunner:
 
         plot_status = ""
         if record_result and BENCHMARK.generate_plots_on_completion:
-            try:
-                from src.evaluation.benchmark_plotter import generate_benchmark_plots
+            if self._automated:
+                if self._enqueue_route_plots_callback is not None:
+                    try:
+                        queued = self._enqueue_route_plots_callback(route_folder)
+                        plot_status = ": plots queued" if queued else ": plot queue unavailable"
+                    except Exception as exc:  # pragma: no cover - callback defensive guard.
+                        plot_status = f": plot queue failed ({exc})"
+                else:
+                    plot_status = ": plot worker unavailable"
+            else:
+                try:
+                    from src.evaluation.benchmark_plotter import generate_benchmark_plots
 
-                generate_benchmark_plots(route_folder)
-                plot_status = ": plots saved"
-            except Exception as exc:  # pragma: no cover - matplotlib and filesystem dependent.
-                plot_status = f": plot generation failed ({exc})"
+                    generate_benchmark_plots(route_folder)
+                    plot_status = ": plots saved"
+                except Exception as exc:  # pragma: no cover - matplotlib and filesystem dependent.
+                    plot_status = f": plot generation failed ({exc})"
 
         self._route_running = False
         self._current_route = None
@@ -615,19 +637,25 @@ class RouteTestRunner:
         aggregate = self._build_aggregate_summary()
         _write_json(self._run_folder / "aggregate_summary.json", aggregate)
         self._write_aggregate_csv(self._run_folder / "aggregate_summary.csv")
-        try:
-            from src.evaluation.benchmark_plotter import generate_aggregate_benchmark_plots
-
-            generate_aggregate_benchmark_plots(self._run_folder)
-        except Exception as exc:  # pragma: no cover - matplotlib and filesystem dependent.
-            aggregate["plot_error"] = str(exc)
+        plot_status = ""
+        if self._enqueue_aggregate_plots_callback is not None:
+            try:
+                queued = self._enqueue_aggregate_plots_callback(self._run_folder)
+                plot_status = ": aggregate plots queued" if queued else ": aggregate plot queue unavailable"
+            except Exception as exc:  # pragma: no cover - callback defensive guard.
+                aggregate["plot_error"] = str(exc)
+                _write_json(self._run_folder / "aggregate_summary.json", aggregate)
+                plot_status = f": aggregate plot queue failed ({exc})"
+        else:
+            aggregate["plot_error"] = "Plot worker unavailable"
             _write_json(self._run_folder / "aggregate_summary.json", aggregate)
+            plot_status = ": aggregate plot worker unavailable"
 
         self._active = False
         self._route_running = False
         self._state = BenchmarkRunnerState.TEST_FINISHED
         self._route_status = "finished"
-        self._status_text = f"Automated benchmark finished: {self._run_folder.name}"
+        self._status_text = f"Automated benchmark finished: {self._run_folder.name}{plot_status}"
 
     def _build_aggregate_summary(self) -> dict[str, object]:
         config = self._config.to_dict() if self._config is not None else {}
