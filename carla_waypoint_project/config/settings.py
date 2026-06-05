@@ -171,6 +171,13 @@ class BenchmarkSettings:
     max_trajectory_jump_m: float = 8.0
     route_bounds_margin_m: float = 20.0
     metrics_use_driving_phase_only: bool = True
+    teleport_settle_seconds: float = 2.0
+    sensor_warmup_seconds: float = 5.0
+    filter_warmup_seconds: float = 5.0
+    offline_metric_warmup_seconds: float = 10.0
+    min_fresh_sensor_frames_after_teleport: int = 3
+    max_valid_imu_accel_mps2: float = 20.0
+    divergence_error_threshold_m: float = 10.0
 
 
 @dataclass(frozen=True)
