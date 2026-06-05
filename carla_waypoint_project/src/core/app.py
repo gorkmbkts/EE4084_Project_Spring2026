@@ -1180,6 +1180,14 @@ class SimulationApp:
     def _offline_recording_active(self) -> bool:
         return bool(self._offline_recorder is not None and self._offline_recorder.is_active)
 
+    def _offline_recording_warmup_active(self) -> bool:
+        return bool(
+            self._offline_recorder is not None
+            and self._offline_recorder.is_active
+            and self._offline_recorder.route_running
+            and not self._offline_recorder.controller_enabled
+        )
+
     def _active_filter_warning(self) -> str:
         if self._filter_manager is None:
             return ""
@@ -1290,6 +1298,25 @@ class SimulationApp:
                         self._feed_filter_control_input(control, source="route_initialization_brake")
                     self.actuator_realism.reset(control)
                 elif self._drive_mode == DriveMode.AUTONOMOUS:
+                    if self._offline_recording_warmup_active():
+                        control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=False)
+                        if not self._apply_vehicle_control_safely(control):
+                            self._draw_frame_without_camera()
+                            self._clock.tick_pygame()
+                            continue
+                        self._set_latest_control(control, control)
+                        self.actuator_realism.reset(control)
+                        camera_surface = self._camera_sensor.get_latest_surface()
+                        self._display.begin_frame(camera_surface)
+                        self._draw_topdown_map()
+                        self._draw_lidar_panel()
+                        self._draw_driving_behavior_panels()
+                        self._draw_control_panel()
+                        self._draw_status_bar()
+                        self._display.set_test_mode_titles(self._test_mode_active())
+                        self._display.end_frame()
+                        self._clock.tick_pygame()
+                        continue
                     control_state = self._state_for_tracking_and_control()
                     if control_state is None:
                         control = carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
@@ -1924,6 +1951,7 @@ class SimulationApp:
         self._drive_mode = DriveMode.AUTONOMOUS
         self._route_generation_blocked = False
         self._planner_status = "Offline recording: ground-truth controller active"
+        self._respawn_benchmark_localization_sensors()
         self._teleport_vehicle_to_route_start(start_waypoint)
         if self.route_planner is not None:
             self.route_planner.set_route(route_waypoints)
@@ -2454,7 +2482,9 @@ class SimulationApp:
             f"Current: {recorder.current_route_name if recorder is not None else 'initializing'}",
             f"Map: {self._active_map_display_name()}",
             f"State: {recorder.state.value if recorder is not None else 'n/a'}",
+            f"Phase: {recorder.current_phase if recorder is not None else 'n/a'}",
             f"Samples: {recorder.sample_count if recorder is not None else 0}",
+            f"Warm-up excluded: {recorder.warmup_excluded_seconds:.1f}s" if recorder is not None else "Warm-up excluded: n/a",
             f"Route time: {recorder.elapsed_route_seconds():.1f}s" if recorder is not None else "Route time: n/a",
             f"Distance to goal: {self._format_optional_metric(self._latest_tracking.distance_to_goal_m, 'm')}",
             f"Completion: {completion:.0f}%" if completion is not None else "Completion: n/a",
@@ -2572,7 +2602,6 @@ class SimulationApp:
                 gnss_projector=self._gnss_projector,
                 applied_control=self._latest_applied_control,
                 frame_index=self._current_world_frame(),
-                failure_reason=failure_reason,
             )
             self._control_status_text = recorder.status_text
             self._planner_status = recorder.status_text
@@ -2584,6 +2613,23 @@ class SimulationApp:
             and not route
             and not self._latest_tracking.completed
         )
+        if not recorder.controller_enabled:
+            self._reset_benchmark_failure_monitor()
+            recorder.update(
+                route_completed=False,
+                route_failed=False,
+                active_map_name=self._active_map_name,
+                ground_truth_state=self._latest_ground_truth_state,
+                gnss_measurement=self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None,
+                imu_measurement=self._imu_sensor.get_latest_measurement() if self._imu_sensor is not None else None,
+                gnss_projector=self._gnss_projector,
+                applied_control=self._latest_applied_control,
+                frame_index=self._current_world_frame(),
+            )
+            self._control_status_text = recorder.status_text
+            self._planner_status = recorder.status_text
+            return False
+
         failure_reason = self._offline_recording_failure_reason(route_failed=route_failed)
         if failure_reason:
             if self._vehicle is not None:

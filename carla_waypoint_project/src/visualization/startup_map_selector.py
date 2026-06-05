@@ -1060,14 +1060,16 @@ class StartupMapSelector:
                 self._draw_text(line, (content.left, y), self._small_font, color, content.width)
                 y += 18
         if self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY:
-            if y + 38 <= content.bottom:
-                self._draw_text(
-                    "Replay uses passive filter mode. Raw GNSS is included automatically.",
-                    (content.left, y + 8),
-                    self._small_font,
-                    DASHBOARD.muted_text_color,
-                    content.width,
-                )
+            notes = (
+                "Replay uses passive filter mode. Raw GNSS is included automatically.",
+                "Warm-up samples are logged but excluded from evaluation metrics.",
+                "Main ranking uses eval_position_rmse_m; full metrics are diagnostics.",
+            )
+            for note in notes:
+                if y + 18 > content.bottom:
+                    break
+                self._draw_text(note, (content.left, y + 8), self._small_font, DASHBOARD.muted_text_color, content.width)
+                y += 18
         elif y + 58 <= content.bottom:
             y += 8
             self._draw_text("Tracking Mode", (content.left, y), self._small_font, DASHBOARD.muted_text_color, content.width)
@@ -1314,8 +1316,9 @@ class StartupMapSelector:
         )
         self._offline_status_lines = [
             f"Results: {result.output_folder}",
-            f"Best RMSE filter: {best}",
-            f"Raw GNSS RMSE: {raw}",
+            f"Best eval RMSE filter: {best}",
+            f"Raw GNSS eval RMSE: {raw}",
+            f"Warm-up excluded: {result.warmup_excluded_s:.1f}s",
             f"Routes evaluated: {result.route_count} | Failures: {len(result.failures)}",
         ]
 

@@ -164,7 +164,19 @@ def build_benchmark_metadata(
                 "max_trajectory_jump_m": BENCHMARK.max_trajectory_jump_m,
                 "route_bounds_margin_m": BENCHMARK.route_bounds_margin_m,
                 "metrics_use_driving_phase_only": BENCHMARK.metrics_use_driving_phase_only,
+                "teleport_settle_seconds": BENCHMARK.teleport_settle_seconds,
+                "sensor_warmup_seconds": BENCHMARK.sensor_warmup_seconds,
+                "filter_warmup_seconds": BENCHMARK.filter_warmup_seconds,
+                "offline_metric_warmup_seconds": BENCHMARK.offline_metric_warmup_seconds,
+                "min_fresh_sensor_frames_after_teleport": BENCHMARK.min_fresh_sensor_frames_after_teleport,
+                "max_valid_imu_accel_mps2": BENCHMARK.max_valid_imu_accel_mps2,
+                "divergence_error_threshold_m": BENCHMARK.divergence_error_threshold_m,
             },
+            "teleport_transient_handling": (
+                "Saved route tests begin by relocating the ego vehicle to the route start. "
+                "Startup stabilization samples are diagnostic; valid_for_metrics/eval metrics "
+                "exclude those non-physical transients from route performance comparison."
+            ),
         },
         "kalman_filter": {
             "filter_type": active_filter_name,

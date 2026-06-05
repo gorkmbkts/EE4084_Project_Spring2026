@@ -24,6 +24,8 @@ class FilterPerformanceSample:
     timestamp: float
     route_name: str
     phase: str
+    valid_for_metrics: bool
+    warmup_excluded_reason: str
     ground_truth_x: Optional[float]
     ground_truth_y: Optional[float]
     ground_truth_yaw: Optional[float]
@@ -161,6 +163,8 @@ class FilterPerformanceLogger:
         filtered_state: Optional[VehicleState] = None,
         filter_diagnostics: Optional[dict[str, object]] = None,
         speed_plan: Optional[SpeedPlan] = None,
+        valid_for_metrics: Optional[bool] = None,
+        warmup_excluded_reason: str = "",
     ) -> Optional[FilterPerformanceSample]:
         if not self._started or tracking is None:
             return None
@@ -185,10 +189,14 @@ class FilterPerformanceLogger:
         nees = self._position_nees(x_error, y_error, covariance_x_std, covariance_y_std)
         gnss_frame = self._optional_int(diagnostics.get("last_gnss_frame") if isinstance(diagnostics, dict) else None)
         imu_frame = self._optional_int(diagnostics.get("last_imu_frame") if isinstance(diagnostics, dict) else None)
+        metric_valid = bool(valid_for_metrics) if valid_for_metrics is not None else phase in ("driving", "completed")
+        excluded_reason = "" if metric_valid else (warmup_excluded_reason or f"{phase}_excluded")
         sample = FilterPerformanceSample(
             timestamp=timestamp,
             route_name=route_name,
             phase=phase,
+            valid_for_metrics=metric_valid,
+            warmup_excluded_reason=excluded_reason,
             ground_truth_x=ground_truth_state.x if ground_truth_state is not None else None,
             ground_truth_y=ground_truth_state.y if ground_truth_state is not None else None,
             ground_truth_yaw=ground_truth_state.yaw if ground_truth_state is not None else None,
@@ -262,23 +270,26 @@ class FilterPerformanceLogger:
 
     def build_summary(self) -> dict[str, object]:
         overall_metrics = self._metrics_for_samples(self._samples)
-        driving_samples = [sample for sample in self._samples if sample.phase in ("driving", "completed")]
-        driving_metrics = self._metrics_for_samples(driving_samples)
-        stabilization_samples = [sample for sample in self._samples if sample.phase == "stabilization"]
+        eval_samples = [sample for sample in self._samples if sample.valid_for_metrics]
+        eval_metrics = self._metrics_for_samples(eval_samples)
+        driving_samples = eval_samples
+        driving_metrics = eval_metrics
+        stabilization_samples = [sample for sample in self._samples if not sample.valid_for_metrics]
         stabilization_metrics = self._metrics_for_samples(stabilization_samples)
 
         filtered_rmse = overall_metrics["filtered_rmse_m"]
         raw_gnss_rmse = overall_metrics["raw_gnss_rmse_m"]
         improvement_ratio = self._ratio(raw_gnss_rmse, filtered_rmse)
 
-        driving_filtered_rmse = driving_metrics["filtered_rmse_m"]
-        driving_raw_gnss_rmse = driving_metrics["raw_gnss_rmse_m"]
-        driving_improvement_ratio = self._ratio(driving_raw_gnss_rmse, driving_filtered_rmse)
+        eval_filtered_rmse = eval_metrics["filtered_rmse_m"]
+        eval_raw_gnss_rmse = eval_metrics["raw_gnss_rmse_m"]
+        eval_improvement_ratio = self._ratio(eval_raw_gnss_rmse, eval_filtered_rmse)
 
         completion_time = None
         if len(self._samples) >= 2:
             completion_time = self._samples[-1].timestamp - self._samples[0].timestamp
         diagnostic_notes = self._diagnostic_notes(stabilization_metrics, driving_metrics)
+        warmup_excluded_s = self._duration_for_samples(stabilization_samples)
 
         return {
             "benchmark_id": self._benchmark_id,
@@ -286,6 +297,9 @@ class FilterPerformanceLogger:
             "active_filter_name": self._active_filter_name,
             "route_name": self._route_name,
             "sample_count": len(self._samples),
+            "valid_for_metrics_sample_count": len(eval_samples),
+            "startup_transient_sample_count": len(stabilization_samples),
+            "warmup_excluded_s": warmup_excluded_s,
             "route_completion_success": self._completed and not self._aborted,
             "route_aborted": self._aborted,
             "timeout": self._timeout,
@@ -293,6 +307,34 @@ class FilterPerformanceLogger:
             "completion_time_s": completion_time,
             "active_filter_rmse_m": filtered_rmse,
             "filtered_rmse_m": filtered_rmse,
+            "full_active_filter_rmse_m": filtered_rmse,
+            "full_filtered_rmse_m": filtered_rmse,
+            "full_filtered_mae_m": overall_metrics["filtered_mae_m"],
+            "full_mean_position_error_m": overall_metrics["filtered_mae_m"],
+            "full_filtered_max_error_m": overall_metrics["filtered_max_error_m"],
+            "full_filtered_p95_error_m": overall_metrics["filtered_p95_error_m"],
+            "full_filtered_p99_error_m": overall_metrics["filtered_p99_error_m"],
+            "full_raw_gnss_rmse_m": raw_gnss_rmse,
+            "full_raw_gnss_mae_m": overall_metrics["raw_gnss_mae_m"],
+            "full_raw_gnss_max_error_m": overall_metrics["raw_gnss_max_error_m"],
+            "full_raw_gnss_p95_error_m": overall_metrics["raw_gnss_p95_error_m"],
+            "eval_active_filter_rmse_m": eval_filtered_rmse,
+            "eval_filtered_rmse_m": eval_filtered_rmse,
+            "eval_filtered_mae_m": eval_metrics["filtered_mae_m"],
+            "eval_mean_position_error_m": eval_metrics["filtered_mae_m"],
+            "eval_filtered_max_error_m": eval_metrics["filtered_max_error_m"],
+            "eval_filtered_p95_error_m": eval_metrics["filtered_p95_error_m"],
+            "eval_filtered_p99_error_m": eval_metrics["filtered_p99_error_m"],
+            "eval_raw_gnss_rmse_m": eval_raw_gnss_rmse,
+            "eval_raw_gnss_mae_m": eval_metrics["raw_gnss_mae_m"],
+            "eval_raw_gnss_max_error_m": eval_metrics["raw_gnss_max_error_m"],
+            "eval_raw_gnss_p95_error_m": eval_metrics["raw_gnss_p95_error_m"],
+            "eval_filtered_improvement_ratio": eval_improvement_ratio,
+            "eval_kalman_improvement_ratio": eval_improvement_ratio,
+            "eval_speed_rmse_mps": eval_metrics["speed_rmse_mps"],
+            "eval_yaw_rmse_deg": eval_metrics["yaw_rmse_deg"],
+            "eval_mean_nis": eval_metrics["mean_nis"],
+            "eval_mean_nees": eval_metrics["mean_nees"],
             "filtered_mae_m": overall_metrics["filtered_mae_m"],
             "x_rmse_m": overall_metrics["x_rmse_m"],
             "y_rmse_m": overall_metrics["y_rmse_m"],
@@ -331,8 +373,8 @@ class FilterPerformanceLogger:
             "imu_update_count": self._unique_count(sample.imu_update_frame for sample in self._samples),
             "segment_metrics": self._segment_metrics(self._samples),
             "driving_sample_count": len(driving_samples),
-            "driving_active_filter_rmse_m": driving_filtered_rmse,
-            "driving_filtered_rmse_m": driving_filtered_rmse,
+            "driving_active_filter_rmse_m": eval_filtered_rmse,
+            "driving_filtered_rmse_m": eval_filtered_rmse,
             "driving_filtered_mae_m": driving_metrics["filtered_mae_m"],
             "driving_x_rmse_m": driving_metrics["x_rmse_m"],
             "driving_y_rmse_m": driving_metrics["y_rmse_m"],
@@ -340,17 +382,17 @@ class FilterPerformanceLogger:
             "driving_yaw_rmse_deg": driving_metrics["yaw_rmse_deg"],
             "driving_filtered_max_error_m": driving_metrics["filtered_max_error_m"],
             "driving_filtered_p95_error_m": driving_metrics["filtered_p95_error_m"],
-            "driving_kalman_rmse_m": driving_filtered_rmse,
+            "driving_kalman_rmse_m": eval_filtered_rmse,
             "driving_kalman_mae_m": driving_metrics["filtered_mae_m"],
             "driving_kalman_max_error_m": driving_metrics["filtered_max_error_m"],
             "driving_kalman_p95_error_m": driving_metrics["filtered_p95_error_m"],
-            "driving_raw_gnss_rmse_m": driving_raw_gnss_rmse,
+            "driving_raw_gnss_rmse_m": eval_raw_gnss_rmse,
             "driving_raw_gnss_mae_m": driving_metrics["raw_gnss_mae_m"],
             "driving_raw_gnss_max_error_m": driving_metrics["raw_gnss_max_error_m"],
             "driving_raw_gnss_p95_error_m": driving_metrics["raw_gnss_p95_error_m"],
-            "driving_active_filter_improvement_ratio": driving_improvement_ratio,
-            "driving_filtered_improvement_ratio": driving_improvement_ratio,
-            "driving_kalman_improvement_ratio": driving_improvement_ratio,
+            "driving_active_filter_improvement_ratio": eval_improvement_ratio,
+            "driving_filtered_improvement_ratio": eval_improvement_ratio,
+            "driving_kalman_improvement_ratio": eval_improvement_ratio,
             "driving_mean_cross_track_error_m": driving_metrics["mean_cross_track_error_m"],
             "driving_max_cross_track_error_m": driving_metrics["max_cross_track_error_m"],
             "driving_p95_cross_track_error_m": driving_metrics["p95_cross_track_error_m"],
@@ -533,11 +575,15 @@ class FilterPerformanceLogger:
             "speed_rmse_mps": cls._rmse(speed_errors),
             "yaw_rmse_deg": cls._rmse(yaw_errors),
             "filtered_max_error_m": max(filtered_errors) if filtered_errors else None,
+            "filtered_median_error_m": cls._percentile(filtered_errors, 50.0),
             "filtered_p95_error_m": cls._percentile(filtered_errors, 95.0),
+            "filtered_p99_error_m": cls._percentile(filtered_errors, 99.0),
             "raw_gnss_rmse_m": cls._rmse(raw_gnss_errors),
             "raw_gnss_mae_m": cls._mean(raw_gnss_errors),
             "raw_gnss_max_error_m": max(raw_gnss_errors) if raw_gnss_errors else None,
+            "raw_gnss_median_error_m": cls._percentile(raw_gnss_errors, 50.0),
             "raw_gnss_p95_error_m": cls._percentile(raw_gnss_errors, 95.0),
+            "raw_gnss_p99_error_m": cls._percentile(raw_gnss_errors, 99.0),
             "mean_cross_track_error_m": cls._mean(cross_track_errors),
             "max_cross_track_error_m": max(cross_track_errors) if cross_track_errors else None,
             "p95_cross_track_error_m": cls._percentile(cross_track_errors, 95.0),
@@ -579,9 +625,16 @@ class FilterPerformanceLogger:
         )
         if float(stabilization_max) > 100.0 or large_relative_spike:
             return [
-                "Large stabilization transient detected. Driving-phase metrics should be used for route performance comparison."
+                "Large startup transient detected. Eval/driving metrics should be used for route performance comparison."
             ]
         return []
+
+    @staticmethod
+    def _duration_for_samples(samples: Iterable[FilterPerformanceSample]) -> float:
+        sample_list = sorted(samples, key=lambda sample: sample.timestamp)
+        if len(sample_list) < 2:
+            return 0.0
+        return max(0.0, float(sample_list[-1].timestamp - sample_list[0].timestamp))
 
     @classmethod
     def _segment_metrics(cls, samples: Iterable[FilterPerformanceSample]) -> dict[str, dict[str, Optional[float]]]:

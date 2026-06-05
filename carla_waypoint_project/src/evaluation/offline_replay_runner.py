@@ -13,6 +13,7 @@ import time
 from types import SimpleNamespace
 from typing import Optional
 
+from config.settings import BENCHMARK
 from src.KalmanLab.filter_base import TRACKING_MODE_PASSIVE
 from src.KalmanLab.registry import discover_filters
 from src.core.vehicle_state import VehicleState
@@ -40,7 +41,21 @@ from src.localization.gnss_projection import LocalGnssMeasurement
 
 ESTIMATE_FIELDNAMES = [
     "timestamp",
+    "sample_timestamp",
+    "metric_timestamp",
+    "sensor_time_offset_s",
+    "ground_truth_alignment",
     "frame",
+    "dt",
+    "phase",
+    "valid_for_metrics",
+    "seconds_since_teleport",
+    "seconds_since_recording_start",
+    "seconds_since_replay_start",
+    "fresh_gnss_after_teleport_count",
+    "fresh_imu_after_teleport_count",
+    "teleport_frame",
+    "warmup_excluded_reason",
     "filter_id",
     "ground_truth_x",
     "ground_truth_y",
@@ -49,6 +64,10 @@ ESTIMATE_FIELDNAMES = [
     "ground_truth_speed",
     "ground_truth_vx_mps",
     "ground_truth_vy_mps",
+    "sample_ground_truth_x",
+    "sample_ground_truth_y",
+    "sample_ground_truth_yaw",
+    "sample_ground_truth_speed",
     "estimate_x",
     "estimate_y",
     "estimate_z",
@@ -89,6 +108,7 @@ class OfflineReplayResult:
     best_filter_id: Optional[str]
     best_position_rmse_m: Optional[float]
     raw_gnss_rmse_m: Optional[float]
+    warmup_excluded_s: float
     failures: tuple[dict[str, object], ...]
 
 
@@ -140,10 +160,20 @@ class OfflineReplayRunner:
             "selected_filters": filter_ids,
             "sensor_log_paths": [str(path) for path in request.sensor_log_paths],
             "initial_condition_policy": request.initial_condition_policy,
+            "replay_mode": "passive_offline_replay",
+            "control_commands_used": False,
+            "control_command_policy": "Logged throttle/brake/steer are preserved in sensor logs but are not fed to passive replay filters.",
+            "warmup_exclusion_policy": (
+                "Use recorded valid_for_metrics when present; otherwise exclude the first "
+                f"{BENCHMARK.offline_metric_warmup_seconds:.1f}s by timestamp fallback."
+            ),
+            "divergence_error_threshold_m": BENCHMARK.divergence_error_threshold_m,
             "metric_definitions": {
-                "position_rmse_m": "sqrt(mean((estimated_xy - ground_truth_xy)^2))",
-                "position_mae_m": "mean absolute horizontal position error",
-                "improvement_over_raw_gnss_percent": "100 * (raw_gnss_rmse - filter_rmse) / raw_gnss_rmse",
+                "full_position_rmse_m": "Position RMSE over every finite replay sample, including startup diagnostics.",
+                "eval_position_rmse_m": "Position RMSE over valid_for_metrics=true samples only. This is the fair comparison metric.",
+                "position_rmse_m": "Backward-compatible alias for eval_position_rmse_m.",
+                "metric_ground_truth_alignment": "Estimate errors are computed against ground truth interpolated at the sensor/estimate timestamp.",
+                "improvement_over_raw_gnss_percent": "100 * (raw_gnss_eval_rmse - filter_eval_rmse) / raw_gnss_eval_rmse",
                 "nis": "reported only when a filter exposes innovation statistics",
                 "nees": "computed only when a comparable position covariance is exposed",
             },
@@ -158,6 +188,7 @@ class OfflineReplayRunner:
         best_filter_id: Optional[str] = None
         best_rmse: Optional[float] = None
         first_raw_rmse: Optional[float] = None
+        total_warmup_excluded_s = 0.0
 
         for route_index, log_path in enumerate(request.sensor_log_paths, start=1):
             route_result = self._run_one_log(
@@ -169,10 +200,11 @@ class OfflineReplayRunner:
             )
             failures.extend(route_result["failures"])
             aggregate_rows.extend(route_result["aggregate_rows"])
+            total_warmup_excluded_s += float(route_result.get("warmup_excluded_s") or 0.0)
             if first_raw_rmse is None:
                 first_raw_rmse = route_result.get("raw_gnss_rmse_m")
             for row in route_result["aggregate_rows"]:
-                rmse = _optional_float(row.get("position_rmse_m"))
+                rmse = _optional_float(row.get("eval_position_rmse_m") or row.get("position_rmse_m"))
                 filter_id = str(row.get("filter_id") or "")
                 if filter_id == "raw_gnss" or rmse is None:
                     continue
@@ -180,6 +212,7 @@ class OfflineReplayRunner:
                     best_rmse = rmse
                     best_filter_id = filter_id
 
+        best_filter_id, best_rmse = _best_filter_by_mean_eval_rmse(aggregate_rows)
         _write_csv(run_folder / "aggregate_summary.csv", _aggregate_fieldnames(), aggregate_rows)
         aggregate_summary = {
             "route_count": len(request.sensor_log_paths),
@@ -187,6 +220,7 @@ class OfflineReplayRunner:
             "best_filter_id": best_filter_id,
             "best_position_rmse_m": best_rmse,
             "raw_gnss_rmse_m": first_raw_rmse,
+            "warmup_excluded_s": total_warmup_excluded_s,
             "failures": failures,
             "aggregate_rows": aggregate_rows,
             "explanation": OFFLINE_LOCALIZATION_EXPLANATION,
@@ -203,6 +237,7 @@ class OfflineReplayRunner:
             best_filter_id=best_filter_id,
             best_position_rmse_m=best_rmse,
             raw_gnss_rmse_m=first_raw_rmse,
+            warmup_excluded_s=total_warmup_excluded_s,
             failures=tuple(failures),
         )
 
@@ -214,13 +249,14 @@ class OfflineReplayRunner:
         filter_ids: list[str],
         filter_tunes: dict[str, dict[str, object]],
     ) -> dict[str, object]:
-        rows = _read_log_rows(log_path)
+        rows, warmup_policy = _annotated_log_rows(log_path)
         if len(rows) < 2:
             failure = {
                 "sensor_log_path": str(log_path),
                 "reason": "Sensor log is empty or too short.",
             }
             return {"failures": [failure], "aggregate_rows": [], "raw_gnss_rmse_m": None}
+        metric_alignment = _annotate_metric_ground_truth(rows)
 
         source_metadata = _source_metadata(log_path)
         route_name = _route_name(source_metadata, log_path)
@@ -233,8 +269,12 @@ class OfflineReplayRunner:
         plots_dir.mkdir(parents=True, exist_ok=True)
 
         raw_estimates = _raw_gnss_estimates(rows)
-        raw_metrics = compute_localization_metrics(raw_estimates, raw_gnss_rmse_m=None)
-        raw_rmse = _optional_float(raw_metrics.get("position_rmse_m"))
+        raw_metrics = compute_localization_metrics(
+            raw_estimates,
+            raw_gnss_rmse_m=None,
+            divergence_error_threshold_m=BENCHMARK.divergence_error_threshold_m,
+        )
+        raw_rmse = _optional_float(raw_metrics.get("eval_position_rmse_m"))
         _write_csv(result_dir / "raw_gnss_estimates.csv", ESTIMATE_FIELDNAMES, raw_estimates)
         write_json(metrics_dir / "raw_gnss_metrics.json", raw_metrics)
 
@@ -254,9 +294,22 @@ class OfflineReplayRunner:
                 if filter_id != "raw_gnss"
             },
             "initial_condition_policy": "first_valid_gnss_initializes_each_filter",
+            "replay_mode": "passive_offline_replay",
+            "control_commands_used": False,
+            "control_command_policy": "Logged controls are not fed to passive offline replay filters.",
             "sample_count": len(rows),
+            "valid_for_metrics_sample_count": sum(1 for row in rows if _bool_value(row.get("valid_for_metrics"), default=False)),
+            "warmup_excluded_sample_count": sum(1 for row in rows if not _bool_value(row.get("valid_for_metrics"), default=False)),
+            "warmup_excluded_s": raw_metrics.get("warmup_excluded_s"),
+            "warmup_exclusion_policy": warmup_policy,
+            "metric_ground_truth_alignment": metric_alignment,
+            "divergence_error_threshold_m": BENCHMARK.divergence_error_threshold_m,
             "recording_metadata": source_metadata,
             "explanation": OFFLINE_LOCALIZATION_EXPLANATION,
+            "teleport_transient_handling": (
+                "Warm-up and teleport transient samples are replayed through filters for stabilization, "
+                "but eval_* metrics only use valid_for_metrics=true samples."
+            ),
             "failures": failures,
         }
         write_json(route_folder / "metadata.json", route_metadata)
@@ -268,7 +321,11 @@ class OfflineReplayRunner:
             try:
                 estimates, diagnostics = self._replay_filter(filter_id, rows, filter_tunes.get(filter_id, {}))
                 runtime_s = time.perf_counter() - started
-                metrics = compute_localization_metrics(estimates, raw_gnss_rmse_m=raw_rmse)
+                metrics = compute_localization_metrics(
+                    estimates,
+                    raw_gnss_rmse_m=raw_rmse,
+                    divergence_error_threshold_m=BENCHMARK.divergence_error_threshold_m,
+                )
                 metrics["replay_runtime_s"] = runtime_s
                 metrics["diagnostics"] = diagnostics
                 _write_csv(result_dir / f"{slugify(filter_id, 'filter')}_estimates.csv", ESTIMATE_FIELDNAMES, estimates)
@@ -289,6 +346,10 @@ class OfflineReplayRunner:
             "route_name": route_name,
             "sensor_log_path": str(log_path),
             "raw_gnss_rmse_m": raw_rmse,
+            "raw_gnss_eval_rmse_m": raw_rmse,
+            "warmup_exclusion_policy": warmup_policy,
+            "metric_ground_truth_alignment": metric_alignment,
+            "warmup_excluded_s": raw_metrics.get("warmup_excluded_s"),
             "rows": summary_rows,
             "failures": failures,
         }
@@ -304,6 +365,7 @@ class OfflineReplayRunner:
             "failures": failures,
             "aggregate_rows": aggregate_rows,
             "raw_gnss_rmse_m": raw_rmse,
+            "warmup_excluded_s": raw_metrics.get("warmup_excluded_s"),
         }
 
     def _replay_filter(
@@ -326,6 +388,7 @@ class OfflineReplayRunner:
         last_gnss_frame: Optional[int] = None
         last_imu_frame: Optional[int] = None
         failures = 0
+        last_diagnostics: dict[str, object] = {}
         for row in rows:
             imu = _imu_from_row(row)
             gnss = _gnss_from_row(row)
@@ -338,6 +401,7 @@ class OfflineReplayRunner:
                     last_gnss_frame = int(gnss.frame)
                 state = getattr(filter_instance, "get_state")()
                 diagnostics = _filter_diagnostics(filter_instance)
+                last_diagnostics = diagnostics
             except Exception:
                 failures += 1
                 state = None
@@ -347,6 +411,7 @@ class OfflineReplayRunner:
             "failed_sample_updates": failures,
             "last_gnss_frame": last_gnss_frame,
             "last_imu_frame": last_imu_frame,
+            "last_filter_diagnostics": last_diagnostics,
         }
 
 
@@ -371,11 +436,11 @@ def _raw_gnss_estimates(rows: list[dict[str, object]]) -> list[dict[str, object]
         x = _optional_float(row.get("gnss_local_x"))
         y = _optional_float(row.get("gnss_local_y"))
         z = _optional_float(row.get("gnss_local_z"))
-        timestamp = _optional_float(row.get("timestamp"))
+        timestamp = _first_float(row.get("gnss_timestamp"), row.get("timestamp"))
         speed = None
         yaw = previous_yaw
         if previous is not None and timestamp is not None and x is not None and y is not None:
-            prev_t = _optional_float(previous.get("timestamp"))
+            prev_t = _first_float(previous.get("gnss_timestamp"), previous.get("timestamp"))
             prev_x = _optional_float(previous.get("gnss_local_x"))
             prev_y = _optional_float(previous.get("gnss_local_y"))
             if prev_t is not None and prev_x is not None and prev_y is not None:
@@ -410,19 +475,20 @@ def _estimate_row(
     state: Optional[VehicleState],
     diagnostics: dict[str, object],
 ) -> dict[str, object]:
-    gt_x = _optional_float(row.get("ground_truth_x"))
-    gt_y = _optional_float(row.get("ground_truth_y"))
-    gt_vx = _optional_float(row.get("ground_truth_vx_mps"))
-    gt_vy = _optional_float(row.get("ground_truth_vy_mps"))
+    gt_x = _first_float(row.get("metric_ground_truth_x"), row.get("ground_truth_x"))
+    gt_y = _first_float(row.get("metric_ground_truth_y"), row.get("ground_truth_y"))
+    gt_z = _first_float(row.get("metric_ground_truth_z"), row.get("ground_truth_z"))
+    gt_yaw = _first_float(row.get("metric_ground_truth_yaw"), row.get("ground_truth_yaw"))
+    gt_speed = _first_float(row.get("metric_ground_truth_speed"), row.get("ground_truth_speed"))
+    gt_vx = _first_float(row.get("metric_ground_truth_vx_mps"), row.get("ground_truth_vx_mps"))
+    gt_vy = _first_float(row.get("metric_ground_truth_vy_mps"), row.get("ground_truth_vy_mps"))
     est_x = state.x if state is not None else None
     est_y = state.y if state is not None else None
     x_error = (est_x - gt_x) if est_x is not None and gt_x is not None and math.isfinite(est_x) else None
     y_error = (est_y - gt_y) if est_y is not None and gt_y is not None and math.isfinite(est_y) else None
     speed_error = None
-    if state is not None:
-        gt_speed = _optional_float(row.get("ground_truth_speed"))
-        if gt_speed is not None:
-            speed_error = state.speed - gt_speed
+    if state is not None and gt_speed is not None:
+        speed_error = state.speed - gt_speed
     velocity_error = None
     if state is not None and state.vx_mps is not None and state.vy_mps is not None and gt_vx is not None and gt_vy is not None:
         velocity_error = math.hypot(state.vx_mps - gt_vx, state.vy_mps - gt_vy)
@@ -431,15 +497,33 @@ def _estimate_row(
         covariance = state.covariance_diagonal
     return {
         "timestamp": row.get("timestamp"),
+        "sample_timestamp": row.get("timestamp"),
+        "metric_timestamp": row.get("metric_timestamp"),
+        "sensor_time_offset_s": row.get("sensor_time_offset_s"),
+        "ground_truth_alignment": row.get("ground_truth_alignment"),
         "frame": row.get("frame"),
+        "dt": row.get("dt"),
+        "phase": row.get("phase"),
+        "valid_for_metrics": row.get("valid_for_metrics"),
+        "seconds_since_teleport": row.get("seconds_since_teleport"),
+        "seconds_since_recording_start": row.get("seconds_since_recording_start"),
+        "seconds_since_replay_start": row.get("seconds_since_replay_start"),
+        "fresh_gnss_after_teleport_count": row.get("fresh_gnss_after_teleport_count"),
+        "fresh_imu_after_teleport_count": row.get("fresh_imu_after_teleport_count"),
+        "teleport_frame": row.get("teleport_frame"),
+        "warmup_excluded_reason": row.get("warmup_excluded_reason"),
         "filter_id": filter_id,
-        "ground_truth_x": row.get("ground_truth_x"),
-        "ground_truth_y": row.get("ground_truth_y"),
-        "ground_truth_z": row.get("ground_truth_z"),
-        "ground_truth_yaw": row.get("ground_truth_yaw"),
-        "ground_truth_speed": row.get("ground_truth_speed"),
-        "ground_truth_vx_mps": row.get("ground_truth_vx_mps"),
-        "ground_truth_vy_mps": row.get("ground_truth_vy_mps"),
+        "ground_truth_x": gt_x,
+        "ground_truth_y": gt_y,
+        "ground_truth_z": gt_z,
+        "ground_truth_yaw": gt_yaw,
+        "ground_truth_speed": gt_speed,
+        "ground_truth_vx_mps": gt_vx,
+        "ground_truth_vy_mps": gt_vy,
+        "sample_ground_truth_x": row.get("ground_truth_x"),
+        "sample_ground_truth_y": row.get("ground_truth_y"),
+        "sample_ground_truth_yaw": row.get("ground_truth_yaw"),
+        "sample_ground_truth_speed": row.get("ground_truth_speed"),
         "estimate_x": est_x,
         "estimate_y": est_y,
         "estimate_z": state.z if state is not None else None,
@@ -447,10 +531,10 @@ def _estimate_row(
         "estimate_speed": state.speed if state is not None else None,
         "estimate_vx_mps": state.vx_mps if state is not None else None,
         "estimate_vy_mps": state.vy_mps if state is not None else None,
-        "position_error_m": position_error(est_x, est_y, row.get("ground_truth_x"), row.get("ground_truth_y")),
+        "position_error_m": position_error(est_x, est_y, gt_x, gt_y),
         "x_error_m": x_error,
         "y_error_m": y_error,
-        "yaw_error_deg": yaw_error_deg(state.yaw if state is not None else None, row.get("ground_truth_yaw")),
+        "yaw_error_deg": yaw_error_deg(state.yaw if state is not None else None, gt_yaw),
         "speed_error_mps": speed_error,
         "velocity_error_mps": velocity_error,
         "nis": diagnostics.get("nis"),
@@ -508,6 +592,147 @@ def _filter_diagnostics(filter_instance: object) -> dict[str, object]:
     return diagnostics if isinstance(diagnostics, dict) else {}
 
 
+def _annotated_log_rows(path: Path) -> tuple[list[dict[str, object]], dict[str, object]]:
+    rows = _read_log_rows(path)
+    if not rows:
+        return rows, {
+            "valid_for_metrics_source": "none",
+            "warnings": ["Sensor log is empty."],
+        }
+
+    valid_values = [str(row.get("valid_for_metrics") or "").strip() for row in rows]
+    has_valid_column = "valid_for_metrics" in rows[0]
+    has_usable_valid_column = has_valid_column and any(valid_values)
+    first_timestamp = next((_optional_float(row.get("timestamp")) for row in rows if _optional_float(row.get("timestamp")) is not None), 0.0)
+    first_timestamp = first_timestamp or 0.0
+    warnings: list[str] = []
+    if not has_usable_valid_column:
+        warnings.append("valid_for_metrics column missing; timestamp-based warm-up fallback was used.")
+
+    annotated: list[dict[str, object]] = []
+    for row in rows:
+        item = dict(row)
+        timestamp = _optional_float(item.get("timestamp"))
+        replay_seconds = _first_float(
+            item.get("seconds_since_recording_start"),
+            item.get("seconds_since_teleport"),
+        )
+        if replay_seconds is None and timestamp is not None:
+            replay_seconds = max(0.0, timestamp - first_timestamp)
+        if replay_seconds is None:
+            replay_seconds = 0.0
+        item["seconds_since_replay_start"] = replay_seconds
+
+        if has_usable_valid_column:
+            valid = _bool_value(item.get("valid_for_metrics"), default=False)
+            reason = str(item.get("warmup_excluded_reason") or "")
+        else:
+            valid = replay_seconds >= float(BENCHMARK.offline_metric_warmup_seconds)
+            reason = "" if valid else "offline_metric_warmup_fallback"
+            item["phase"] = item.get("phase") or ("EVALUATION_ACTIVE" if valid else "OFFLINE_METRIC_WARMUP")
+            item["warmup_excluded_reason"] = reason
+        item["valid_for_metrics"] = valid
+        if not valid and not str(item.get("warmup_excluded_reason") or ""):
+            item["warmup_excluded_reason"] = reason or "warmup_excluded"
+        annotated.append(item)
+
+    return annotated, {
+        "valid_for_metrics_source": "sensor_log" if has_usable_valid_column else "timestamp_fallback",
+        "offline_metric_warmup_seconds": BENCHMARK.offline_metric_warmup_seconds,
+        "warnings": warnings,
+    }
+
+
+def _annotate_metric_ground_truth(rows: list[dict[str, object]]) -> dict[str, object]:
+    timeline = _ground_truth_timeline(rows)
+    offsets: list[float] = []
+    for row in rows:
+        sample_timestamp = _optional_float(row.get("timestamp"))
+        metric_timestamp = _first_float(row.get("gnss_timestamp"), row.get("imu_timestamp"), row.get("timestamp"))
+        if metric_timestamp is None:
+            metric_timestamp = sample_timestamp
+        if metric_timestamp is not None:
+            row["metric_timestamp"] = metric_timestamp
+        if sample_timestamp is not None and metric_timestamp is not None:
+            offset = max(0.0, sample_timestamp - metric_timestamp)
+            row["sensor_time_offset_s"] = offset
+            offsets.append(offset)
+        metric_gt = _interpolated_ground_truth(timeline, metric_timestamp)
+        if metric_gt is None:
+            row["ground_truth_alignment"] = "sample_timestamp_fallback"
+            continue
+        row["ground_truth_alignment"] = "sensor_timestamp_interpolated"
+        for key, value in metric_gt.items():
+            row[f"metric_ground_truth_{key}"] = value
+    return {
+        "policy": "errors_compare_estimates_to_ground_truth_interpolated_at_sensor_timestamp",
+        "mean_sensor_time_offset_s": _mean(offsets),
+        "max_sensor_time_offset_s": max(offsets) if offsets else None,
+        "sample_count": len(rows),
+    }
+
+
+def _ground_truth_timeline(rows: list[dict[str, object]]) -> list[dict[str, float]]:
+    timeline: list[dict[str, float]] = []
+    for row in rows:
+        timestamp = _optional_float(row.get("timestamp"))
+        x = _optional_float(row.get("ground_truth_x"))
+        y = _optional_float(row.get("ground_truth_y"))
+        if timestamp is None or x is None or y is None:
+            continue
+        item = {
+            "timestamp": timestamp,
+            "x": x,
+            "y": y,
+        }
+        for source_key, target_key in (
+            ("ground_truth_z", "z"),
+            ("ground_truth_yaw", "yaw"),
+            ("ground_truth_speed", "speed"),
+            ("ground_truth_vx_mps", "vx_mps"),
+            ("ground_truth_vy_mps", "vy_mps"),
+        ):
+            value = _optional_float(row.get(source_key))
+            if value is not None:
+                item[target_key] = value
+        timeline.append(item)
+    return timeline
+
+
+def _interpolated_ground_truth(
+    timeline: list[dict[str, float]],
+    timestamp: Optional[float],
+) -> Optional[dict[str, float]]:
+    if not timeline or timestamp is None:
+        return None
+    if timestamp <= timeline[0]["timestamp"]:
+        return dict(timeline[0])
+    if timestamp >= timeline[-1]["timestamp"]:
+        return dict(timeline[-1])
+    left_index = 0
+    right_index = len(timeline) - 1
+    while left_index + 1 < right_index:
+        mid = (left_index + right_index) // 2
+        if timeline[mid]["timestamp"] <= timestamp:
+            left_index = mid
+        else:
+            right_index = mid
+    left = timeline[left_index]
+    right = timeline[right_index]
+    t0 = left["timestamp"]
+    t1 = right["timestamp"]
+    if t1 <= t0:
+        return dict(left)
+    alpha = max(0.0, min(1.0, (timestamp - t0) / (t1 - t0)))
+    result = {"timestamp": timestamp}
+    for key in ("x", "y", "z", "speed", "vx_mps", "vy_mps"):
+        if key in left and key in right:
+            result[key] = float(left[key] + alpha * (right[key] - left[key]))
+    if "yaw" in left and "yaw" in right:
+        result["yaw"] = _normalize_angle_deg(left["yaw"] + alpha * _normalize_angle_deg(right["yaw"] - left["yaw"]))
+    return result
+
+
 def _read_log_rows(path: Path) -> list[dict[str, object]]:
     with Path(path).open("r", newline="", encoding="utf-8") as csv_file:
         return list(csv.DictReader(csv_file))
@@ -540,15 +765,36 @@ def _summary_row(
     return {
         "route_name": route_name,
         "filter_id": filter_id,
+        "full_position_rmse_m": metrics.get("full_position_rmse_m"),
+        "full_position_mae_m": metrics.get("full_position_mae_m"),
+        "full_mean_position_error_m": metrics.get("full_mean_position_error_m"),
+        "full_max_position_error_m": metrics.get("full_max_position_error_m"),
+        "full_final_position_error_m": metrics.get("full_final_position_error_m"),
+        "eval_position_rmse_m": metrics.get("eval_position_rmse_m"),
+        "eval_position_mae_m": metrics.get("eval_position_mae_m"),
+        "eval_mean_position_error_m": metrics.get("eval_mean_position_error_m"),
+        "eval_max_position_error_m": metrics.get("eval_max_position_error_m"),
+        "eval_final_position_error_m": metrics.get("eval_final_position_error_m"),
+        "eval_position_error_std_m": metrics.get("eval_position_error_std_m"),
         "position_rmse_m": metrics.get("position_rmse_m"),
         "position_mae_m": metrics.get("position_mae_m"),
         "mean_position_error_m": metrics.get("mean_position_error_m"),
         "position_error_std_m": metrics.get("position_error_std_m"),
         "max_position_error_m": metrics.get("max_position_error_m"),
         "final_position_error_m": metrics.get("final_position_error_m"),
+        "median_position_error_m": metrics.get("median_position_error_m"),
+        "p95_position_error_m": metrics.get("p95_position_error_m"),
+        "p99_position_error_m": metrics.get("p99_position_error_m"),
+        "divergence_error_threshold_m": metrics.get("divergence_error_threshold_m"),
+        "divergence_event_count": metrics.get("divergence_event_count"),
+        "divergence_duration_s": metrics.get("divergence_duration_s"),
         "improvement_over_raw_gnss_percent": metrics.get("improvement_over_raw_gnss_percent"),
         "valid_estimate_count": metrics.get("valid_estimate_count"),
         "missing_or_invalid_estimate_count": metrics.get("missing_or_invalid_estimate_count"),
+        "valid_for_metrics_sample_count": metrics.get("valid_for_metrics_sample_count"),
+        "warmup_excluded_sample_count": metrics.get("warmup_excluded_sample_count"),
+        "warmup_excluded_s": metrics.get("warmup_excluded_s"),
+        "total_sample_count": metrics.get("total_sample_count"),
         "yaw_rmse_deg": metrics.get("yaw_rmse_deg"),
         "speed_rmse_mps": metrics.get("speed_rmse_mps"),
         "velocity_rmse_mps": metrics.get("velocity_rmse_mps"),
@@ -564,15 +810,36 @@ def _summary_fieldnames() -> list[str]:
     return [
         "route_name",
         "filter_id",
+        "full_position_rmse_m",
+        "full_position_mae_m",
+        "full_mean_position_error_m",
+        "full_max_position_error_m",
+        "full_final_position_error_m",
+        "eval_position_rmse_m",
+        "eval_position_mae_m",
+        "eval_mean_position_error_m",
+        "eval_max_position_error_m",
+        "eval_final_position_error_m",
+        "eval_position_error_std_m",
         "position_rmse_m",
         "position_mae_m",
         "mean_position_error_m",
         "position_error_std_m",
         "max_position_error_m",
         "final_position_error_m",
+        "median_position_error_m",
+        "p95_position_error_m",
+        "p99_position_error_m",
+        "divergence_error_threshold_m",
+        "divergence_event_count",
+        "divergence_duration_s",
         "improvement_over_raw_gnss_percent",
         "valid_estimate_count",
         "missing_or_invalid_estimate_count",
+        "valid_for_metrics_sample_count",
+        "warmup_excluded_sample_count",
+        "warmup_excluded_s",
+        "total_sample_count",
         "yaw_rmse_deg",
         "speed_rmse_mps",
         "velocity_rmse_mps",
@@ -586,6 +853,27 @@ def _summary_fieldnames() -> list[str]:
 
 def _aggregate_fieldnames() -> list[str]:
     return ["route_index", *_summary_fieldnames(), "sensor_log_path"]
+
+
+def _best_filter_by_mean_eval_rmse(rows: list[dict[str, object]]) -> tuple[Optional[str], Optional[float]]:
+    grouped: dict[str, list[float]] = {}
+    for row in rows:
+        filter_id = str(row.get("filter_id") or "")
+        if not filter_id or filter_id == "raw_gnss":
+            continue
+        rmse = _optional_float(row.get("eval_position_rmse_m") or row.get("position_rmse_m"))
+        if rmse is not None:
+            grouped.setdefault(filter_id, []).append(rmse)
+    best_filter_id = None
+    best_rmse = None
+    for filter_id, values in grouped.items():
+        if not values:
+            continue
+        mean_rmse = sum(values) / len(values)
+        if best_rmse is None or mean_rmse < best_rmse:
+            best_filter_id = filter_id
+            best_rmse = mean_rmse
+    return best_filter_id, best_rmse
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
@@ -613,6 +901,32 @@ def _optional_float(value: object) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _first_float(*values: object) -> Optional[float]:
+    for value in values:
+        number = _optional_float(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _bool_value(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    return default
+
+
+def _mean(values: list[float]) -> Optional[float]:
+    return sum(values) / len(values) if values else None
 
 
 def _normalize_angle_deg(angle_deg: float) -> float:

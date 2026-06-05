@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.KalmanLab.filters import ctra_ekf, ctrv_ekf
+from src.KalmanLab.filters import ca_kf, ctra_ekf, ctrv_ekf
 from src.KalmanLab.registry import discover_filters
 from src.localization.gnss_projection import LocalGnssMeasurement
 
@@ -107,6 +107,42 @@ def test_filter_wrappers_initialize_from_gnss_and_imu() -> None:
             raise AssertionError("CTRA did not expose longitudinal acceleration")
 
 
+def test_ca_kf_ignores_startup_imu_acceleration_spike() -> None:
+    class Projector:
+        def project(self, gnss: object) -> LocalGnssMeasurement:
+            return LocalGnssMeasurement(
+                x=float(gnss.x),
+                y=float(gnss.y),
+                z=0.0,
+                latitude=0.0,
+                longitude=0.0,
+                altitude=0.0,
+                frame=int(gnss.frame),
+                timestamp=float(gnss.timestamp),
+            )
+
+    filt = ca_kf.Filter(Projector(), tune={"max_valid_imu_accel_mps2": 20.0})
+    filt.process_imu(
+        SimpleNamespace(
+            accelerometer=(100.0, 0.0, 0.0),
+            gyroscope=(0.0, 0.0, 0.0),
+            compass=math.pi / 2.0,
+            frame=1,
+            timestamp=0.0,
+        )
+    )
+    state = filt.process_gnss(SimpleNamespace(x=1.0, y=2.0, frame=2, timestamp=0.05))
+    if state is None:
+        raise AssertionError("CA-KF did not initialize from GNSS")
+    if state.acceleration_mps2 > 1.0e-9:
+        raise AssertionError("CA-KF initialized acceleration from transient IMU")
+    diagnostics = filt.get_diagnostics()
+    if diagnostics.get("imu_accel_update_skipped_count", 0) < 1:
+        raise AssertionError("CA-KF did not count skipped acceleration spike")
+    if diagnostics.get("imu_accel_update_skipped_latest_reason") != "imu_accel_magnitude_gate":
+        raise AssertionError("CA-KF skip reason missing acceleration gate")
+
+
 def test_registry_capabilities() -> None:
     records = {record.filter_id: record for record in discover_filters() if record.valid}
     for filter_id in ("ctrv_ekf", "ctra_ekf"):
@@ -160,6 +196,7 @@ def run_all() -> None:
     test_wrapped_yaw_update()
     test_gyro_yaw_rate_update()
     test_filter_wrappers_initialize_from_gnss_and_imu()
+    test_ca_kf_ignores_startup_imu_acceleration_spike()
     test_registry_capabilities()
     test_startup_setup_does_not_hide_experimental_filters()
     test_state_uses_plugin_model_type()

@@ -8,6 +8,7 @@ from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 
+from config.settings import BENCHMARK
 from src.KalmanLab.control_model import estimate_command_motion
 from src.KalmanLab.filter_base import FilterControlInput, TRACKING_MODE_ACTIVE, normalize_tracking_mode
 from src.core.vehicle_state import VehicleState
@@ -67,6 +68,9 @@ TUNE = {
     "command_max_accel_mps2": 8.0,
     "command_yaw_rate_stddev_dps": 18.0,
     "command_max_yaw_rate_dps": 90.0,
+    "initialize_acceleration_from_imu": False,
+    "max_valid_imu_accel_mps2": BENCHMARK.max_valid_imu_accel_mps2,
+    "startup_accel_guard_gnss_updates": 3,
 }
 
 
@@ -86,6 +90,8 @@ TUNE_SPECS = (
     ParameterSpec("command_max_accel_mps2", "Cmd accel cap", 0.5, 15.0, "m/s2", 2, "Active tracking"),
     ParameterSpec("command_yaw_rate_stddev_dps", "Yaw-rate trust", 1.0, 90.0, "deg/s", 1, "Active tracking"),
     ParameterSpec("command_max_yaw_rate_dps", "Yaw-rate cap", 10.0, 180.0, "deg/s", 1, "Active tracking"),
+    ParameterSpec("max_valid_imu_accel_mps2", "IMU accel gate", 2.0, 80.0, "m/s2", 1, "Startup guard"),
+    ParameterSpec("startup_accel_guard_gnss_updates", "Startup accel guard", 0.0, 20.0, "GNSS", 0, "Startup guard"),
 )
 
 
@@ -310,6 +316,9 @@ class Filter:
         self._min_prediction_dt_s = float(self._tune["min_prediction_dt_s"])
         self._max_prediction_dt_s = float(self._tune["max_prediction_dt_s"])
         self._command_accel_stddev = float(self._tune["command_accel_stddev_mps2"])
+        self._initialize_acceleration_from_imu = bool(self._tune.get("initialize_acceleration_from_imu", False))
+        self._max_valid_imu_accel_mps2 = float(self._tune.get("max_valid_imu_accel_mps2", BENCHMARK.max_valid_imu_accel_mps2))
+        self._startup_accel_guard_gnss_updates = max(0, int(float(self._tune.get("startup_accel_guard_gnss_updates", 3))))
 
         self._latest_state: Optional[VehicleState] = None
         self._latest_gnss_local: Optional[LocalGnssMeasurement] = None
@@ -323,6 +332,10 @@ class Filter:
         self._last_valid_yaw_deg = 0.0
         self._last_imu_frame: Optional[int] = None
         self._last_gnss_frame: Optional[int] = None
+        self._gnss_update_count = 0
+        self._imu_accel_update_skipped_count = 0
+        self._imu_accel_update_skipped_latest_reason = ""
+        self._imu_accel_magnitude_latest: Optional[float] = None
 
     @property
     def initialized(self) -> bool:
@@ -346,6 +359,10 @@ class Filter:
         self._last_valid_yaw_deg = 0.0
         self._last_imu_frame = None
         self._last_gnss_frame = None
+        self._gnss_update_count = 0
+        self._imu_accel_update_skipped_count = 0
+        self._imu_accel_update_skipped_latest_reason = ""
+        self._imu_accel_magnitude_latest = None
 
     def process_control(self, control_input: FilterControlInput) -> bool:
         self._latest_control_input = control_input
@@ -357,8 +374,19 @@ class Filter:
             self._latest_imu_yaw_deg = yaw_deg
 
         acceleration_xy = self._imu_acceleration_to_world_xy(imu, yaw_deg)
-        self._pending_acceleration_xy = acceleration_xy
+        accel_magnitude = math.hypot(acceleration_xy[0], acceleration_xy[1])
+        self._imu_accel_magnitude_latest = accel_magnitude
         self._last_imu_frame = int(imu.frame)
+        if not math.isfinite(accel_magnitude):
+            self._skip_imu_accel_update("imu_accel_not_finite")
+            return self._latest_state
+        if accel_magnitude > self._max_valid_imu_accel_mps2:
+            self._skip_imu_accel_update("imu_accel_magnitude_gate")
+            return self._latest_state
+        if self._startup_accel_guard_active():
+            self._skip_imu_accel_update("startup_accel_guard")
+            return self._latest_state
+        self._pending_acceleration_xy = acceleration_xy
 
         if not self._filter.initialized:
             return self._latest_state
@@ -374,7 +402,12 @@ class Filter:
 
         self._latest_gnss_local = local
         self._last_gnss_frame = int(gnss.frame)
-        acceleration_xy = self._pending_acceleration_xy or (0.0, 0.0)
+        self._gnss_update_count += 1
+        acceleration_xy = (
+            self._pending_acceleration_xy
+            if self._initialize_acceleration_from_imu and self._pending_acceleration_xy is not None
+            else (0.0, 0.0)
+        )
 
         if not self._filter.initialized:
             self._filter.initialize(
@@ -412,8 +445,25 @@ class Filter:
             "latest_command_longitudinal_accel_mps2": self._latest_command_longitudinal_accel_mps2,
             "last_gnss_frame": self._last_gnss_frame,
             "last_imu_frame": self._last_imu_frame,
+            "gnss_update_count": self._gnss_update_count,
+            "initialize_acceleration_from_imu": self._initialize_acceleration_from_imu,
+            "max_valid_imu_accel_mps2": self._max_valid_imu_accel_mps2,
+            "imu_accel_update_skipped_count": self._imu_accel_update_skipped_count,
+            "imu_accel_update_skipped_latest_reason": self._imu_accel_update_skipped_latest_reason,
+            "imu_accel_magnitude_latest": self._imu_accel_magnitude_latest,
+            "startup_accel_guard_active": self._startup_accel_guard_active(),
             "timestamp": snapshot.timestamp if snapshot is not None else None,
         }
+
+    def _skip_imu_accel_update(self, reason: str) -> None:
+        self._imu_accel_update_skipped_count += 1
+        self._imu_accel_update_skipped_latest_reason = reason
+
+    def _startup_accel_guard_active(self) -> bool:
+        return (
+            self._gnss_update_count < self._startup_accel_guard_gnss_updates
+            or (not self._filter.initialized and not self._initialize_acceleration_from_imu)
+        )
 
     def _predict_to(self, timestamp: float) -> None:
         current_timestamp = self._filter.timestamp

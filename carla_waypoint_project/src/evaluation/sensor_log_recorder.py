@@ -42,6 +42,14 @@ SENSOR_LOG_FIELDNAMES = [
     "route_name",
     "route_index",
     "recording_driver",
+    "phase",
+    "valid_for_metrics",
+    "seconds_since_teleport",
+    "seconds_since_recording_start",
+    "fresh_gnss_after_teleport_count",
+    "fresh_imu_after_teleport_count",
+    "teleport_frame",
+    "warmup_excluded_reason",
     "ground_truth_x",
     "ground_truth_y",
     "ground_truth_z",
@@ -75,6 +83,19 @@ SENSOR_LOG_FIELDNAMES = [
     "control_hand_brake",
     "control_reverse",
 ]
+
+
+PHASE_TELEPORT_SETTLING = "TELEPORT_SETTLING"
+PHASE_SENSOR_WARMUP = "SENSOR_WARMUP"
+PHASE_FILTER_WARMUP = "FILTER_WARMUP"
+PHASE_EVALUATION_ACTIVE = "EVALUATION_ACTIVE"
+
+TELEPORT_TRANSIENT_EXPLANATION = (
+    "Saved route tests begin by relocating the ego vehicle to the route start. "
+    "This teleportation creates non-physical transient samples in CARLA physics "
+    "and GNSS/IMU sensors. These samples are kept for diagnostics but excluded "
+    "from reported evaluation metrics using valid_for_metrics=false."
+)
 
 
 class SensorLogRecorderState(Enum):
@@ -162,6 +183,16 @@ class SensorLogRecorder:
         self._last_ground_truth: Optional[VehicleState] = None
         self._last_exported_summary: Optional[dict[str, object]] = None
         self._route_summaries: list[dict[str, object]] = []
+        self._teleport_frame: Optional[int] = None
+        self._fresh_gnss_after_teleport_count = 0
+        self._fresh_imu_after_teleport_count = 0
+        self._last_fresh_gnss_key: Optional[tuple[object, object]] = None
+        self._last_fresh_imu_key: Optional[tuple[object, object]] = None
+        self._valid_for_metrics_sample_count = 0
+        self._warmup_excluded_sample_count = 0
+        self._warmup_excluded_s = 0.0
+        self._phase_counts: dict[str, int] = {}
+        self._current_phase = PHASE_TELEPORT_SETTLING
         self._status_text = "Offline recording idle"
         self._last_failure_reason = ""
 
@@ -196,6 +227,18 @@ class SensorLogRecorder:
     @property
     def sample_count(self) -> int:
         return self._sample_count
+
+    @property
+    def current_phase(self) -> str:
+        return self._current_phase
+
+    @property
+    def controller_enabled(self) -> bool:
+        return self._route_running and self._current_phase == PHASE_EVALUATION_ACTIVE
+
+    @property
+    def warmup_excluded_seconds(self) -> float:
+        return self._warmup_excluded_s
 
     @property
     def run_folder(self) -> Optional[Path]:
@@ -236,6 +279,8 @@ class SensorLogRecorder:
             "mode": OFFLINE_MODE_NAME,
             "report_name": OFFLINE_REPORT_NAME,
             "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+            "warmup_config": _warmup_config_dict(),
+            "teleport_transient_handling": TELEPORT_TRANSIENT_EXPLANATION,
             "project_commit": project_commit_hash(),
             "explanation": OFFLINE_LOCALIZATION_EXPLANATION,
         }
@@ -254,6 +299,7 @@ class SensorLogRecorder:
         self._route_summaries = []
         self._last_exported_summary = None
         self._last_failure_reason = ""
+        self._reset_route_counters()
         self._status_text = f"Offline recording ready: {len(self._routes)} route(s)"
         return self.begin_current_route(active_map_name)
 
@@ -378,9 +424,10 @@ class SensorLogRecorder:
         self._route_started_timestamp = None
         self._last_sample_timestamp = None
         self._last_ground_truth = None
+        self._reset_route_counters()
         self._route_running = True
         self._state = SensorLogRecorderState.RUNNING_ROUTE
-        self._status_text = f"Recording sensor log: {route.name}"
+        self._status_text = f"Recording sensor log: {route.name} ({PHASE_TELEPORT_SETTLING})"
         self._begin_route_callback(start_waypoint, goal_waypoint, route_waypoints)
         return True
 
@@ -399,8 +446,21 @@ class SensorLogRecorder:
         timestamp = float(ground_truth_state.timestamp)
         if self._route_started_timestamp is None:
             self._route_started_timestamp = timestamp
+        if self._teleport_frame is None and frame_index is not None:
+            self._teleport_frame = int(frame_index)
         dt = 0.0 if self._last_sample_timestamp is None else max(0.0, timestamp - self._last_sample_timestamp)
         self._last_sample_timestamp = timestamp
+        seconds_since_teleport = max(0.0, timestamp - self._route_started_timestamp)
+        seconds_since_recording_start = seconds_since_teleport
+        self._update_fresh_sensor_counts(gnss_measurement, imu_measurement)
+        phase, valid_for_metrics, warmup_reason = self._sample_phase(seconds_since_teleport)
+        self._current_phase = phase
+        self._phase_counts[phase] = self._phase_counts.get(phase, 0) + 1
+        if valid_for_metrics:
+            self._valid_for_metrics_sample_count += 1
+        else:
+            self._warmup_excluded_sample_count += 1
+            self._warmup_excluded_s += dt
         gt_ax, gt_ay, gt_yaw_rate = self._derived_ground_truth_motion(ground_truth_state, dt)
         local = gnss_projector.project(gnss_measurement) if gnss_projector is not None and gnss_measurement is not None else None
         imu_accel = getattr(imu_measurement, "accelerometer", (None, None, None)) if imu_measurement is not None else (None, None, None)
@@ -413,6 +473,14 @@ class SensorLogRecorder:
             "route_name": self._current_route.name,
             "route_index": self._current_route_index + 1,
             "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+            "phase": phase,
+            "valid_for_metrics": valid_for_metrics,
+            "seconds_since_teleport": seconds_since_teleport,
+            "seconds_since_recording_start": seconds_since_recording_start,
+            "fresh_gnss_after_teleport_count": self._fresh_gnss_after_teleport_count,
+            "fresh_imu_after_teleport_count": self._fresh_imu_after_teleport_count,
+            "teleport_frame": self._teleport_frame,
+            "warmup_excluded_reason": warmup_reason,
             "ground_truth_x": ground_truth_state.x,
             "ground_truth_y": ground_truth_state.y,
             "ground_truth_z": ground_truth_state.z,
@@ -449,6 +517,7 @@ class SensorLogRecorder:
         self._writer.writerow({key: "" if value is None else value for key, value in row.items()})
         self._sample_count += 1
         self._last_ground_truth = ground_truth_state
+        self._status_text = f"Recording sensor log: {self._current_route.name} ({phase})"
 
     def _finish_current_route(self, aborted: bool, reason: str) -> None:
         route = self._current_route
@@ -466,10 +535,19 @@ class SensorLogRecorder:
             "route_map_name": route.map_name,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "sample_count": self._sample_count,
+            "valid_for_metrics_sample_count": self._valid_for_metrics_sample_count,
+            "warmup_excluded_sample_count": self._warmup_excluded_sample_count,
+            "warmup_excluded_s": self._warmup_excluded_s,
+            "phase_counts": dict(self._phase_counts),
             "duration_s": duration,
             "success": not aborted,
             "failure_reason": reason if aborted else "",
             "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+            "teleport_frame": self._teleport_frame,
+            "fresh_gnss_after_teleport_count": self._fresh_gnss_after_teleport_count,
+            "fresh_imu_after_teleport_count": self._fresh_imu_after_teleport_count,
+            "warmup_config": _warmup_config_dict(),
+            "teleport_transient_handling": TELEPORT_TRANSIENT_EXPLANATION,
             "sensor_log_path": str(route_folder / "sensor_log.csv"),
             "route_folder": str(route_folder),
         }
@@ -499,7 +577,12 @@ class SensorLogRecorder:
                 "route_count": len(self._routes),
                 "completed_route_count": sum(1 for item in self._route_summaries if item.get("success")),
                 "failed_route_count": sum(1 for item in self._route_summaries if not item.get("success")),
+                "valid_for_metrics_sample_count": sum(int(item.get("valid_for_metrics_sample_count") or 0) for item in self._route_summaries),
+                "warmup_excluded_sample_count": sum(int(item.get("warmup_excluded_sample_count") or 0) for item in self._route_summaries),
+                "warmup_excluded_s": sum(float(item.get("warmup_excluded_s") or 0.0) for item in self._route_summaries),
+                "warmup_config": _warmup_config_dict(),
                 "route_summaries": self._route_summaries,
+                "teleport_transient_handling": TELEPORT_TRANSIENT_EXPLANATION,
                 "explanation": OFFLINE_LOCALIZATION_EXPLANATION,
             }
             write_json(self._run_folder / "recording_summary.json", summary)
@@ -568,6 +651,12 @@ class SensorLogRecorder:
             "weather": self._weather_callback(),
             "vehicle_blueprint": self._vehicle_blueprint_callback(),
             "random_seed": config.random_seed if config is not None else None,
+            "teleport_settle_seconds": BENCHMARK.teleport_settle_seconds,
+            "sensor_warmup_seconds": BENCHMARK.sensor_warmup_seconds,
+            "filter_warmup_seconds": BENCHMARK.filter_warmup_seconds,
+            "min_fresh_sensor_frames_after_teleport": BENCHMARK.min_fresh_sensor_frames_after_teleport,
+            "warmup_config": _warmup_config_dict(),
+            "teleport_transient_handling": TELEPORT_TRANSIENT_EXPLANATION,
             "project_commit": project_commit_hash(),
             "explanation": OFFLINE_LOCALIZATION_EXPLANATION,
             "recording_flow": (
@@ -598,6 +687,60 @@ class SensorLogRecorder:
         yaw_delta = math.radians(_normalize_angle_deg(state.yaw - previous.yaw))
         return ax, ay, yaw_delta / dt
 
+    def _reset_route_counters(self) -> None:
+        self._teleport_frame = None
+        self._fresh_gnss_after_teleport_count = 0
+        self._fresh_imu_after_teleport_count = 0
+        self._last_fresh_gnss_key = None
+        self._last_fresh_imu_key = None
+        self._valid_for_metrics_sample_count = 0
+        self._warmup_excluded_sample_count = 0
+        self._warmup_excluded_s = 0.0
+        self._phase_counts = {}
+        self._current_phase = PHASE_TELEPORT_SETTLING
+
+    def _update_fresh_sensor_counts(self, gnss_measurement: object | None, imu_measurement: object | None) -> None:
+        gnss_key = self._fresh_sensor_key(gnss_measurement)
+        if gnss_key is not None and gnss_key != self._last_fresh_gnss_key:
+            self._fresh_gnss_after_teleport_count += 1
+            self._last_fresh_gnss_key = gnss_key
+        imu_key = self._fresh_sensor_key(imu_measurement)
+        if imu_key is not None and imu_key != self._last_fresh_imu_key:
+            self._fresh_imu_after_teleport_count += 1
+            self._last_fresh_imu_key = imu_key
+
+    def _fresh_sensor_key(self, measurement: object | None) -> Optional[tuple[object, object]]:
+        if measurement is None:
+            return None
+        frame = getattr(measurement, "frame", None)
+        timestamp = getattr(measurement, "timestamp", None)
+        if self._teleport_frame is not None and frame is not None:
+            try:
+                if int(frame) < self._teleport_frame:
+                    return None
+            except (TypeError, ValueError):
+                pass
+        if frame is None and timestamp is None:
+            return None
+        return frame, timestamp
+
+    def _sample_phase(self, seconds_since_teleport: float) -> tuple[str, bool, str]:
+        settle_s = max(0.0, float(BENCHMARK.teleport_settle_seconds))
+        sensor_s = max(0.0, float(BENCHMARK.sensor_warmup_seconds))
+        filter_s = max(0.0, float(BENCHMARK.filter_warmup_seconds))
+        min_frames = max(0, int(BENCHMARK.min_fresh_sensor_frames_after_teleport))
+        if seconds_since_teleport < settle_s:
+            return PHASE_TELEPORT_SETTLING, False, "teleport_settling"
+        if (
+            seconds_since_teleport < settle_s + sensor_s
+            or self._fresh_gnss_after_teleport_count < min_frames
+            or self._fresh_imu_after_teleport_count < min_frames
+        ):
+            return PHASE_SENSOR_WARMUP, False, "sensor_warmup"
+        if seconds_since_teleport < settle_s + sensor_s + filter_s:
+            return PHASE_FILTER_WARMUP, False, "filter_warmup"
+        return PHASE_EVALUATION_ACTIVE, True, ""
+
     def _close_writer(self) -> None:
         if self._csv_file is not None:
             self._csv_file.close()
@@ -609,6 +752,18 @@ def _tuple_item(value: object, index: int) -> object:
     if isinstance(value, (tuple, list)) and index < len(value):
         return value[index]
     return None
+
+
+def _warmup_config_dict() -> dict[str, object]:
+    return {
+        "teleport_settle_seconds": BENCHMARK.teleport_settle_seconds,
+        "sensor_warmup_seconds": BENCHMARK.sensor_warmup_seconds,
+        "filter_warmup_seconds": BENCHMARK.filter_warmup_seconds,
+        "offline_metric_warmup_seconds": BENCHMARK.offline_metric_warmup_seconds,
+        "min_fresh_sensor_frames_after_teleport": BENCHMARK.min_fresh_sensor_frames_after_teleport,
+        "max_valid_imu_accel_mps2": BENCHMARK.max_valid_imu_accel_mps2,
+        "divergence_error_threshold_m": BENCHMARK.divergence_error_threshold_m,
+    }
 
 
 def _waypoint_location_dict(waypoint: "carla.Waypoint") -> dict[str, float]:

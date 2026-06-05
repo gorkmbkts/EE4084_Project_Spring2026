@@ -662,9 +662,11 @@ class RouteTestRunner:
             "vehicle_behavior_config": config.get("vehicle_behavior_config"),
             "random_seed": config.get("random_seed"),
             "project_commit": (config.get("metadata") or {}).get("project_commit") if isinstance(config.get("metadata"), dict) else None,
-            "primary_metric_source": "driving_preferred",
+            "primary_metric_source": "eval_preferred",
             "mean_filtered_rmse_m": _mean(filtered_values),
             "mean_raw_gnss_rmse_m": _mean(raw_values),
+            "mean_eval_filtered_rmse_m": _mean(_finite_summary_values(self._route_summaries, "eval_filtered_rmse_m")),
+            "mean_eval_raw_gnss_rmse_m": _mean(_finite_summary_values(self._route_summaries, "eval_raw_gnss_rmse_m")),
             "mean_driving_filtered_rmse_m": _mean(_finite_summary_values(self._route_summaries, "driving_filtered_rmse_m")),
             "mean_driving_raw_gnss_rmse_m": _mean(_finite_summary_values(self._route_summaries, "driving_raw_gnss_rmse_m")),
             "mean_overall_filtered_rmse_m": _mean(_finite_summary_values(self._route_summaries, "filtered_rmse_m")),
@@ -692,6 +694,12 @@ class RouteTestRunner:
             "yaw_rmse_deg",
             "mean_nees",
             "mean_nis",
+            "eval_filtered_rmse_m",
+            "eval_raw_gnss_rmse_m",
+            "eval_improvement_percent",
+            "valid_for_metrics_sample_count",
+            "startup_transient_sample_count",
+            "warmup_excluded_s",
             "driving_filtered_rmse_m",
             "driving_raw_gnss_rmse_m",
             "driving_improvement_percent",
@@ -734,6 +742,12 @@ class RouteTestRunner:
                         "yaw_rmse_deg": metrics.get("yaw_rmse_deg"),
                         "mean_nees": metrics.get("mean_nees"),
                         "mean_nis": metrics.get("mean_nis"),
+                        "eval_filtered_rmse_m": metrics.get("eval_filtered_rmse_m"),
+                        "eval_raw_gnss_rmse_m": metrics.get("eval_raw_gnss_rmse_m"),
+                        "eval_improvement_percent": metrics.get("eval_improvement_percent"),
+                        "valid_for_metrics_sample_count": summary.get("valid_for_metrics_sample_count"),
+                        "startup_transient_sample_count": summary.get("startup_transient_sample_count"),
+                        "warmup_excluded_s": summary.get("warmup_excluded_s"),
                         "driving_filtered_rmse_m": metrics.get("driving_filtered_rmse_m"),
                         "driving_raw_gnss_rmse_m": metrics.get("driving_raw_gnss_rmse_m"),
                         "driving_improvement_percent": metrics.get("driving_improvement_percent"),
@@ -857,13 +871,9 @@ class RouteTestRunner:
                 "last_failure_reason": failed_attempts[-1]["reason"] if failed_attempts else None,
             }
         )
-        filtered = _optional_float(enriched.get("filtered_rmse_m"))
-        raw = _optional_float(enriched.get("raw_gnss_rmse_m"))
-        if raw is not None and raw > 0.0 and filtered is not None:
-            enriched["improvement_percent"] = 100.0 * (raw - filtered) / raw
-        else:
-            enriched["improvement_percent"] = None
-        enriched["primary_metric_source"] = _primary_metric_row(enriched).get("primary_metric_source")
+        primary_metrics = _primary_metric_row(enriched)
+        enriched["improvement_percent"] = primary_metrics.get("improvement_percent")
+        enriched["primary_metric_source"] = primary_metrics.get("primary_metric_source")
         return enriched
 
     def _pending_route(self) -> Optional[SavedTestRoute]:
@@ -934,25 +944,47 @@ def _prefer_driving_metric(summary: dict[str, object], driving_key: str, overall
     return _optional_float(summary.get(overall_key))
 
 
+def _prefer_eval_metric(
+    summary: dict[str, object],
+    eval_key: str,
+    driving_key: str,
+    overall_key: str,
+) -> Optional[float]:
+    eval_value = _optional_float(summary.get(eval_key))
+    if eval_value is not None:
+        return eval_value
+    return _prefer_driving_metric(summary, driving_key, overall_key)
+
+
 def _primary_metric_row(summary: dict[str, object]) -> dict[str, Optional[float] | str]:
+    eval_filtered = _optional_float(summary.get("eval_filtered_rmse_m"))
+    eval_raw = _optional_float(summary.get("eval_raw_gnss_rmse_m"))
     driving_filtered = _optional_float(summary.get("driving_filtered_rmse_m"))
     driving_raw = _optional_float(summary.get("driving_raw_gnss_rmse_m"))
     overall_filtered = _optional_float(summary.get("filtered_rmse_m"))
     overall_raw = _optional_float(summary.get("raw_gnss_rmse_m"))
 
-    primary_filtered = driving_filtered if driving_filtered is not None else overall_filtered
-    primary_raw = driving_raw if driving_raw is not None else overall_raw
-    primary_source = "driving" if driving_filtered is not None or driving_raw is not None else "overall_fallback"
+    primary_filtered = eval_filtered if eval_filtered is not None else driving_filtered if driving_filtered is not None else overall_filtered
+    primary_raw = eval_raw if eval_raw is not None else driving_raw if driving_raw is not None else overall_raw
+    if eval_filtered is not None or eval_raw is not None:
+        primary_source = "eval"
+    elif driving_filtered is not None or driving_raw is not None:
+        primary_source = "driving"
+    else:
+        primary_source = "overall_fallback"
 
     return {
         "primary_metric_source": primary_source,
         "filtered_rmse_m": primary_filtered,
         "raw_gnss_rmse_m": primary_raw,
         "improvement_percent": _improvement_percent(primary_raw, primary_filtered),
-        "speed_rmse_mps": _prefer_driving_metric(summary, "driving_speed_rmse_mps", "speed_rmse_mps"),
-        "yaw_rmse_deg": _prefer_driving_metric(summary, "driving_yaw_rmse_deg", "yaw_rmse_deg"),
-        "mean_nees": _prefer_driving_metric(summary, "driving_mean_nees", "mean_nees"),
-        "mean_nis": _prefer_driving_metric(summary, "driving_mean_nis", "mean_nis"),
+        "speed_rmse_mps": _prefer_eval_metric(summary, "eval_speed_rmse_mps", "driving_speed_rmse_mps", "speed_rmse_mps"),
+        "yaw_rmse_deg": _prefer_eval_metric(summary, "eval_yaw_rmse_deg", "driving_yaw_rmse_deg", "yaw_rmse_deg"),
+        "mean_nees": _prefer_eval_metric(summary, "eval_mean_nees", "driving_mean_nees", "mean_nees"),
+        "mean_nis": _prefer_eval_metric(summary, "eval_mean_nis", "driving_mean_nis", "mean_nis"),
+        "eval_filtered_rmse_m": eval_filtered,
+        "eval_raw_gnss_rmse_m": eval_raw,
+        "eval_improvement_percent": _improvement_percent(eval_raw, eval_filtered),
         "driving_filtered_rmse_m": driving_filtered,
         "driving_raw_gnss_rmse_m": driving_raw,
         "driving_improvement_percent": _improvement_percent(driving_raw, driving_filtered),
