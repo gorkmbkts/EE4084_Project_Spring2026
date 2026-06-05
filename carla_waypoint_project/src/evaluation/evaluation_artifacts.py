@@ -9,9 +9,6 @@ from pathlib import Path
 import re
 from typing import Optional
 
-from config.settings import BENCHMARK
-
-
 OFFLINE_LOCALIZATION_EXPLANATION = (
     "Closed-loop benchmark evaluates the complete filter-controller-driving behavior system. "
     "Offline localization replay evaluates filter-only localization performance by replaying "
@@ -21,6 +18,7 @@ OFFLINE_LOCALIZATION_EXPLANATION = (
 OFFLINE_REPORT_NAME = "Localization Evaluation Under Identical Sensor Logs"
 OFFLINE_MODE_NAME = "Offline Localization Replay"
 RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER = "ground_truth_controller"
+DEFAULT_OFFLINE_OUTPUT_ROOT = "benchmark_results"
 
 
 @dataclass(frozen=True)
@@ -54,20 +52,20 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def benchmark_root(output_root: str = BENCHMARK.output_root) -> Path:
+def benchmark_root(output_root: str = DEFAULT_OFFLINE_OUTPUT_ROOT) -> Path:
     root = Path(output_root)
     return root if root.is_absolute() else project_root() / root
 
 
-def offline_root(output_root: str = BENCHMARK.output_root) -> Path:
+def offline_root(output_root: str = DEFAULT_OFFLINE_OUTPUT_ROOT) -> Path:
     return benchmark_root(output_root) / "offline_localization"
 
 
-def recordings_root(output_root: str = BENCHMARK.output_root) -> Path:
+def recordings_root(output_root: str = DEFAULT_OFFLINE_OUTPUT_ROOT) -> Path:
     return offline_root(output_root) / "recordings"
 
 
-def evaluations_root(output_root: str = BENCHMARK.output_root) -> Path:
+def evaluations_root(output_root: str = DEFAULT_OFFLINE_OUTPUT_ROOT) -> Path:
     return offline_root(output_root) / "evaluations"
 
 
@@ -106,7 +104,7 @@ def read_json(path: Path) -> dict[str, object]:
     return data if isinstance(data, dict) else {}
 
 
-def list_recorded_logs(output_root: str = BENCHMARK.output_root) -> list[RecordedLogInfo]:
+def list_recorded_logs(output_root: str = DEFAULT_OFFLINE_OUTPUT_ROOT) -> list[RecordedLogInfo]:
     """Return route-level recorded sensor logs sorted newest first."""
     root = recordings_root(output_root)
     if not root.exists():

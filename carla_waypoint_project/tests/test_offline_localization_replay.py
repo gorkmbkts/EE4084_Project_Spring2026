@@ -13,9 +13,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.evaluation.evaluation_artifacts import (  # noqa: E402
+    DEFAULT_OFFLINE_OUTPUT_ROOT,
     OFFLINE_LOCALIZATION_EXPLANATION,
     RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
     list_recorded_logs,
+    recordings_root,
     write_json,
 )
 from src.evaluation.offline_replay_runner import OfflineReplayRequest, OfflineReplayRunner  # noqa: E402
@@ -121,6 +123,12 @@ def test_startup_test_setup_has_nested_offline_tabs() -> None:
             raise AssertionError(f"startup setup missing {text!r}")
 
 
+def test_offline_recording_discovery_defaults_to_benchmark_results() -> None:
+    expected = PROJECT_ROOT / DEFAULT_OFFLINE_OUTPUT_ROOT / "offline_localization" / "recordings"
+    if recordings_root() != expected:
+        raise AssertionError(f"offline recordings default path changed: {recordings_root()} != {expected}")
+
+
 def _short_saved_route():
     store = TestRouteStore()
     for route in store.all_routes:
@@ -193,6 +201,7 @@ def run_all() -> None:
         test_offline_replay_runs_on_short_saved_route_log(Path(directory))
     test_offline_recording_does_not_feed_filter_control()
     test_startup_test_setup_has_nested_offline_tabs()
+    test_offline_recording_discovery_defaults_to_benchmark_results()
 
 
 if __name__ == "__main__":
