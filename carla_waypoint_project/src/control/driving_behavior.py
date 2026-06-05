@@ -148,28 +148,25 @@ class CurvatureSpeedPlanner:
         state: VehicleState,
         preview_waypoints: Sequence["carla.Waypoint"],
     ) -> tuple[float, float, float]:
-        points = [(float(state.x), float(state.y))]
+        del state
         max_distance = max(3.0, float(self._config.curve_lookahead_m))
+        points: list[tuple[float, float]] = []
         distance = 0.0
 
-        previous_x, previous_y = points[0]
-        yaw_rad = math.radians(state.yaw)
         for waypoint in preview_waypoints:
             location = waypoint.transform.location
             x = float(location.x)
             y = float(location.y)
-            if len(points) == 1:
-                dx = x - state.x
-                dy = y - state.y
-                local_x = math.cos(yaw_rad) * dx + math.sin(yaw_rad) * dy
-                if local_x < -0.5:
-                    continue
+            if not points:
+                points.append((x, y))
+                continue
+
+            previous_x, previous_y = points[-1]
             step = math.hypot(x - previous_x, y - previous_y)
             if step < 0.05:
                 continue
             distance += step
             points.append((x, y))
-            previous_x, previous_y = x, y
             if distance >= max_distance:
                 break
 
