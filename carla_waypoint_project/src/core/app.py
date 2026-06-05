@@ -6,7 +6,7 @@ from collections import deque
 from enum import Enum
 import math
 import time
-from typing import Optional
+from typing import Optional, Sequence
 
 import pygame
 
@@ -44,6 +44,7 @@ from src.evaluation.benchmark_config import (
 from src.evaluation.filter_performance import FilterPerformanceLogger
 from src.evaluation.plot_job_worker import BenchmarkPlotJobWorker
 from src.evaluation.route_test_runner import RouteTestRunner
+from src.evaluation.sensor_log_recorder import OfflineRecordingConfig, SensorLogRecorder
 from src.evaluation.test_route_store import TestRouteStore
 from src.localization.gnss_projection import GnssDiagnostics, GnssLocalProjector
 from src.planning.map_selector import MapSelector
@@ -115,12 +116,14 @@ class SimulationApp:
         selected_map_load_name: Optional[str] = None,
         existing_display_surface: Optional[pygame.Surface] = None,
         benchmark_config: Optional[BenchmarkConfig] = None,
+        offline_recording_config: Optional[OfflineRecordingConfig] = None,
     ) -> None:
         pygame.init()
         self._requested_map_name = requested_map_name
         self._selected_map_load_name = selected_map_load_name or requested_map_name
         self._existing_display_surface = existing_display_surface
         self._startup_benchmark_config = benchmark_config
+        self._startup_offline_recording_config = offline_recording_config
         self._client_manager = CarlaClientManager(requested_map_name=requested_map_name)
         self._clock = SimulationClock()
         self._display: Optional[PygameDisplay] = None
@@ -146,6 +149,7 @@ class SimulationApp:
         self._topdown_renderer: Optional[TopDownMapRenderer] = None
         self._test_route_store: Optional[TestRouteStore] = None
         self._test_runner: Optional[RouteTestRunner] = None
+        self._offline_recorder: Optional[SensorLogRecorder] = None
         self._plot_worker = BenchmarkPlotJobWorker()
         self._performance_logger = FilterPerformanceLogger()
         self.route_planner: Optional[RoutePlanner] = None
@@ -204,6 +208,7 @@ class SimulationApp:
         self._control_visual_widget: Optional[ControlVisualizationWidget] = None
         self._driving_diagnostics_widget: Optional[DrivingDiagnosticsWidget] = None
         self._benchmark_start_attempted = False
+        self._offline_recording_start_attempted = False
         self._last_sensor_apply_status = "Sensor noise changes respawn GNSS/IMU safely."
         self._failure_monitor_last_progress_time: Optional[float] = None
         self._failure_monitor_last_position: Optional[tuple[float, float]] = None
@@ -278,6 +283,15 @@ class SimulationApp:
             enqueue_aggregate_plots_callback=self._plot_worker.enqueue_aggregate_plots,
             selected_map_load_name=self._selected_map_load_name,
         )
+        self._offline_recorder = SensorLogRecorder(
+            world_map=world_map,
+            route_store=self._test_route_store,
+            begin_route_callback=self._begin_offline_recording_route,
+            plan_route_callback=self._planned_route_for_metadata,
+            weather_callback=self._weather_metadata,
+            vehicle_blueprint_callback=self._vehicle_blueprint_metadata,
+            selected_map_load_name=self._selected_map_load_name,
+        )
 
         if self.route_planner.planner_error:
             self._planner_status = "Planner: fallback"
@@ -285,7 +299,10 @@ class SimulationApp:
             self._planner_status = "Planner: CARLA"
 
         self._initialize_display()
-        self._apply_startup_benchmark_config()
+        if self._startup_offline_recording_config is not None:
+            self._apply_startup_offline_recording_config()
+        else:
+            self._apply_startup_benchmark_config()
 
     def _ensure_ready(self) -> None:
         required = {
@@ -306,6 +323,7 @@ class SimulationApp:
             "top-down renderer": self._topdown_renderer,
             "test route store": self._test_route_store,
             "test runner": self._test_runner,
+            "offline recorder": self._offline_recorder,
         }
         missing = [name for name, value in required.items() if value is None]
         if missing:
@@ -476,6 +494,45 @@ class SimulationApp:
         self._control_status_text = self._test_runner.status_text
         if not started and self._test_runner.needs_map_switch(self._active_map_name):
             self._switch_map_for_benchmark()
+
+    def _apply_startup_offline_recording_config(self) -> None:
+        config = self._startup_offline_recording_config
+        if config is None or self._offline_recording_start_attempted:
+            return
+        self._offline_recording_start_attempted = True
+        self.sensor_noise_config = config.sensor_noise_config
+        apply_behavior_values(self.driving_behavior_config, config.vehicle_behavior_config)
+        if self._sensor_noise_panel is not None:
+            self._sensor_noise_panel.set_values(
+                {
+                    key: value
+                    for key, value in self.sensor_noise_config.to_dict().items()
+                    if isinstance(value, (int, float))
+                },
+                active_preset=config.sensor_noise_preset,
+                commit=False,
+            )
+        try:
+            if self._gnss_sensor is not None:
+                self._gnss_sensor.apply_config(self.sensor_noise_config, respawn=True)
+            if self._imu_sensor is not None:
+                self._imu_sensor.apply_config(self.sensor_noise_config, respawn=True)
+        except Exception as exc:
+            self._planner_status = f"Offline recording sensor setup failed: {exc}"
+            self._control_status_text = self._planner_status
+            return
+        if self._offline_recorder is None:
+            self._planner_status = "Offline recorder unavailable"
+            self._control_status_text = self._planner_status
+            return
+        self._test_route_authoring_active = False
+        self._map_selection_active = False
+        self._drive_mode = DriveMode.AUTONOMOUS
+        started = self._offline_recorder.start_recording(config, self._active_map_name)
+        self._planner_status = self._offline_recorder.status_text
+        self._control_status_text = self._offline_recorder.status_text
+        if not started and self._offline_recorder.needs_map_switch(self._active_map_name):
+            self._switch_map_for_offline_recording()
 
     def _benchmark_output_status(self) -> str:
         runner = self._test_runner
@@ -1069,9 +1126,12 @@ class SimulationApp:
         logger = self._active_performance_logger()
         runner = self._test_runner
         benchmark_state = "active" if runner is not None and runner.is_active else "inactive"
+        offline_state = "recording" if self._offline_recording_active() else "inactive"
         output = ""
         if runner is not None and runner.benchmark_folder is not None and not runner.is_active:
             output = f" | OUTPUT {runner.benchmark_folder.name}"
+        if self._offline_recorder is not None and self._offline_recorder.run_folder is not None and not self._offline_recorder.is_active:
+            output = f" | OUTPUT {self._offline_recorder.run_folder.name}"
         return (
             f"MODE {self._drive_mode.value} | "
             f"FILTER {self._active_filter_name()} | "
@@ -1083,6 +1143,7 @@ class SimulationApp:
             f"GNSS {self._format_optional_metric(logger.current_raw_gnss_error_m, 'm')} | "
             f"CTE {self._format_optional_metric(logger.current_cross_track_error_m, 'm')} | "
             f"BENCH {benchmark_state}"
+            f" | OFFLINE {offline_state}"
             f"{output}"
         )
 
@@ -1109,7 +1170,15 @@ class SimulationApp:
         return self._filter_manager.active_filter_safe_for_autonomous_control()
 
     def _test_mode_active(self) -> bool:
-        return bool(self._test_runner is not None and self._test_runner.is_active and self._test_runner.is_automated)
+        benchmark_active = bool(
+            self._test_runner is not None
+            and self._test_runner.is_active
+            and self._test_runner.is_automated
+        )
+        return benchmark_active or self._offline_recording_active()
+
+    def _offline_recording_active(self) -> bool:
+        return bool(self._offline_recorder is not None and self._offline_recorder.is_active)
 
     def _active_filter_warning(self) -> str:
         if self._filter_manager is None:
@@ -1185,7 +1254,10 @@ class SimulationApp:
                 if self._can_update_route_tracking() and self._latest_state is not None:
                     self._latest_tracking = self.waypoint_tracker.update(self._latest_state)
                 self._update_sensor_diagnostics()
-                world_reloaded = self._update_test_performance()
+                if self._offline_recording_active():
+                    world_reloaded = self._update_offline_recording()
+                else:
+                    world_reloaded = self._update_test_performance()
                 if world_reloaded or frame_generation != self._world_context_generation:
                     self._clock.tick_pygame()
                     continue
@@ -1214,7 +1286,8 @@ class SimulationApp:
                         self._clock.tick_pygame()
                         continue
                     self._set_latest_control(control, control)
-                    self._feed_filter_control_input(control, source="route_initialization_brake")
+                    if not self._offline_recording_active():
+                        self._feed_filter_control_input(control, source="route_initialization_brake")
                     self.actuator_realism.reset(control)
                 elif self._drive_mode == DriveMode.AUTONOMOUS:
                     control_state = self._state_for_tracking_and_control()
@@ -1225,7 +1298,8 @@ class SimulationApp:
                             self._clock.tick_pygame()
                             continue
                         self._set_latest_control(control, control)
-                        self._feed_filter_control_input(control, source="autonomous_safety_brake")
+                        if not self._offline_recording_active():
+                            self._feed_filter_control_input(control, source="autonomous_safety_brake")
                         self.actuator_realism.reset(control)
                     else:
                         preview_waypoints = self.waypoint_tracker.get_preview_waypoints(max_count=90)
@@ -1248,7 +1322,8 @@ class SimulationApp:
                             self._clock.tick_pygame()
                             continue
                         self._set_latest_control(control, applied_control)
-                        self._feed_filter_control_input(applied_control, source="autonomous_applied")
+                        if not self._offline_recording_active():
+                            self._feed_filter_control_input(applied_control, source="autonomous_applied")
                 else:
                     try:
                         control = self._manual_controller.apply_control()
@@ -1309,6 +1384,8 @@ class SimulationApp:
 
     def _state_for_tracking_and_control(self) -> Optional[VehicleState]:
         """Return GT in manual mode and the active filter state in autonomous mode."""
+        if self._offline_recording_active():
+            return self._latest_ground_truth_state
         if self._drive_mode == DriveMode.AUTONOMOUS:
             return self._latest_estimated_state
         return self._latest_ground_truth_state
@@ -1460,6 +1537,7 @@ class SimulationApp:
     def _set_manual_mode(self) -> None:
         if self._test_runner is not None and self._test_runner.is_active:
             self._test_runner.stop(aborted=True, reason="Test aborted: manual mode")
+        self._stop_offline_recording_if_active("Offline recording aborted: manual mode")
         self._cancel_route_activation()
         self._drive_mode = DriveMode.MANUAL
         if self._vehicle is not None:
@@ -1648,6 +1726,7 @@ class SimulationApp:
     def _emergency_brake(self) -> None:
         if self._test_runner is not None and self._test_runner.is_active:
             self._test_runner.stop(aborted=True, reason="Test aborted: emergency brake")
+        self._stop_offline_recording_if_active("Offline recording aborted: emergency brake")
         self._cancel_route_activation()
         self._drive_mode = DriveMode.MANUAL
         if self._vehicle is not None:
@@ -1826,6 +1905,32 @@ class SimulationApp:
         self._teleport_vehicle_to_route_start(start_waypoint)
         self._reset_driving_behavior()
 
+    def _begin_offline_recording_route(
+        self,
+        start_waypoint: "carla.Waypoint",
+        goal_waypoint: "carla.Waypoint",
+        route_waypoints: Sequence["carla.Waypoint"],
+    ) -> None:
+        del goal_waypoint
+        if self.route_planner is not None:
+            self.route_planner.set_route(route_waypoints)
+        self.waypoint_tracker.set_route(route_waypoints)
+        self._latest_tracking = self._empty_tracking_status()
+        self._reset_benchmark_failure_monitor()
+        self._pending_start_waypoint = None
+        self._pending_goal_waypoint = None
+        self._pending_start_autonomous = False
+        self._route_activation_state = RouteActivationState.ROUTE_ACTIVE
+        self._drive_mode = DriveMode.AUTONOMOUS
+        self._route_generation_blocked = False
+        self._planner_status = "Offline recording: ground-truth controller active"
+        self._teleport_vehicle_to_route_start(start_waypoint)
+        if self.route_planner is not None:
+            self.route_planner.set_route(route_waypoints)
+        self.waypoint_tracker.set_route(route_waypoints)
+        self._route_activation_state = RouteActivationState.ROUTE_ACTIVE
+        self._reset_driving_behavior()
+
     def _generate_route_from_selection(
         self,
         teleport_to_start: bool = True,
@@ -1975,6 +2080,8 @@ class SimulationApp:
     def _clear_route(self, stop_test: bool = True) -> None:
         if stop_test and self._test_runner is not None and self._test_runner.is_active:
             self._test_runner.stop(aborted=True, reason="Test aborted: route cleared")
+        if stop_test:
+            self._stop_offline_recording_if_active("Offline recording aborted: route cleared")
         self._cancel_route_activation()
         if self.route_planner is not None:
             self.route_planner.clear_route()
@@ -1983,6 +2090,10 @@ class SimulationApp:
         self._reset_benchmark_failure_monitor()
         self._drive_mode = DriveMode.MANUAL
         self._reset_driving_behavior()
+
+    def _stop_offline_recording_if_active(self, reason: str) -> None:
+        if self._offline_recorder is not None and self._offline_recorder.is_active:
+            self._offline_recorder.stop(aborted=True, reason=reason)
 
     def _switch_map_for_benchmark(self) -> WorldSwitchResult:
         runner = self._test_runner
@@ -2016,6 +2127,42 @@ class SimulationApp:
             runner.stop(aborted=True, reason=f"Map switch failed: {exc}")
             self._planner_status = runner.status_text
             self._control_status_text = runner.status_text
+            return WorldSwitchResult.FAILED
+        finally:
+            self._world_reload_in_progress = False
+
+    def _switch_map_for_offline_recording(self) -> WorldSwitchResult:
+        recorder = self._offline_recorder
+        if recorder is None or not recorder.is_active:
+            return WorldSwitchResult.NOOP
+        map_name = recorder.required_map_name()
+        if not map_name:
+            return WorldSwitchResult.NOOP
+        load_name = self._client_manager.resolve_map_load_name(map_name)
+        status = f"Loading map for offline recording: {display_map_name(load_name)}"
+        self._planner_status = status
+        self._control_status_text = status
+        self._world_context_generation += 1
+        self._world_reload_in_progress = True
+        try:
+            self._destroy_world_actors_for_reload()
+            self._client_manager.load_world(load_name)
+            self._rebuild_world_context_after_map_load(selected_map_load_name=load_name)
+            self._world_context_generation += 1
+            recorder.update_world_context(
+                world_map=self._client_manager.world_map,
+                route_store=self._test_route_store,
+                selected_map_load_name=map_name,
+            )
+            self._drive_mode = DriveMode.AUTONOMOUS
+            self._skip_frames_after_world_reload = 1
+            self._planner_status = recorder.status_text
+            self._control_status_text = recorder.status_text
+            return WorldSwitchResult.SWITCHED
+        except Exception as exc:
+            recorder.stop(aborted=True, reason=f"Offline recording map switch failed: {exc}")
+            self._planner_status = recorder.status_text
+            self._control_status_text = recorder.status_text
             return WorldSwitchResult.FAILED
         finally:
             self._world_reload_in_progress = False
@@ -2234,6 +2381,9 @@ class SimulationApp:
     def _draw_control_panel(self) -> None:
         assert self._display is not None
         assert self._control_panel is not None
+        if self._offline_recording_active() and self._live_evaluation_panel is not None:
+            self._live_evaluation_panel.draw(self._display.surface, self._offline_recording_lines())
+            return
         if self._test_mode_active() and self._live_evaluation_panel is not None:
             self._update_live_evaluation_history()
             self._live_evaluation_panel.draw(self._display.surface, self._live_evaluation_lines())
@@ -2259,6 +2409,8 @@ class SimulationApp:
         self._status_bar.draw(self._display.surface, self._display.status_bar_rect)
 
     def _test_progress_lines(self) -> list[str]:
+        if self._offline_recording_active():
+            return self._offline_recording_lines()
         runner = self._test_runner
         config = runner.config if runner is not None else None
         route = runner.current_route_name if runner is not None else ""
@@ -2289,6 +2441,35 @@ class SimulationApp:
         last_failure = runner.last_failure_reason if runner is not None else self._last_benchmark_failure_reason
         if last_failure:
             lines.append(f"Last failure: {last_failure}")
+        return lines
+
+    def _offline_recording_lines(self) -> list[str]:
+        recorder = self._offline_recorder
+        config = self._startup_offline_recording_config
+        completion = self._route_completion_percent()
+        lines = [
+            "Offline Localization Replay: recording",
+            "Driver: ground_truth_controller",
+            f"Route: {(recorder.current_route_index + 1) if recorder is not None else 0}/{recorder.total_routes if recorder is not None else 0}",
+            f"Current: {recorder.current_route_name if recorder is not None else 'initializing'}",
+            f"Map: {self._active_map_display_name()}",
+            f"State: {recorder.state.value if recorder is not None else 'n/a'}",
+            f"Samples: {recorder.sample_count if recorder is not None else 0}",
+            f"Route time: {recorder.elapsed_route_seconds():.1f}s" if recorder is not None else "Route time: n/a",
+            f"Distance to goal: {self._format_optional_metric(self._latest_tracking.distance_to_goal_m, 'm')}",
+            f"Completion: {completion:.0f}%" if completion is not None else "Completion: n/a",
+            "Control state: ground truth",
+            "Candidate filters do not control this pass.",
+        ]
+        if config is not None:
+            lines.insert(6, f"Sensor preset: {config.sensor_noise_preset}")
+            lines.insert(7, f"Behavior preset: {config.vehicle_behavior_preset}")
+        if recorder is not None and recorder.status_text:
+            lines.append(recorder.status_text)
+        if recorder is not None and recorder.run_folder is not None:
+            lines.append(f"Output folder: {recorder.run_folder}")
+        if recorder is not None and recorder.last_failure_reason:
+            lines.append(f"Last failure: {recorder.last_failure_reason}")
         return lines
 
     def _live_evaluation_lines(self) -> list[str]:
@@ -2371,8 +2552,81 @@ class SimulationApp:
         next_index = runner.current_route_index + (1 if runner.route_running else 0)
         routes = runner.config.selected_routes
         if 0 <= next_index < len(routes):
-            return routes[next_index].name
+                return routes[next_index].name
         return ""
+
+    def _update_offline_recording(self) -> bool:
+        recorder = self._offline_recorder
+        if recorder is None or not recorder.is_active:
+            return False
+        if not recorder.route_running:
+            if recorder.needs_map_switch(self._active_map_name):
+                return self._switch_map_for_offline_recording() != WorldSwitchResult.NOOP
+            recorder.update(
+                route_completed=False,
+                route_failed=False,
+                active_map_name=self._active_map_name,
+                ground_truth_state=self._latest_ground_truth_state,
+                gnss_measurement=self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None,
+                imu_measurement=self._imu_sensor.get_latest_measurement() if self._imu_sensor is not None else None,
+                gnss_projector=self._gnss_projector,
+                applied_control=self._latest_applied_control,
+                frame_index=self._current_world_frame(),
+                failure_reason=failure_reason,
+            )
+            self._control_status_text = recorder.status_text
+            self._planner_status = recorder.status_text
+            return False
+
+        route = self.route_planner.get_route() if self.route_planner is not None else []
+        route_failed = (
+            self._route_activation_state == RouteActivationState.IDLE
+            and not route
+            and not self._latest_tracking.completed
+        )
+        failure_reason = self._offline_recording_failure_reason(route_failed=route_failed)
+        if failure_reason:
+            if self._vehicle is not None:
+                try:
+                    self._vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+                except RuntimeError:
+                    pass
+            recorder.update(
+                route_completed=False,
+                route_failed=True,
+                active_map_name=self._active_map_name,
+                ground_truth_state=self._latest_ground_truth_state,
+                gnss_measurement=self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None,
+                imu_measurement=self._imu_sensor.get_latest_measurement() if self._imu_sensor is not None else None,
+                gnss_projector=self._gnss_projector,
+                applied_control=self._latest_applied_control,
+                frame_index=self._current_world_frame(),
+            )
+            self._last_benchmark_failure_reason = failure_reason
+            self._reset_benchmark_failure_monitor()
+        else:
+            recorder.update(
+                route_completed=self._latest_tracking.completed,
+                route_failed=route_failed,
+                active_map_name=self._active_map_name,
+                ground_truth_state=self._latest_ground_truth_state,
+                gnss_measurement=self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None,
+                imu_measurement=self._imu_sensor.get_latest_measurement() if self._imu_sensor is not None else None,
+                gnss_projector=self._gnss_projector,
+                applied_control=self._latest_applied_control,
+                frame_index=self._current_world_frame(),
+            )
+        self._control_status_text = recorder.status_text
+        self._planner_status = recorder.status_text
+        if recorder.needs_map_switch(self._active_map_name):
+            return self._switch_map_for_offline_recording() != WorldSwitchResult.NOOP
+        return False
+
+    def _current_world_frame(self) -> Optional[int]:
+        try:
+            return int(self._client_manager.world.get_snapshot().frame)
+        except Exception:
+            return None
 
     def _update_test_performance(self) -> bool:
         runner = self._test_runner
@@ -2513,6 +2767,73 @@ class SimulationApp:
             return f"No route progress for {stalled_seconds:.1f}s"
         return ""
 
+    def _offline_recording_failure_reason(self, route_failed: bool) -> str:
+        recorder = self._offline_recorder
+        if recorder is None or not recorder.route_running:
+            self._reset_benchmark_failure_monitor()
+            return ""
+        if route_failed:
+            return "Route unavailable before completion"
+        if self._latest_tracking.completed:
+            self._reset_benchmark_failure_monitor()
+            return ""
+        if self._route_activation_state != RouteActivationState.ROUTE_ACTIVE:
+            self._reset_benchmark_failure_monitor()
+            return ""
+        state = self._latest_ground_truth_state
+        if state is None:
+            return ""
+
+        now = time.monotonic()
+        position = (float(state.x), float(state.y))
+        speed = abs(float(state.speed))
+        tracking = self._latest_tracking
+        cte = tracking.cross_track_error_m
+        if isinstance(cte, (int, float)) and math.isfinite(cte) and cte >= BENCHMARK_LATERAL_DEVIATION_M:
+            if self._failure_monitor_deviation_started is None:
+                self._failure_monitor_deviation_started = now
+            elif now - self._failure_monitor_deviation_started >= BENCHMARK_LATERAL_DEVIATION_SECONDS:
+                return f"Large lateral deviation ({cte:.1f} m from route)"
+        else:
+            self._failure_monitor_deviation_started = None
+
+        if self._failure_monitor_last_progress_time is None:
+            self._failure_monitor_last_progress_time = now
+            self._failure_monitor_last_position = position
+            self._failure_monitor_last_distance_to_goal = self._finite_float(tracking.distance_to_goal_m)
+            self._failure_monitor_last_closest_index = tracking.closest_index
+            return ""
+
+        moved_m = 0.0
+        if self._failure_monitor_last_position is not None:
+            moved_m = math.hypot(
+                position[0] - self._failure_monitor_last_position[0],
+                position[1] - self._failure_monitor_last_position[1],
+            )
+        current_goal_distance = self._finite_float(tracking.distance_to_goal_m)
+        previous_goal_distance = self._failure_monitor_last_distance_to_goal
+        goal_distance_progress = (
+            previous_goal_distance is not None
+            and current_goal_distance is not None
+            and previous_goal_distance - current_goal_distance >= BENCHMARK_GOAL_DISTANCE_PROGRESS_M
+        )
+        index_progress = tracking.closest_index > self._failure_monitor_last_closest_index
+        movement_progress = moved_m >= BENCHMARK_PROGRESS_DISTANCE_M
+
+        if movement_progress or goal_distance_progress or index_progress:
+            self._failure_monitor_last_progress_time = now
+            self._failure_monitor_last_position = position
+            self._failure_monitor_last_distance_to_goal = current_goal_distance
+            self._failure_monitor_last_closest_index = tracking.closest_index
+            return ""
+
+        stalled_seconds = now - self._failure_monitor_last_progress_time
+        if speed <= BENCHMARK_STUCK_SPEED_MPS and stalled_seconds >= BENCHMARK_STUCK_SECONDS:
+            return f"Vehicle stuck: speed {speed:.2f} m/s, no route progress for {stalled_seconds:.1f}s"
+        if stalled_seconds >= BENCHMARK_NO_PROGRESS_SECONDS:
+            return f"No route progress for {stalled_seconds:.1f}s"
+        return ""
+
     def _update_sensor_diagnostics(self) -> None:
         gnss = self._gnss_sensor.get_latest_measurement() if self._gnss_sensor is not None else None
         if self._gnss_projector is None:
@@ -2551,6 +2872,8 @@ class SimulationApp:
         """Destroy actors and close pygame resources."""
         if self._test_runner is not None and self._test_runner.is_active:
             self._test_runner.stop(aborted=True, reason="Application shutdown")
+        if self._offline_recorder is not None and self._offline_recorder.is_active:
+            self._offline_recorder.stop(aborted=True, reason="Application shutdown")
 
         self._plot_worker.shutdown(wait=True, timeout_s=2.0)
 

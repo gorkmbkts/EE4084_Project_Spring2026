@@ -27,6 +27,13 @@ from src.evaluation.benchmark_config import (
     validate_benchmark_config,
 )
 from src.control.driving_behavior import DrivingBehaviorConfig
+from src.evaluation.evaluation_artifacts import (
+    OFFLINE_LOCALIZATION_EXPLANATION,
+    RecordedLogInfo,
+    list_recorded_logs,
+)
+from src.evaluation.offline_replay_runner import OfflineReplayRequest, OfflineReplayRunner
+from src.evaluation.sensor_log_recorder import OfflineRecordingConfig
 from src.evaluation.test_route_store import SavedTestRoute
 from src.utils.map_names import display_map_name, maps_compatible, normalize_map_name
 from src.visualization.ui.parameter_controls import ParameterEditor
@@ -48,6 +55,17 @@ _COMMON_FALLBACK_MAPS = (
     "Town10HD_Opt",
 )
 
+EVALUATION_MODE_CLOSED_LOOP = "Closed-Loop Benchmark"
+EVALUATION_MODE_OFFLINE_REPLAY = "Offline Localization Replay"
+TEST_SETUP_SUBTABS = (
+    "Evaluation Mode",
+    "Filters",
+    "Sensor Noise",
+    "Vehicle Behavior",
+    "Routes",
+    "Offline Replay",
+)
+
 
 @dataclass(frozen=True)
 class StartupMapSelection:
@@ -57,6 +75,7 @@ class StartupMapSelection:
     active_map_name: Optional[str]
     used_current_map: bool
     benchmark_config: Optional[BenchmarkConfig] = None
+    offline_recording_config: Optional[OfflineRecordingConfig] = None
 
 
 @dataclass(frozen=True)
@@ -95,9 +114,14 @@ class StartupMapSelector:
         self._runtime_state_path = self._project_root / "config" / "runtime_state.json"
         self._active_tab = "Map Selection"
         self._tab_rects: dict[str, pygame.Rect] = {}
+        self._active_setup_subtab = "Evaluation Mode"
+        self._setup_subtab_rects: dict[str, pygame.Rect] = {}
+        self._evaluation_mode = EVALUATION_MODE_CLOSED_LOOP
+        self._evaluation_mode_rects: dict[str, pygame.Rect] = {}
         self._setup_filter_records = []
         self._setup_filter_buttons: dict[str, pygame.Rect] = {}
         self._selected_filter_id = ""
+        self._offline_filter_ids: set[str] = set()
         self._selected_filter_tunes: dict[str, dict[str, object]] = {}
         self._filter_tune_editor: Optional[ParameterEditor] = None
         self._filter_tune_editor_filter_id = ""
@@ -117,6 +141,14 @@ class StartupMapSelector:
         self._select_all_routes_rect = pygame.Rect(0, 0, 1, 1)
         self._clear_routes_rect = pygame.Rect(0, 0, 1, 1)
         self._start_benchmark_rect = pygame.Rect(0, 0, 1, 1)
+        self._record_sensor_logs_rect = pygame.Rect(0, 0, 1, 1)
+        self._run_offline_replay_rect = pygame.Rect(0, 0, 1, 1)
+        self._refresh_recorded_logs_rect = pygame.Rect(0, 0, 1, 1)
+        self._recorded_logs: list[RecordedLogInfo] = []
+        self._selected_recorded_log_indices: set[int] = set()
+        self._recorded_log_scroll = 0
+        self._recorded_log_rects: dict[int, pygame.Rect] = {}
+        self._offline_status_lines: list[str] = ["Recorded logs are loaded from benchmark_results/offline_localization/recordings."]
         self._setup_summary_lines: list[str] = []
 
     @property
@@ -577,8 +609,18 @@ class StartupMapSelector:
             record.filter_id == self._selected_filter_id for record in self._setup_filter_records
         ):
             self._selected_filter_id = self._setup_filter_records[0].filter_id
+        if not self._offline_filter_ids:
+            self._offline_filter_ids = {
+                record.filter_id
+                for record in self._setup_filter_records
+                if record.benchmark_selectable and record.filter_id != "raw_gnss"
+            }
+            if not self._offline_filter_ids and self._selected_filter_id:
+                self._offline_filter_ids.add(self._selected_filter_id)
         self._ensure_filter_tune_editor()
         self._route_items = load_available_test_routes([option.load_name or option.detail for option in self._options])
+        if not self._recorded_logs:
+            self._refresh_recorded_logs()
         if self._sensor_editor is None:
             self._sensor_editor = ParameterEditor(
                 specs=SENSOR_NOISE_SPECS,
@@ -595,6 +637,13 @@ class StartupMapSelector:
                 active_preset="Balanced",
                 title="Vehicle Behavior Settings",
             )
+
+    def _refresh_recorded_logs(self) -> None:
+        self._recorded_logs = list_recorded_logs()
+        self._selected_recorded_log_indices = {
+            index for index in self._selected_recorded_log_indices if index < len(self._recorded_logs)
+        }
+        self._recorded_log_scroll = min(self._recorded_log_scroll, max(0, len(self._recorded_logs) - 1))
 
     def _selected_filter_record(self) -> object | None:
         return next(
@@ -657,10 +706,11 @@ class StartupMapSelector:
         record = self._selected_filter_record()
         if record is None:
             return TuneRecommendation("", self._tracking_mode, {}, ("Select a filter to see recommendations.",))
+        tracking_mode = TRACKING_MODE_PASSIVE if self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY else self._tracking_mode
         return recommend_filter_tune(
             filter_id=record.filter_id,
             sensor_noise_config=sensor_noise_config_from_values(self._current_sensor_values(), preset_name=self._sensor_preset),
-            tracking_mode=self._tracking_mode,
+            tracking_mode=tracking_mode,
             current_tune=dict(self._selected_filter_tunes.get(record.filter_id, record.tune)),
             tune_specs=getattr(record, "tune_specs", ()),
         )
@@ -693,101 +743,272 @@ class StartupMapSelector:
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and hasattr(event, "pos"):
             position = event.pos
+            for subtab, rect in self._setup_subtab_rects.items():
+                if rect.collidepoint(position):
+                    self._active_setup_subtab = subtab
+                    return _NoSelection
+            for mode, rect in self._evaluation_mode_rects.items():
+                if rect.collidepoint(position):
+                    self._evaluation_mode = mode
+                    return _NoSelection
             for filter_id, rect in self._setup_filter_buttons.items():
                 if rect.collidepoint(position):
                     self._selected_filter_id = filter_id
+                    if self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY:
+                        if filter_id == "raw_gnss":
+                            self._offline_status_lines = ["Raw GNSS is included automatically as the baseline."]
+                        elif filter_id in self._offline_filter_ids:
+                            self._offline_filter_ids.remove(filter_id)
+                        else:
+                            self._offline_filter_ids.add(filter_id)
                     self._ensure_filter_tune_editor()
                     return _NoSelection
             for mode, rect in self._tracking_button_rects.items():
-                if rect.collidepoint(position):
+                if self._evaluation_mode == EVALUATION_MODE_CLOSED_LOOP and rect.collidepoint(position):
                     self._tracking_mode = mode
                     return _NoSelection
-            if self._apply_recommended_rect.collidepoint(position):
+            if self._active_setup_subtab == "Filters" and self._apply_recommended_rect.collidepoint(position):
                 self._apply_recommended_setup_tune()
                 return _NoSelection
+            if self._active_setup_subtab == "Offline Replay" and self._refresh_recorded_logs_rect.collidepoint(position):
+                self._refresh_recorded_logs()
+                self._offline_status_lines = [f"Found {len(self._recorded_logs)} recorded route log(s)."]
+                return _NoSelection
 
-        if self._filter_tune_editor is not None and self._filter_tune_editor.handle_event(event):
+        if (
+            self._active_setup_subtab == "Filters"
+            and self._filter_tune_editor is not None
+            and self._filter_tune_editor.handle_event(event)
+        ):
             return _NoSelection
-        if self._sensor_editor is not None and self._sensor_editor.handle_event(event):
+        if (
+            self._active_setup_subtab == "Sensor Noise"
+            and self._sensor_editor is not None
+            and self._sensor_editor.handle_event(event)
+        ):
             self._sensor_preset = self._sensor_editor.active_preset
             return _NoSelection
-        if self._behavior_editor is not None and self._behavior_editor.handle_event(event):
+        if (
+            self._active_setup_subtab == "Vehicle Behavior"
+            and self._behavior_editor is not None
+            and self._behavior_editor.handle_event(event)
+        ):
             self._behavior_preset = self._behavior_editor.active_preset
             return _NoSelection
 
         if event.type == pygame.MOUSEWHEEL:
-            self._route_scroll = max(0, self._route_scroll - event.y * 2)
+            if self._active_setup_subtab == "Routes":
+                self._route_scroll = max(0, self._route_scroll - event.y * 2)
+            elif self._active_setup_subtab == "Offline Replay":
+                self._recorded_log_scroll = max(0, self._recorded_log_scroll - event.y * 2)
             return _NoSelection
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and hasattr(event, "pos"):
             position = event.pos
-            if self._select_all_routes_rect.collidepoint(position):
+            if self._active_setup_subtab == "Routes" and self._select_all_routes_rect.collidepoint(position):
                 self._selected_route_indices = {item.index for item in self._route_items}
                 return _NoSelection
-            if self._clear_routes_rect.collidepoint(position):
+            if self._active_setup_subtab == "Routes" and self._clear_routes_rect.collidepoint(position):
                 self._selected_route_indices.clear()
                 return _NoSelection
-            for index, rect in self._route_rects.items():
-                if rect.collidepoint(position):
+            if self._active_setup_subtab == "Routes":
+                for index, rect in self._route_rects.items():
+                    if not rect.collidepoint(position):
+                        continue
                     if index in self._selected_route_indices:
                         self._selected_route_indices.remove(index)
                     else:
                         self._selected_route_indices.add(index)
                     return _NoSelection
-            if self._start_benchmark_rect.collidepoint(position):
+            if self._active_setup_subtab == "Offline Replay":
+                for index, rect in self._recorded_log_rects.items():
+                    if not rect.collidepoint(position):
+                        continue
+                    if index in self._selected_recorded_log_indices:
+                        self._selected_recorded_log_indices.remove(index)
+                    else:
+                        self._selected_recorded_log_indices.add(index)
+                    return _NoSelection
+            if (
+                self._evaluation_mode == EVALUATION_MODE_CLOSED_LOOP
+                and self._start_benchmark_rect.collidepoint(position)
+            ):
                 return self._start_benchmark_from_setup(client)
+            if (
+                self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY
+                and self._record_sensor_logs_rect.collidepoint(position)
+            ):
+                return self._start_offline_recording_from_setup(client)
+            if (
+                self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY
+                and self._run_offline_replay_rect.collidepoint(position)
+            ):
+                self._run_offline_replay_from_setup()
+                return _NoSelection
         return _NoSelection
 
     def _draw_test_setup(self, rect: pygame.Rect) -> None:
         self._refresh_test_setup()
         gap = 12
         bottom = pygame.Rect(rect.left, rect.bottom - 46, rect.width, 42)
-        work = pygame.Rect(rect.left, rect.top, rect.width, rect.height - 58)
-
-        if work.width >= 1280:
-            column_width = max(250, (work.width - 3 * gap) // 4)
-            left = pygame.Rect(work.left, work.top, column_width, work.height)
-            tune = pygame.Rect(left.right + gap, work.top, column_width, work.height)
-            sensor = pygame.Rect(tune.right + gap, work.top, column_width, work.height)
-            right = pygame.Rect(sensor.right + gap, work.top, work.right - sensor.right - gap, work.height)
-            self._draw_filter_selection(left)
-            self._draw_filter_tune_panel(tune)
+        subtab_bar = pygame.Rect(rect.left, rect.top, rect.width, 34)
+        self._draw_setup_subtabs(subtab_bar)
+        work = pygame.Rect(rect.left, subtab_bar.bottom + gap, rect.width, rect.height - 58 - subtab_bar.height - gap)
+        self._setup_filter_buttons.clear()
+        self._tracking_button_rects.clear()
+        self._route_rects.clear()
+        self._recorded_log_rects.clear()
+        self._evaluation_mode_rects.clear()
+        self._refresh_recorded_logs_rect = pygame.Rect(0, 0, 1, 1)
+        if self._active_setup_subtab == "Evaluation Mode":
+            self._draw_evaluation_mode_panel(work)
+        elif self._active_setup_subtab == "Filters":
+            if work.width >= 980:
+                left = pygame.Rect(work.left, work.top, max(320, int(work.width * 0.42)), work.height)
+                right = pygame.Rect(left.right + gap, work.top, work.right - left.right - gap, work.height)
+                self._draw_filter_selection(left)
+                self._draw_filter_tune_panel(right)
+            else:
+                top = pygame.Rect(work.left, work.top, work.width, max(220, int(work.height * 0.48)))
+                lower = pygame.Rect(work.left, top.bottom + gap, work.width, work.bottom - top.bottom - gap)
+                self._draw_filter_selection(top)
+                self._draw_filter_tune_panel(lower)
+        elif self._active_setup_subtab == "Sensor Noise":
             if self._sensor_editor is not None:
-                self._sensor_editor.draw(self._surface, sensor)
-            behavior_rect = pygame.Rect(right.left, right.top, right.width, max(180, int(right.height * 0.50)))
-            routes_rect = pygame.Rect(right.left, behavior_rect.bottom + gap, right.width, right.bottom - behavior_rect.bottom - gap)
-        else:
-            top_height = max(220, int((work.height - gap) * 0.48))
-            bottom_height = work.height - top_height - gap
-            column_width = max(260, (work.width - gap) // 2)
-            left_top = pygame.Rect(work.left, work.top, column_width, top_height)
-            right_top = pygame.Rect(left_top.right + gap, work.top, work.right - left_top.right - gap, top_height)
-            left_bottom = pygame.Rect(work.left, left_top.bottom + gap, column_width, bottom_height)
-            right_bottom = pygame.Rect(left_bottom.right + gap, left_bottom.top, work.right - left_bottom.right - gap, bottom_height)
-            self._draw_filter_selection(left_top)
-            self._draw_filter_tune_panel(right_top)
-            if self._sensor_editor is not None:
-                self._sensor_editor.draw(self._surface, left_bottom)
-            behavior_rect = pygame.Rect(right_bottom.left, right_bottom.top, right_bottom.width, max(170, int(right_bottom.height * 0.52)))
-            routes_rect = pygame.Rect(
-                right_bottom.left,
-                behavior_rect.bottom + gap,
-                right_bottom.width,
-                max(80, right_bottom.bottom - behavior_rect.bottom - gap),
-            )
-
-        if self._behavior_editor is not None:
-            self._behavior_editor.draw(self._surface, behavior_rect)
-            self._draw_route_selection(routes_rect)
-        else:
-            self._draw_route_selection(routes_rect)
+                self._sensor_editor.draw(self._surface, work)
+        elif self._active_setup_subtab == "Vehicle Behavior":
+            if self._behavior_editor is not None:
+                self._behavior_editor.draw(self._surface, work)
+        elif self._active_setup_subtab == "Routes":
+            self._draw_route_selection(work)
+        elif self._active_setup_subtab == "Offline Replay":
+            self._draw_offline_replay_panel(work)
         self._draw_test_setup_footer(bottom)
+
+    def _draw_setup_subtabs(self, rect: pygame.Rect) -> None:
+        self._setup_subtab_rects.clear()
+        gap = 6
+        x = rect.left
+        available = rect.width - gap * (len(TEST_SETUP_SUBTABS) - 1)
+        tab_width = max(92, available // len(TEST_SETUP_SUBTABS))
+        for tab in TEST_SETUP_SUBTABS:
+            button = pygame.Rect(x, rect.top, min(tab_width, rect.right - x), rect.height)
+            self._setup_subtab_rects[tab] = button
+            active = tab == self._active_setup_subtab
+            hovered = button.collidepoint(pygame.mouse.get_pos())
+            background = (35, 73, 53) if active else ((34, 42, 54) if hovered else (24, 30, 39))
+            border = DASHBOARD.success_color if active else DASHBOARD.panel_border_color
+            pygame.draw.rect(self._surface, background, button, border_radius=5)
+            pygame.draw.rect(self._surface, border, button, width=1, border_radius=5)
+            rendered = self._small_font.render(tab, True, DASHBOARD.title_color if active else DASHBOARD.text_color)
+            self._surface.blit(rendered, rendered.get_rect(center=button.center))
+            x += tab_width + gap
+
+    def _draw_evaluation_mode_panel(self, rect: pygame.Rect) -> None:
+        pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, rect, border_radius=6)
+        pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
+        content = rect.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
+        self._draw_text("Evaluation Mode", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+        button_top = content.top + 42
+        gap = 14
+        button_width = max(220, (content.width - gap) // 2)
+        modes = (
+            (EVALUATION_MODE_CLOSED_LOOP, "Closed-Loop Benchmark", "Filter estimate controls the vehicle through the existing controller."),
+            (EVALUATION_MODE_OFFLINE_REPLAY, "Offline Localization Replay", "Identical recorded GNSS/IMU logs are replayed through each filter."),
+        )
+        self._evaluation_mode_rects.clear()
+        for index, (mode, title, detail) in enumerate(modes):
+            card = pygame.Rect(content.left + index * (button_width + gap), button_top, button_width, 112)
+            self._evaluation_mode_rects[mode] = card
+            active = self._evaluation_mode == mode
+            hovered = card.collidepoint(pygame.mouse.get_pos())
+            background = (35, 73, 53) if active else ((31, 39, 50) if hovered else (20, 25, 33))
+            border = DASHBOARD.success_color if active else DASHBOARD.panel_border_color
+            pygame.draw.rect(self._surface, background, card, border_radius=6)
+            pygame.draw.rect(self._surface, border, card, width=1, border_radius=6)
+            self._draw_text(title, (card.left + 14, card.top + 14), self._font, DASHBOARD.title_color, card.width - 28)
+            self._draw_wrapped_text(detail, pygame.Rect(card.left + 14, card.top + 44, card.width - 28, 50), self._small_font, DASHBOARD.muted_text_color)
+            self._draw_text("SELECTED" if active else "AVAILABLE", (card.left + 14, card.bottom - 24), self._small_font, DASHBOARD.success_color if active else DASHBOARD.muted_text_color, card.width - 28)
+
+        explanation_rect = pygame.Rect(content.left, button_top + 138, content.width, min(160, content.bottom - button_top - 138))
+        pygame.draw.rect(self._surface, (14, 18, 24), explanation_rect, border_radius=6)
+        pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, explanation_rect, width=1, border_radius=6)
+        self._draw_wrapped_text(
+            OFFLINE_LOCALIZATION_EXPLANATION,
+            explanation_rect.inflate(-18, -18),
+            self._font,
+            DASHBOARD.text_color,
+        )
+
+    def _draw_offline_replay_panel(self, rect: pygame.Rect) -> None:
+        gap = 12
+        top_height = min(118, max(94, rect.height // 5))
+        explanation = pygame.Rect(rect.left, rect.top, rect.width, top_height)
+        logs = pygame.Rect(rect.left, explanation.bottom + gap, rect.width, max(120, rect.bottom - explanation.bottom - gap))
+        pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, explanation, border_radius=6)
+        pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, explanation, width=1, border_radius=6)
+        content = explanation.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
+        self._draw_text("Offline Replay", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+        text = (
+            "Offline replay compares filters using identical recorded GNSS/IMU logs. During log recording, "
+            "the vehicle is driven using ground-truth state, not by the evaluated filters. During replay, "
+            "the vehicle is not moved. This avoids closed-loop trajectory differences and gives a fair "
+            "localization-only comparison."
+        )
+        self._draw_wrapped_text(text, pygame.Rect(content.left, content.top + 30, content.width, content.height - 30), self._small_font, DASHBOARD.text_color)
+        self._draw_recorded_log_list(logs)
+
+    def _draw_recorded_log_list(self, rect: pygame.Rect) -> None:
+        pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, rect, border_radius=6)
+        pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
+        content = rect.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
+        title = f"Recorded Logs ({len(self._selected_recorded_log_indices)} selected)"
+        self._draw_text(title, content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+        self._refresh_recorded_logs_rect = pygame.Rect(content.right - 136, content.top, 136, 26)
+        self._draw_button(self._refresh_recorded_logs_rect, "Refresh Logs")
+        list_rect = pygame.Rect(content.left, content.top + 36, content.width, max(80, int(content.height * 0.62)))
+        pygame.draw.rect(self._surface, (14, 18, 24), list_rect, border_radius=4)
+        self._recorded_log_rects.clear()
+        if not self._recorded_logs:
+            self._draw_text(
+                "No recorded logs found. Record sensor logs from selected routes first.",
+                (list_rect.left + 8, list_rect.top + 10),
+                self._small_font,
+                DASHBOARD.warning_color,
+                list_rect.width - 16,
+            )
+        else:
+            row_h = 58
+            visible = max(1, list_rect.height // row_h)
+            self._recorded_log_scroll = min(self._recorded_log_scroll, max(0, len(self._recorded_logs) - visible))
+            for visible_index, info in enumerate(self._recorded_logs[self._recorded_log_scroll : self._recorded_log_scroll + visible]):
+                index = self._recorded_log_scroll + visible_index
+                row = pygame.Rect(list_rect.left + 5, list_rect.top + 5 + visible_index * row_h, list_rect.width - 10, row_h - 6)
+                self._recorded_log_rects[index] = row
+                selected = index in self._selected_recorded_log_indices
+                pygame.draw.rect(self._surface, (35, 73, 53) if selected else (24, 30, 39), row, border_radius=4)
+                pygame.draw.rect(self._surface, DASHBOARD.success_color if selected else DASHBOARD.panel_border_color, row, width=1, border_radius=4)
+                mark = "[x]" if selected else "[ ]"
+                self._draw_text(f"{mark} {info.route_name}", (row.left + 8, row.top + 6), self._font, DASHBOARD.title_color, row.width - 16)
+                detail = (
+                    f"{display_map_name(info.map_name)} | {info.sample_count or 'n/a'} samples | "
+                    f"{info.recording_driver or 'unknown'} | Sensor {info.sensor_noise_preset or 'n/a'} | Behavior {info.vehicle_behavior_preset or 'n/a'}"
+                )
+                self._draw_text(detail, (row.left + 8, row.top + 30), self._small_font, DASHBOARD.muted_text_color, row.width - 16)
+        status_top = list_rect.bottom + 10
+        status_rect = pygame.Rect(content.left, status_top, content.width, content.bottom - status_top)
+        pygame.draw.rect(self._surface, (14, 18, 24), status_rect, border_radius=4)
+        y = status_rect.top + 8
+        for line in self._offline_status_lines[:4]:
+            self._draw_text(line, (status_rect.left + 8, y), self._small_font, DASHBOARD.text_color, status_rect.width - 16)
+            y += 18
 
     def _draw_filter_selection(self, rect: pygame.Rect) -> None:
         pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, rect, border_radius=6)
         pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
         content = rect.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
         self._tracking_button_rects.clear()
-        self._draw_text("Filter Selection", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+        title = "Replay Filter Selection" if self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY else "Filter Selection"
+        self._draw_text(title, content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
         y = content.top + 34
         self._setup_filter_buttons.clear()
         if not self._setup_filter_records:
@@ -796,12 +1017,22 @@ class StartupMapSelector:
         for record in self._setup_filter_records:
             button = pygame.Rect(content.left, y, content.width, 44)
             self._setup_filter_buttons[record.filter_id] = button
-            active = record.filter_id == self._selected_filter_id
+            active = (
+                record.filter_id in self._offline_filter_ids
+                if self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY and record.filter_id != "raw_gnss"
+                else record.filter_id == self._selected_filter_id
+            )
             pygame.draw.rect(self._surface, (35, 73, 53) if active else (24, 30, 39), button, border_radius=5)
             pygame.draw.rect(self._surface, DASHBOARD.success_color if active else DASHBOARD.panel_border_color, button, width=1, border_radius=5)
-            label = f"{record.display_name} ({record.filter_id})"
+            if self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY:
+                mark = "[baseline]" if record.filter_id == "raw_gnss" else ("[x]" if record.filter_id in self._offline_filter_ids else "[ ]")
+                label = f"{mark} {record.display_name} ({record.filter_id})"
+            else:
+                label = f"{record.display_name} ({record.filter_id})"
             self._draw_text(label, (button.left + 10, button.top + 6), self._button_font, DASHBOARD.title_color, button.width - 20)
             status = self._filter_capability_summary(record)
+            if self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY and record.filter_id == "raw_gnss":
+                status = "included baseline | replay only"
             status_color = DASHBOARD.warning_color if "experimental" in status.lower() or "not safe" in status.lower() else DASHBOARD.muted_text_color
             self._draw_text(status, (button.left + 10, button.top + 25), self._small_font, status_color, button.width - 20)
             y += 52
@@ -828,7 +1059,16 @@ class StartupMapSelector:
                 color = DASHBOARD.warning_color if "NO" in line or "Experimental: YES" in line else DASHBOARD.text_color
                 self._draw_text(line, (content.left, y), self._small_font, color, content.width)
                 y += 18
-        if y + 58 <= content.bottom:
+        if self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY:
+            if y + 38 <= content.bottom:
+                self._draw_text(
+                    "Replay uses passive filter mode. Raw GNSS is included automatically.",
+                    (content.left, y + 8),
+                    self._small_font,
+                    DASHBOARD.muted_text_color,
+                    content.width,
+                )
+        elif y + 58 <= content.bottom:
             y += 8
             self._draw_text("Tracking Mode", (content.left, y), self._small_font, DASHBOARD.muted_text_color, content.width)
             y += 20
@@ -929,18 +1169,38 @@ class StartupMapSelector:
             self._draw_text(f"{display_map_name(item.route.map_name)} | {length} | {status}", (row.left + 8, row.top + 29), self._small_font, DASHBOARD.muted_text_color, row.width - 16)
 
     def _draw_test_setup_footer(self, rect: pygame.Rect) -> None:
-        self._start_benchmark_rect = pygame.Rect(rect.right - 214, rect.top + 3, 214, 34)
-        self._draw_button(self._start_benchmark_rect, "Start Benchmark Test", primary=True)
+        self._start_benchmark_rect = pygame.Rect(0, 0, 1, 1)
+        self._record_sensor_logs_rect = pygame.Rect(0, 0, 1, 1)
+        self._run_offline_replay_rect = pygame.Rect(0, 0, 1, 1)
+        if self._evaluation_mode == EVALUATION_MODE_CLOSED_LOOP:
+            self._start_benchmark_rect = pygame.Rect(rect.right - 236, rect.top + 3, 236, 34)
+            self._draw_button(self._start_benchmark_rect, "Start Closed-Loop Benchmark", primary=True)
+            summary_right = self._start_benchmark_rect.left - 12
+        else:
+            run_width = 230
+            record_width = 330
+            self._run_offline_replay_rect = pygame.Rect(rect.right - run_width, rect.top + 3, run_width, 34)
+            self._record_sensor_logs_rect = pygame.Rect(self._run_offline_replay_rect.left - 10 - record_width, rect.top + 3, record_width, 34)
+            self._draw_button(self._record_sensor_logs_rect, "Record Sensor Logs from Selected Routes", primary=True)
+            self._draw_button(self._run_offline_replay_rect, "Run Offline Replay Evaluation", primary=True)
+            summary_right = self._record_sensor_logs_rect.left - 12
         summary = self._setup_summary_text()
-        self._draw_text(summary, (rect.left, rect.top + 10), self._small_font, DASHBOARD.muted_text_color, self._start_benchmark_rect.left - rect.left - 12)
+        self._draw_text(summary, (rect.left, rect.top + 10), self._small_font, DASHBOARD.muted_text_color, summary_right - rect.left)
 
     def _setup_summary_text(self) -> str:
         routes = [item.route for item in self._route_items if item.index in self._selected_route_indices]
         maps = sorted({display_map_name(route.map_name) for route in routes})
         filter_label = self._selected_filter_id or "none"
         map_text = ", ".join(maps[:3]) + ("..." if len(maps) > 3 else "")
+        if self._evaluation_mode == EVALUATION_MODE_OFFLINE_REPLAY:
+            filters = ", ".join(sorted(self._offline_filter_ids)) or "none"
+            logs = len(self._selected_recorded_log_indices)
+            return (
+                f"Offline replay | Filters {filters} + raw_gnss | Routes {len(routes)} | "
+                f"Logs {logs} | Maps {map_text or 'none'} | Sensor {self._sensor_preset} | Behavior {self._behavior_preset}"
+            )
         return (
-            f"Filter {filter_label} | Mode {self._tracking_mode} | Routes {len(routes)} | "
+            f"Closed-loop | Filter {filter_label} | Mode {self._tracking_mode} | Routes {len(routes)} | "
             f"Maps {map_text or 'none'} | Sensor {self._sensor_preset} | Behavior {self._behavior_preset}"
         )
 
@@ -980,6 +1240,84 @@ class StartupMapSelector:
 
         first_route = routes[0]
         return self._load_map_for_benchmark(client, first_route, config)
+
+    def _start_offline_recording_from_setup(self, client: object) -> object:
+        routes = [item.route for item in self._route_items if item.index in self._selected_route_indices]
+        if not routes:
+            self._error = "Select at least one saved route before recording sensor logs."
+            self._active_setup_subtab = "Routes"
+            return _NoSelection
+        sensor_values = self._sensor_editor.values() if self._sensor_editor is not None else SENSOR_NOISE_PRESETS["Medium Noise"]
+        behavior_values = self._behavior_editor.values() if self._behavior_editor is not None else BEHAVIOR_PRESETS["Balanced"]
+        if self._sensor_editor is not None:
+            self._sensor_preset = self._sensor_editor.active_preset
+        if self._behavior_editor is not None:
+            self._behavior_preset = self._behavior_editor.active_preset
+        config = OfflineRecordingConfig(
+            selected_routes=tuple(routes),
+            sensor_noise_config=sensor_noise_config_from_values(sensor_values, preset_name=self._sensor_preset),
+            vehicle_behavior_config=driving_behavior_from_values(behavior_values, preset_name=self._behavior_preset),
+            sensor_noise_preset=self._sensor_preset,
+            vehicle_behavior_preset=self._behavior_preset,
+            metadata={
+                "startup_mode": "offline_localization_replay",
+                "recording_driver": "ground_truth_controller",
+            },
+        )
+        available_maps = [option.load_name or option.detail for option in self._options]
+        missing = [
+            route
+            for route in routes
+            if route.map_name and available_maps and not any(maps_compatible(candidate, route.map_name) for candidate in available_maps)
+        ]
+        if missing:
+            self._error = f"Route map unavailable: {missing[0].name} -> {missing[0].map_name}."
+            return _NoSelection
+        return self._load_map_for_offline_recording(client, routes[0], config)
+
+    def _run_offline_replay_from_setup(self) -> None:
+        selected_logs = [
+            info for index, info in enumerate(self._recorded_logs) if index in self._selected_recorded_log_indices
+        ]
+        if not selected_logs:
+            self._error = "Select at least one recorded sensor log."
+            self._active_setup_subtab = "Offline Replay"
+            return
+        selected_filters = tuple(sorted(filter_id for filter_id in self._offline_filter_ids if filter_id != "raw_gnss"))
+        if not selected_filters:
+            self._error = "Select at least one replay filter. Raw GNSS is only the baseline."
+            self._active_setup_subtab = "Filters"
+            return
+        filter_tunes = {
+            filter_id: dict(self._selected_filter_tunes.get(filter_id, {}))
+            for filter_id in selected_filters
+        }
+        try:
+            result = OfflineReplayRunner().run(
+                OfflineReplayRequest(
+                    sensor_log_paths=tuple(info.sensor_log_path for info in selected_logs),
+                    selected_filter_ids=selected_filters,
+                    filter_tunes=filter_tunes,
+                    include_raw_gnss_baseline=True,
+                )
+            )
+        except Exception as exc:
+            self._error = f"Offline replay failed: {exc}"
+            self._offline_status_lines = [self._error]
+            return
+        self._error = ""
+        raw = f"{result.raw_gnss_rmse_m:.3f} m" if result.raw_gnss_rmse_m is not None else "n/a"
+        best = (
+            f"{result.best_filter_id} ({result.best_position_rmse_m:.3f} m)"
+            if result.best_filter_id is not None and result.best_position_rmse_m is not None
+            else "n/a"
+        )
+        self._offline_status_lines = [
+            f"Results: {result.output_folder}",
+            f"Best RMSE filter: {best}",
+            f"Raw GNSS RMSE: {raw}",
+            f"Routes evaluated: {result.route_count} | Failures: {len(result.failures)}",
+        ]
 
     def _load_map_for_benchmark(
         self,
@@ -1024,6 +1362,51 @@ class StartupMapSelector:
             active_map_name=active_map_name,
             used_current_map=False,
             benchmark_config=config,
+        )
+
+    def _load_map_for_offline_recording(
+        self,
+        client: object,
+        first_route: SavedTestRoute,
+        config: OfflineRecordingConfig,
+    ) -> object:
+        current_map = self._read_current_map(client)
+        if maps_compatible(current_map, first_route.map_name):
+            self._write_runtime_state(selected_load_name=None, active_map_name=current_map)
+            return StartupMapSelection(
+                selected_map_load_name=None,
+                active_map_name=current_map,
+                used_current_map=True,
+                offline_recording_config=config,
+            )
+        if not first_route.map_name:
+            self._error = "First selected route has no map metadata."
+            return _NoSelection
+        load_name = self._load_name_for_map(first_route.map_name)
+        self._status = "Loading map"
+        self._detail = f"Loading {display_map_name(load_name)} for offline recording..."
+        self._error = ""
+        self._draw(status_only=False)
+        pygame.display.flip()
+        pygame.event.pump()
+        try:
+            setter = getattr(client, "set_timeout", None)
+            if setter is not None:
+                setter(max(float(CARLA.timeout_seconds), 60.0))
+            world = client.load_world(load_name)
+            world_map = world.get_map()
+            active_map_name = getattr(world_map, "name", None)
+        except Exception as exc:
+            self._status = "Connected"
+            self._detail = "Select a map before the dashboard starts."
+            self._error = f"Offline recording map load failed: {exc}"
+            return _NoSelection
+        self._write_runtime_state(selected_load_name=load_name, active_map_name=active_map_name)
+        return StartupMapSelection(
+            selected_map_load_name=load_name,
+            active_map_name=active_map_name,
+            used_current_map=False,
+            offline_recording_config=config,
         )
 
     def _load_name_for_map(self, map_name: str) -> str:
@@ -1184,6 +1567,35 @@ class StartupMapSelector:
         fitted = self._fit_text(str(text), font, max_width)
         rendered = font.render(fitted, True, color)
         self._surface.blit(rendered, position)
+
+    def _draw_wrapped_text(
+        self,
+        text: object,
+        rect: pygame.Rect,
+        font: pygame.font.Font,
+        color: tuple[int, int, int],
+        line_gap: int = 4,
+    ) -> None:
+        words = str(text).split()
+        lines: list[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if not current or font.size(candidate)[0] <= rect.width:
+                current = candidate
+                continue
+            lines.append(current)
+            current = word
+        if current:
+            lines.append(current)
+        y = rect.top
+        line_height = font.get_linesize() + line_gap
+        for line in lines:
+            if y + font.get_linesize() > rect.bottom:
+                break
+            rendered = font.render(self._fit_text(line, font, rect.width), True, color)
+            self._surface.blit(rendered, (rect.left, y))
+            y += line_height
 
     @staticmethod
     def _fit_text(text: str, font: pygame.font.Font, max_width: int) -> str:

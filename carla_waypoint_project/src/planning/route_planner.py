@@ -74,6 +74,10 @@ class RoutePlanner:
         """Clear the stored global route."""
         self._route = []
 
+    def set_route(self, route: Sequence["carla.Waypoint"]) -> None:
+        """Use a precomputed route without invoking the planner again."""
+        self._route = self._densify_route(self._deduplicate_route(route))
+
     def get_route(self) -> List["carla.Waypoint"]:
         """Return a copy of the currently stored route."""
         return list(self._route)
