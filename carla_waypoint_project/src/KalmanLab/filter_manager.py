@@ -15,9 +15,9 @@ from src.KalmanLab.filter_base import (
     normalize_tracking_mode,
 )
 from src.KalmanLab.registry import discover_filters
+from src.core.localization_status import LocalizationStatus
+from src.core.vehicle_state import VehicleState
 from src.localization.gnss_projection import GnssLocalProjector, LocalGnssMeasurement
-from src.localization.motion_info import MotionInfo, motion_info_from_diagnostics
-from src.localization.state_estimator import EgoState, LocalizationStatus
 
 
 class FilterManager:
@@ -170,7 +170,7 @@ class FilterManager:
             except Exception as exc:
                 self._runtime_error = f"Reset failed: {exc}"
 
-    def update(self) -> Optional[EgoState]:
+    def update(self) -> Optional[VehicleState]:
         """Process any new sensor frames and return the latest active-filter state."""
         if self._active_filter is None:
             return None
@@ -189,7 +189,7 @@ class FilterManager:
 
         return self.get_state()
 
-    def get_state(self) -> Optional[EgoState]:
+    def get_state(self) -> Optional[VehicleState]:
         if self._active_filter is None:
             return None
         try:
@@ -197,9 +197,9 @@ class FilterManager:
         except Exception as exc:
             self._runtime_error = f"get_state failed: {exc}"
             return None
-        return state if isinstance(state, EgoState) else state
+        return state if isinstance(state, VehicleState) or state is None else state
 
-    def get_status(self, ground_truth_state: Optional[EgoState]) -> LocalizationStatus:
+    def get_status(self, ground_truth_state: Optional[VehicleState]) -> LocalizationStatus:
         estimated_state = self.get_state()
         position_error_m = None
         if estimated_state is not None and ground_truth_state is not None:
@@ -323,10 +323,6 @@ class FilterManager:
         diagnostics.setdefault("active_control_input_used", self._active_control_input_used)
         diagnostics.setdefault("latest_control_input", self._control_input_dict(self._last_control_input))
         return diagnostics
-
-    def get_motion_info(self) -> Optional[MotionInfo]:
-        """Return optional model-aware motion data from active filter diagnostics."""
-        return motion_info_from_diagnostics(self.get_diagnostics(), self.get_active_filter_info())
 
     def _call_filter_method(self, method_name: str, measurement: object) -> bool:
         if self._active_filter is None:

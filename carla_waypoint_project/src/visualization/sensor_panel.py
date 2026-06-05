@@ -10,8 +10,9 @@ import pygame
 
 from config.settings import DASHBOARD, GNSS, IMU
 from src.control.waypoint_tracker import TrackingStatus
+from src.core.localization_status import LocalizationStatus
+from src.core.vehicle_state import VehicleState
 from src.localization.gnss_projection import GnssDiagnostics
-from src.localization.state_estimator import EgoState, LocalizationStatus
 from src.sensors.gnss_sensor import GnssMeasurement
 from src.sensors.imu_sensor import ImuMeasurement
 from src.sensors.lidar_sensor import LidarMeasurement
@@ -28,9 +29,9 @@ class SensorPanelData:
     pygame_frame_dt_seconds: float
     planner_status: str
     route_size: int
-    ego_state: Optional[EgoState]
-    ground_truth_state: Optional[EgoState]
-    estimated_state: Optional[EgoState]
+    ego_state: Optional[VehicleState]
+    ground_truth_state: Optional[VehicleState]
+    estimated_state: Optional[VehicleState]
     localization_status: Optional[LocalizationStatus]
     route_activation_state: str
     stabilization_active: bool
@@ -146,6 +147,9 @@ class SensorPanelRenderer:
                     (f"Est x/y: {estimate.x:7.2f} {estimate.y:7.2f}", DASHBOARD.text_color),
                     (f"Est yaw: {estimate.yaw:7.2f} deg", DASHBOARD.text_color),
                     (f"Est speed: {estimate.speed:5.2f} m/s", DASHBOARD.text_color),
+                    (f"Model: {(estimate.model_type or 'n/a')[:18]}", DASHBOARD.muted_text_color),
+                    (f"Source: {(estimate.source_filter_id or 'n/a')[:17]}", DASHBOARD.muted_text_color),
+                    (f"Caps: {(','.join(estimate.capabilities()) or 'basic')[:20]}", DASHBOARD.muted_text_color),
                 ]
             )
 
@@ -256,7 +260,7 @@ class SensorPanelRenderer:
         return rows
 
     @staticmethod
-    def _gt_compass_deg(state: Optional[EgoState]) -> Optional[float]:
+    def _gt_compass_deg(state: Optional[VehicleState]) -> Optional[float]:
         if state is None:
             return None
         return (state.yaw + 90.0) % 360.0

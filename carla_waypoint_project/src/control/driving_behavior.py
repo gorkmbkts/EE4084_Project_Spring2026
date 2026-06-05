@@ -9,7 +9,7 @@ import random
 from typing import Deque, Optional, Sequence
 
 from config.settings import AUTONOMOUS_CONTROL
-from src.localization.state_estimator import EgoState
+from src.core.vehicle_state import VehicleState
 from src.utils.carla_import import ensure_carla_import
 
 carla = ensure_carla_import()
@@ -43,10 +43,13 @@ class DrivingBehaviorConfig:
     yaw_rate_feedback_gain: float = 0.0
     max_model_steer_correction: float = 0.15
     min_model_control_speed_mps: float = 1.0
-    motion_info_lowpass_alpha: float = 0.25
+    model_state_lowpass_alpha: float = 0.25
     max_abs_motion_yaw_rate_radps: float = 2.5
     enable_model_speed_guard: float = 0.0
     model_curvature_speed_factor: float = 0.5
+    enable_acceleration_feedforward: float = 0.0
+    acceleration_feedforward_gain: float = 0.0
+    max_acceleration_feedforward_delta: float = 0.15
 
 
 @dataclass(frozen=True)
@@ -97,7 +100,7 @@ class CurvatureSpeedPlanner:
 
     def plan(
         self,
-        state: EgoState,
+        state: VehicleState,
         preview_waypoints: Sequence["carla.Waypoint"],
         route_completed: bool,
         dt_seconds: float,
@@ -142,31 +145,28 @@ class CurvatureSpeedPlanner:
 
     def _curvature_score(
         self,
-        state: EgoState,
+        state: VehicleState,
         preview_waypoints: Sequence["carla.Waypoint"],
     ) -> tuple[float, float, float]:
-        points = [(float(state.x), float(state.y))]
+        del state
         max_distance = max(3.0, float(self._config.curve_lookahead_m))
+        points: list[tuple[float, float]] = []
         distance = 0.0
 
-        previous_x, previous_y = points[0]
-        yaw_rad = math.radians(state.yaw)
         for waypoint in preview_waypoints:
             location = waypoint.transform.location
             x = float(location.x)
             y = float(location.y)
-            if len(points) == 1:
-                dx = x - state.x
-                dy = y - state.y
-                local_x = math.cos(yaw_rad) * dx + math.sin(yaw_rad) * dy
-                if local_x < -0.5:
-                    continue
+            if not points:
+                points.append((x, y))
+                continue
+
+            previous_x, previous_y = points[-1]
             step = math.hypot(x - previous_x, y - previous_y)
             if step < 0.05:
                 continue
             distance += step
             points.append((x, y))
-            previous_x, previous_y = x, y
             if distance >= max_distance:
                 break
 

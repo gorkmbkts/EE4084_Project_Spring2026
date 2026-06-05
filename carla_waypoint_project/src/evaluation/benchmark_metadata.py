@@ -124,7 +124,7 @@ def build_benchmark_metadata(
             "benchmark_selectable": active_filter_benchmark_selectable,
             "experimental": active_filter_experimental,
             "requires_raw_imu": active_filter_requires_raw_imu,
-            "motion_info_fields": tuple(filter_info.get("motion_info_fields", ())),
+            "provided_state_fields": tuple(filter_info.get("provided_state_fields", ())),
             "tracking_mode": tracking_mode,
             "active_control_input_used": bool(active_control_input_used),
             "recommendation_applied": bool(filter_info.get("recommendation_applied", False)),

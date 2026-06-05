@@ -109,6 +109,7 @@ class BenchmarkPlotJobWorker:
             if not self._accepting_jobs:
                 return False
             self._pending_jobs += 1
+        self._write_plot_status(job, "pending")
         self.start()
         self._queue.put(job)
         return True
@@ -125,6 +126,7 @@ class BenchmarkPlotJobWorker:
                 with self._lock:
                     self._pending_jobs = max(0, self._pending_jobs - 1)
                     self._running_job = job
+                self._write_plot_status(job, "running")
                 try:
                     self._run_job(job)
                 except Exception as exc:  # pragma: no cover - plotting/filesystem dependent.
@@ -132,6 +134,7 @@ class BenchmarkPlotJobWorker:
                 else:
                     with self._lock:
                         self._completed_jobs += 1
+                    self._write_plot_status(job, "completed")
                 finally:
                     with self._lock:
                         self._running_job = None
@@ -161,8 +164,24 @@ class BenchmarkPlotJobWorker:
             self._failed_jobs += 1
             self._latest_error = self._shorten(latest_error, max_length=180)
         self._append_error_log(job, latest_error, formatted_traceback)
+        self._write_plot_status(job, "failed", latest_error)
         self._record_plot_error(job, latest_error)
         print(f"[benchmark plots] {latest_error}\n{formatted_traceback}", flush=True)
+
+    @staticmethod
+    def _write_plot_status(job: _PlotJob, status: str, error: Optional[str] = None) -> None:
+        try:
+            job.folder.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "kind": job.kind,
+                "folder": str(job.folder),
+                "status": status,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "error": error,
+            }
+            (job.folder / "plot_status.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     @staticmethod
     def _append_error_log(job: _PlotJob, latest_error: str, formatted_traceback: str) -> None:

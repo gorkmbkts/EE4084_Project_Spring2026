@@ -2,6 +2,5 @@
 
 from .vehicle_controller import VehicleController
 from .waypoint_tracker import TrackingStatus, WaypointTracker
-from .motion_info import MotionInfo
 
-__all__ = ["MotionInfo", "TrackingStatus", "WaypointTracker", "VehicleController"]
+__all__ = ["TrackingStatus", "WaypointTracker", "VehicleController"]

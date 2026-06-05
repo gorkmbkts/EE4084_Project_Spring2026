@@ -9,7 +9,7 @@ from typing import List, Optional, Sequence, Tuple
 import pygame
 
 from config.settings import ROUTE_PLANNER, TOPDOWN_MAP
-from src.localization.state_estimator import EgoState
+from src.core.vehicle_state import VehicleState
 from src.utils.carla_import import ensure_carla_import
 
 carla = ensure_carla_import()
@@ -149,8 +149,8 @@ class TopDownMapRenderer:
         self,
         surface: pygame.Surface,
         hud: TopDownHudData,
-        ego_state: Optional[EgoState],
-        estimated_state: Optional[EgoState],
+        ego_state: Optional[VehicleState],
+        estimated_state: Optional[VehicleState],
         start_waypoint: Optional["carla.Waypoint"],
         goal_waypoint: Optional["carla.Waypoint"],
         route: Sequence["carla.Waypoint"],
@@ -308,7 +308,7 @@ class TopDownMapRenderer:
         self,
         surface: pygame.Surface,
         rect: pygame.Rect,
-        ego_state: Optional[EgoState],
+        ego_state: Optional[VehicleState],
         color: tuple[int, int, int],
         fill: bool,
     ) -> None:

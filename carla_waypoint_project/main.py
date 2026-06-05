@@ -40,6 +40,7 @@ def main() -> None:
             selected_map_load_name=selection.selected_map_load_name,
             existing_display_surface=selector.surface,
             benchmark_config=selection.benchmark_config,
+            offline_recording_config=selection.offline_recording_config,
         )
         try:
             app.run()

@@ -387,28 +387,20 @@ class RouteTestRunner:
         if target is None:
             self._status_text = "No benchmark output to plot"
             return False
-        if self._automated and self._enqueue_aggregate_plots_callback is not None:
+        if self._automated:
+            callback = self._enqueue_aggregate_plots_callback
+        else:
+            callback = self._enqueue_route_plots_callback
+        if callback is not None:
             try:
-                queued = self._enqueue_aggregate_plots_callback(target)
+                queued = callback(target)
             except Exception as exc:  # pragma: no cover - callback defensive guard.
                 self._status_text = f"Plot queue failed: {exc}"
                 return False
             self._status_text = f"Plots queued: {target.name}" if queued else "Plot queue unavailable"
             return queued
-        try:
-            if self._automated:
-                from src.evaluation.benchmark_plotter import generate_aggregate_benchmark_plots
-
-                generate_aggregate_benchmark_plots(target)
-            else:
-                from src.evaluation.benchmark_plotter import generate_benchmark_plots
-
-                generate_benchmark_plots(target)
-        except Exception as exc:  # pragma: no cover - matplotlib and filesystem dependent.
-            self._status_text = f"Plot generation failed: {exc}"
-            return False
-        self._status_text = f"Plots saved: {target.name}"
-        return True
+        self._status_text = "Plot worker unavailable"
+        return False
 
     def elapsed_test_seconds(self) -> float:
         if self._test_started_monotonic is None:
@@ -576,23 +568,14 @@ class RouteTestRunner:
 
         plot_status = ""
         if record_result and BENCHMARK.generate_plots_on_completion:
-            if self._automated:
-                if self._enqueue_route_plots_callback is not None:
-                    try:
-                        queued = self._enqueue_route_plots_callback(route_folder)
-                        plot_status = ": plots queued" if queued else ": plot queue unavailable"
-                    except Exception as exc:  # pragma: no cover - callback defensive guard.
-                        plot_status = f": plot queue failed ({exc})"
-                else:
-                    plot_status = ": plot worker unavailable"
-            else:
+            if self._enqueue_route_plots_callback is not None:
                 try:
-                    from src.evaluation.benchmark_plotter import generate_benchmark_plots
-
-                    generate_benchmark_plots(route_folder)
-                    plot_status = ": plots saved"
-                except Exception as exc:  # pragma: no cover - matplotlib and filesystem dependent.
-                    plot_status = f": plot generation failed ({exc})"
+                    queued = self._enqueue_route_plots_callback(route_folder)
+                    plot_status = ": plots queued" if queued else ": plot queue unavailable"
+                except Exception as exc:  # pragma: no cover - callback defensive guard.
+                    plot_status = f": plot queue failed ({exc})"
+            else:
+                plot_status = ": plot worker unavailable"
 
         self._route_running = False
         self._current_route = None

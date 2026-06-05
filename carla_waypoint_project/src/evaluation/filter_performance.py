@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Optional
 
 from config.settings import BENCHMARK
+from src.core.vehicle_state import VehicleState
 from src.control.driving_behavior import SpeedPlan
 from src.control.waypoint_tracker import TrackingStatus
 from src.localization.gnss_projection import GnssDiagnostics
-from src.localization.state_estimator import EgoState
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,18 @@ class FilterPerformanceSample:
     filtered_y: Optional[float]
     filtered_yaw: Optional[float]
     filtered_speed: Optional[float]
+    filtered_vx_mps: Optional[float]
+    filtered_vy_mps: Optional[float]
+    filtered_yaw_rate_radps: Optional[float]
+    filtered_curvature_1pm: Optional[float]
+    filtered_acceleration_mps2: Optional[float]
+    filtered_longitudinal_accel_mps2: Optional[float]
+    filtered_lateral_accel_mps2: Optional[float]
+    state_source_filter_id: str
+    state_model_type: str
+    state_capabilities: str
+    state_confidence: Optional[float]
+    state_safe_for_autonomous_control: Optional[bool]
     kalman_x: Optional[float]
     kalman_y: Optional[float]
     kalman_yaw: Optional[float]
@@ -140,13 +152,13 @@ class FilterPerformanceLogger:
     def collect_sample(
         self,
         route_name: str,
-        ground_truth_state: Optional[EgoState],
-        kalman_state: Optional[EgoState] = None,
+        ground_truth_state: Optional[VehicleState],
+        kalman_state: Optional[VehicleState] = None,
         gnss_diagnostics: Optional[GnssDiagnostics] = None,
         tracking: Optional[TrackingStatus] = None,
         route_completed: bool = False,
         phase: str = "driving",
-        filtered_state: Optional[EgoState] = None,
+        filtered_state: Optional[VehicleState] = None,
         filter_diagnostics: Optional[dict[str, object]] = None,
         speed_plan: Optional[SpeedPlan] = None,
     ) -> Optional[FilterPerformanceSample]:
@@ -164,6 +176,8 @@ class FilterPerformanceLogger:
         yaw_error = self._yaw_error(filtered_state, ground_truth_state)
         diagnostics = filter_diagnostics or {}
         covariance_diag = diagnostics.get("covariance_diagonal")
+        if covariance_diag is None and filtered_state is not None:
+            covariance_diag = filtered_state.covariance_diagonal
         covariance_x_std = self._covariance_std(covariance_diag, 0)
         covariance_y_std = self._covariance_std(covariance_diag, 1)
         nis = self._finite_or_none(diagnostics.get("nis") if isinstance(diagnostics, dict) else None)
@@ -183,6 +197,22 @@ class FilterPerformanceLogger:
             filtered_y=filtered_state.y if filtered_state is not None else None,
             filtered_yaw=filtered_state.yaw if filtered_state is not None else None,
             filtered_speed=filtered_state.speed if filtered_state is not None else None,
+            filtered_vx_mps=filtered_state.vx_mps if filtered_state is not None else None,
+            filtered_vy_mps=filtered_state.vy_mps if filtered_state is not None else None,
+            filtered_yaw_rate_radps=filtered_state.yaw_rate_radps if filtered_state is not None else None,
+            filtered_curvature_1pm=filtered_state.curvature_1pm if filtered_state is not None else None,
+            filtered_acceleration_mps2=filtered_state.acceleration_mps2 if filtered_state is not None else None,
+            filtered_longitudinal_accel_mps2=(
+                filtered_state.longitudinal_accel_mps2 if filtered_state is not None else None
+            ),
+            filtered_lateral_accel_mps2=filtered_state.lateral_accel_mps2 if filtered_state is not None else None,
+            state_source_filter_id=filtered_state.source_filter_id if filtered_state is not None else "",
+            state_model_type=filtered_state.model_type if filtered_state is not None else "",
+            state_capabilities=",".join(filtered_state.capabilities()) if filtered_state is not None else "",
+            state_confidence=filtered_state.confidence if filtered_state is not None else None,
+            state_safe_for_autonomous_control=(
+                filtered_state.safe_for_autonomous_control if filtered_state is not None else None
+            ),
             kalman_x=filtered_state.x if filtered_state is not None else None,
             kalman_y=filtered_state.y if filtered_state is not None else None,
             kalman_yaw=filtered_state.yaw if filtered_state is not None else None,
@@ -285,6 +315,12 @@ class FilterPerformanceLogger:
             "max_cross_track_error_m": overall_metrics["max_cross_track_error_m"],
             "p95_cross_track_error_m": overall_metrics["p95_cross_track_error_m"],
             "mean_heading_error_deg": overall_metrics["mean_heading_error_deg"],
+            "yaw_rate_available_pct": overall_metrics["yaw_rate_available_pct"],
+            "curvature_available_pct": overall_metrics["curvature_available_pct"],
+            "acceleration_available_pct": overall_metrics["acceleration_available_pct"],
+            "mean_abs_yaw_rate_radps": overall_metrics["mean_abs_yaw_rate_radps"],
+            "mean_abs_curvature_1pm": overall_metrics["mean_abs_curvature_1pm"],
+            "mean_abs_acceleration_mps2": overall_metrics["mean_abs_acceleration_mps2"],
             "mean_nis": overall_metrics["mean_nis"],
             "mean_nees": overall_metrics["mean_nees"],
             "innovation_mean": overall_metrics["innovation_mean"],
@@ -319,6 +355,12 @@ class FilterPerformanceLogger:
             "driving_max_cross_track_error_m": driving_metrics["max_cross_track_error_m"],
             "driving_p95_cross_track_error_m": driving_metrics["p95_cross_track_error_m"],
             "driving_mean_heading_error_deg": driving_metrics["mean_heading_error_deg"],
+            "driving_yaw_rate_available_pct": driving_metrics["yaw_rate_available_pct"],
+            "driving_curvature_available_pct": driving_metrics["curvature_available_pct"],
+            "driving_acceleration_available_pct": driving_metrics["acceleration_available_pct"],
+            "driving_mean_abs_yaw_rate_radps": driving_metrics["mean_abs_yaw_rate_radps"],
+            "driving_mean_abs_curvature_1pm": driving_metrics["mean_abs_curvature_1pm"],
+            "driving_mean_abs_acceleration_mps2": driving_metrics["mean_abs_acceleration_mps2"],
             "driving_mean_nis": driving_metrics["mean_nis"],
             "driving_mean_nees": driving_metrics["mean_nees"],
             "driving_segment_metrics": self._segment_metrics(driving_samples),
@@ -361,8 +403,8 @@ class FilterPerformanceLogger:
 
     @staticmethod
     def _sample_timestamp(
-        ground_truth_state: Optional[EgoState],
-        filtered_state: Optional[EgoState],
+        ground_truth_state: Optional[VehicleState],
+        filtered_state: Optional[VehicleState],
     ) -> float:
         if ground_truth_state is not None:
             return float(ground_truth_state.timestamp)
@@ -371,25 +413,25 @@ class FilterPerformanceLogger:
         return 0.0
 
     @staticmethod
-    def _position_error(state: Optional[EgoState], ground_truth_state: Optional[EgoState]) -> Optional[float]:
+    def _position_error(state: Optional[VehicleState], ground_truth_state: Optional[VehicleState]) -> Optional[float]:
         if state is None or ground_truth_state is None:
             return None
         return math.hypot(state.x - ground_truth_state.x, state.y - ground_truth_state.y)
 
     @staticmethod
-    def _axis_error(state: Optional[EgoState], ground_truth_state: Optional[EgoState], axis: str) -> Optional[float]:
+    def _axis_error(state: Optional[VehicleState], ground_truth_state: Optional[VehicleState], axis: str) -> Optional[float]:
         if state is None or ground_truth_state is None:
             return None
         return float(getattr(state, axis) - getattr(ground_truth_state, axis))
 
     @staticmethod
-    def _speed_error(state: Optional[EgoState], ground_truth_state: Optional[EgoState]) -> Optional[float]:
+    def _speed_error(state: Optional[VehicleState], ground_truth_state: Optional[VehicleState]) -> Optional[float]:
         if state is None or ground_truth_state is None:
             return None
         return float(state.speed - ground_truth_state.speed)
 
     @staticmethod
-    def _yaw_error(state: Optional[EgoState], ground_truth_state: Optional[EgoState]) -> Optional[float]:
+    def _yaw_error(state: Optional[VehicleState], ground_truth_state: Optional[VehicleState]) -> Optional[float]:
         if state is None or ground_truth_state is None:
             return None
         delta = float(state.yaw - ground_truth_state.yaw)
@@ -407,7 +449,7 @@ class FilterPerformanceLogger:
 
     @classmethod
     def _covariance_std(cls, covariance_diag: object, index: int) -> Optional[float]:
-        if not isinstance(covariance_diag, list) or index >= len(covariance_diag):
+        if not isinstance(covariance_diag, (list, tuple)) or index >= len(covariance_diag):
             return None
         value = cls._finite_or_none(covariance_diag[index])
         if value is None or value < 0.0:
@@ -480,6 +522,9 @@ class FilterPerformanceLogger:
         nis_values = cls._finite_values(sample.nis for sample in sample_list)
         nees_values = cls._finite_values(sample.nees for sample in sample_list)
         innovation_values = cls._finite_values(sample.innovation_norm for sample in sample_list)
+        yaw_rate_values = cls._finite_values(sample.filtered_yaw_rate_radps for sample in sample_list)
+        curvature_values = cls._finite_values(sample.filtered_curvature_1pm for sample in sample_list)
+        acceleration_values = cls._finite_values(sample.filtered_acceleration_mps2 for sample in sample_list)
         return {
             "filtered_rmse_m": cls._rmse(filtered_errors),
             "filtered_mae_m": cls._mean(filtered_errors),
@@ -497,6 +542,18 @@ class FilterPerformanceLogger:
             "max_cross_track_error_m": max(cross_track_errors) if cross_track_errors else None,
             "p95_cross_track_error_m": cls._percentile(cross_track_errors, 95.0),
             "mean_heading_error_deg": cls._mean(heading_errors),
+            "yaw_rate_available_pct": cls._availability_percentage(
+                sample.filtered_yaw_rate_radps for sample in sample_list
+            ),
+            "curvature_available_pct": cls._availability_percentage(
+                sample.filtered_curvature_1pm for sample in sample_list
+            ),
+            "acceleration_available_pct": cls._availability_percentage(
+                sample.filtered_acceleration_mps2 for sample in sample_list
+            ),
+            "mean_abs_yaw_rate_radps": cls._mean([abs(value) for value in yaw_rate_values]),
+            "mean_abs_curvature_1pm": cls._mean([abs(value) for value in curvature_values]),
+            "mean_abs_acceleration_mps2": cls._mean([abs(value) for value in acceleration_values]),
             "mean_nis": cls._mean(nis_values),
             "mean_nees": cls._mean(nees_values),
             "innovation_mean": cls._mean(innovation_values),
@@ -625,6 +682,17 @@ class FilterPerformanceLogger:
         if not valid:
             return None
         return 100.0 * sum(1 for value in valid if value) / len(valid)
+
+    @staticmethod
+    def _availability_percentage(values: Iterable[Optional[float]]) -> Optional[float]:
+        values_list = list(values)
+        if not values_list:
+            return None
+        available = 0
+        for value in values_list:
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                available += 1
+        return 100.0 * available / len(values_list)
 
     @staticmethod
     def _unique_count(values: Iterable[Optional[int]]) -> int:
