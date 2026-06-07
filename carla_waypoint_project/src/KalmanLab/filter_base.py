@@ -61,6 +61,7 @@ class FilterPluginRecord:
     tune: dict[str, Any]
     tune_specs: tuple[Any, ...]
     filter_class: Optional[type]
+    auto_tune_profile: Optional[dict[str, Any]] = None
     error: Optional[str] = None
     template: bool = False
 
@@ -92,6 +93,11 @@ class FilterPluginRecord:
     def provided_state_fields(self) -> tuple[str, ...]:
         value = self.filter_info.get("provided_state_fields", ())
         return tuple(str(item) for item in value) if isinstance(value, (tuple, list)) else ()
+
+    @property
+    def auto_tune_enabled(self) -> bool:
+        profile = self.auto_tune_profile
+        return bool(isinstance(profile, dict) and profile.get("enabled", True))
 
 
 class LocalizationFilter(Protocol):

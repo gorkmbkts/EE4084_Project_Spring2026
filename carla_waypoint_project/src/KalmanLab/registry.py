@@ -57,6 +57,7 @@ def _validate_module(path: Path, module_name: str, module: ModuleType) -> Filter
     tune = getattr(module, "TUNE", None)
     tune_specs = getattr(module, "TUNE_SPECS", ())
     filter_class = getattr(module, "Filter", None)
+    auto_tune_profile = getattr(module, "AUTO_TUNE_PROFILE", None)
 
     if not isinstance(filter_info, dict):
         return _invalid_record(path, module_name, "FILTER_INFO must be a dictionary.")
@@ -91,6 +92,7 @@ def _validate_module(path: Path, module_name: str, module: ModuleType) -> Filter
         tune=dict(tune),
         tune_specs=_normalize_tune_specs(tune_specs),
         filter_class=filter_class,
+        auto_tune_profile=_normalize_auto_tune_profile(auto_tune_profile, tune, tune_specs),
     )
 
 
@@ -106,6 +108,52 @@ def _normalize_tune_specs(value: object) -> tuple[Any, ...]:
         if hasattr(spec, "key") and hasattr(spec, "clamp"):
             specs.append(spec)
     return tuple(specs)
+
+
+def _normalize_auto_tune_profile(
+    value: object,
+    tune: dict[str, Any],
+    tune_specs: object,
+) -> dict[str, Any] | None:
+    """Return optional auto-tune metadata without making it mandatory."""
+    if value is None or not isinstance(value, dict):
+        return None
+    profile = dict(value)
+    primary = _normalize_auto_tune_params(profile.get("primary"), tune, tune_specs)
+    secondary = _normalize_auto_tune_params(profile.get("secondary"), tune, tune_specs)
+    profile["primary"] = primary
+    profile["secondary"] = secondary
+    if not isinstance(profile.get("search"), dict):
+        profile["search"] = {}
+    profile.setdefault("enabled", bool(primary))
+    profile.setdefault("objective", "rmse_consistency")
+    return profile
+
+
+def _normalize_auto_tune_params(value: object, tune: dict[str, Any], tune_specs: object) -> list[dict[str, Any]]:
+    if not isinstance(value, (tuple, list)):
+        return []
+    specs_by_key = {
+        str(getattr(spec, "key", "")): spec
+        for spec in _normalize_tune_specs(tune_specs)
+        if getattr(spec, "key", "")
+    }
+    params: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "")
+        if key not in tune and key not in specs_by_key:
+            continue
+        normalized = dict(item)
+        normalized["key"] = key
+        spec = specs_by_key.get(key)
+        if spec is not None:
+            normalized.setdefault("min", getattr(spec, "minimum", None))
+            normalized.setdefault("max", getattr(spec, "maximum", None))
+        normalized.setdefault("scale", "linear")
+        params.append(normalized)
+    return params
 
 
 def _invalid_record(

@@ -83,6 +83,25 @@ TUNE_SPECS = (
 )
 
 
+AUTO_TUNE_PROFILE = {
+    "enabled": True,
+    "primary": [
+        {"key": "process_accel_stddev_mps2", "scale": "log", "min": 0.20, "max": 8.0},
+        {"key": "process_yaw_rate_stddev_dps", "scale": "log", "min": 2.0, "max": 60.0},
+        {"key": "gnss_position_stddev_m", "scale": "log", "min": 0.40, "max": 6.0},
+        {"key": "imu_yaw_stddev_deg", "scale": "log", "min": 1.0, "max": 20.0},
+    ],
+    "secondary": [
+        {"key": "initial_speed_stddev_mps", "scale": "log", "min": 0.5, "max": 8.0},
+    ],
+    "search": {
+        "default_trials": 30,
+        "strategy": "random_plus_coordinate_refinement",
+    },
+    "objective": "rmse_consistency",
+}
+
+
 def normalize_angle_rad(angle: float) -> float:
     """Wrap an angle in radians to [-pi, pi]."""
     if not math.isfinite(angle):

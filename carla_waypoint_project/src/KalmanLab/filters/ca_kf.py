@@ -95,6 +95,24 @@ TUNE_SPECS = (
 )
 
 
+AUTO_TUNE_PROFILE = {
+    "enabled": True,
+    "primary": [
+        {"key": "process_jerk_stddev_mps3", "scale": "log", "min": 0.10, "max": 5.0},
+        {"key": "gnss_position_stddev_m", "scale": "log", "min": 0.40, "max": 6.0},
+        {"key": "imu_accel_stddev_mps2", "scale": "log", "min": 0.05, "max": 3.0},
+    ],
+    "secondary": [
+        {"key": "initial_velocity_stddev_mps", "scale": "log", "min": 0.5, "max": 8.0},
+    ],
+    "search": {
+        "default_trials": 30,
+        "strategy": "random_plus_coordinate_refinement",
+    },
+    "objective": "rmse_consistency",
+}
+
+
 @dataclass(frozen=True)
 class _CAStateSnapshot:
     px: float

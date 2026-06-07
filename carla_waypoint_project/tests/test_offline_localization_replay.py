@@ -7,6 +7,9 @@ import json
 import math
 from pathlib import Path
 import sys
+from types import SimpleNamespace
+
+import pygame
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -27,8 +30,11 @@ from src.evaluation.offline_replay_runner import (  # noqa: E402
     _annotate_metric_ground_truth,
     _raw_gnss_estimates,
 )
+from src.evaluation.filter_auto_tuner import AutoTuneRequest, FilterAutoTuner  # noqa: E402
 from src.evaluation.sensor_log_recorder import SENSOR_LOG_FIELDNAMES  # noqa: E402
 from src.evaluation.test_route_store import TestRouteStore  # noqa: E402
+from src.evaluation.benchmark_config import ParameterSpec  # noqa: E402
+from src.visualization.ui.parameter_controls import ParameterEditor  # noqa: E402
 from src.KalmanLab.registry import discover_filters  # noqa: E402
 from src.visualization.startup_map_selector import (  # noqa: E402
     CLOSED_LOOP_SUBTABS,
@@ -275,6 +281,142 @@ def test_startup_tune_storage_feeds_closed_loop_and_offline_requests() -> None:
         raise AssertionError("raw_gnss should not require startup tune values")
 
 
+def test_registry_reads_optional_auto_tune_profile() -> None:
+    records = {record.filter_id: record for record in discover_filters() if record.valid}
+    ca = records.get("ca_kf")
+    raw = records.get("raw_gnss")
+    if ca is None or not ca.auto_tune_enabled:
+        raise AssertionError("CA-KF should expose AUTO_TUNE_PROFILE through registry")
+    if not ca.auto_tune_profile or not ca.auto_tune_profile.get("primary"):
+        raise AssertionError("CA-KF auto tune primary parameters missing")
+    if raw is None or raw.auto_tune_profile is not None or raw.auto_tune_enabled:
+        raise AssertionError("raw_gnss should remain valid but not auto-tuneable")
+
+
+def test_parameter_editor_mousewheel_uses_mouse_position_without_event_pos() -> None:
+    pygame.font.init()
+    surface = pygame.Surface((360, 160))
+    specs = tuple(
+        ParameterSpec(f"value_{index}", f"Value {index}", 0.0, 10.0, "", 1, "Group")
+        for index in range(18)
+    )
+    editor = ParameterEditor(specs=specs, values={}, presets={}, active_preset="Custom", title="Many Values")
+    editor.draw(surface, pygame.Rect(0, 0, 360, 120))
+    before = editor._scroll_y
+    event = pygame.event.Event(pygame.MOUSEWHEEL, {"y": -1})
+    if not editor.handle_event(event):
+        raise AssertionError("ParameterEditor did not consume MOUSEWHEEL without event.pos")
+    if editor._scroll_y <= before:
+        raise AssertionError("ParameterEditor did not scroll downward")
+    for _ in range(100):
+        editor.handle_event(event)
+    if editor._scroll_y > editor._max_scroll_y():
+        raise AssertionError("ParameterEditor scroll was not clamped")
+
+
+def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path: Path) -> None:
+    output_root = tmp_path / "benchmark_results"
+    logs = []
+    for index in range(2):
+        route_folder = output_root / "offline_localization" / "recordings" / "run_001" / f"route_{index + 1:03d}"
+        route_folder.mkdir(parents=True)
+        log_path = route_folder / "sensor_log.csv"
+        log_path.write_text("timestamp\n0.0\n", encoding="utf-8")
+        write_json(
+            route_folder / "route_metadata.json",
+            {
+                "route": {"name": f"route_{index + 1}", "map_name": "Town01"},
+                "map_name": "Town01",
+                "sensor_noise_config": {"preset_name": "Synthetic", "gnss_position_stddev_m": 1.25},
+                "vehicle_behavior_config": {"preset_name": "Balanced"},
+                "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+            },
+        )
+        write_json(
+            route_folder / "recording_summary.json",
+            {
+                "route_name": f"route_{index + 1}",
+                "map_name": "Town01",
+                "sample_count": 1,
+                "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+            },
+        )
+        logs.append(log_path)
+
+    calls: list[OfflineReplayRequest] = []
+
+    class FakeRunner:
+        def run(self, request: OfflineReplayRequest) -> SimpleNamespace:
+            calls.append(request)
+            trial_index = len(calls)
+            folder = output_root / "offline_localization" / "evaluations" / f"fake_trial_{trial_index:03d}"
+            folder.mkdir(parents=True)
+            tune = request.filter_tunes["ca_kf"]
+            rmse = float(tune.get("gnss_position_stddev_m", 9.0))
+            write_json(
+                folder / "aggregate_summary.json",
+                {
+                    "route_count": len(request.sensor_log_paths),
+                    "aggregate_rows": [
+                        {
+                            "filter_id": "ca_kf",
+                            "eval_position_rmse_m": rmse,
+                            "yaw_rmse_deg": 0.0,
+                            "divergence_event_count": 0,
+                        }
+                    ],
+                },
+            )
+            return SimpleNamespace(output_folder=folder, failures=())
+
+    request = AutoTuneRequest(
+        filter_id="ca_kf",
+        sensor_log_paths=tuple(logs),
+        base_tune={"gnss_position_stddev_m": 1.25, "process_jerk_stddev_mps3": 1.2},
+        auto_tune_profile={
+            "enabled": True,
+            "primary": [{"key": "gnss_position_stddev_m", "scale": "log", "min": 0.5, "max": 2.0}],
+            "search": {"default_trials": 2, "strategy": "random_plus_coordinate_refinement"},
+            "objective": "rmse_consistency",
+        },
+        max_trials=2,
+        output_root=str(output_root),
+    )
+    result = FilterAutoTuner(runner_factory=FakeRunner).run(request)
+    if not calls:
+        raise AssertionError("auto tuner did not run OfflineReplayRunner")
+    for call in calls:
+        if call.sensor_log_paths != tuple(logs):
+            raise AssertionError("auto tuner did not pass all selected logs")
+        if call.selected_filter_ids != ("ca_kf",):
+            raise AssertionError("auto tuner should tune exactly one filter")
+        if "ca_kf" not in call.filter_tunes:
+            raise AssertionError("candidate tune was not passed through filter_tunes")
+    if result.saved_config_path is None or not result.saved_config_path.exists():
+        raise AssertionError("best tune config was not saved")
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    if config.get("filter_id") != "ca_kf" or "best_tune" not in config:
+        raise AssertionError("saved best tune config is incomplete")
+    if len(config.get("selected_logs") or []) != 2:
+        raise AssertionError("saved best tune config did not preserve selected logs")
+
+
+def test_saved_tune_apply_updates_only_selected_filter() -> None:
+    selector = StartupMapSelector.__new__(StartupMapSelector)
+    selector._setup_filter_records = [record for record in discover_filters() if record.valid]
+    selector._selected_filter_tunes = {
+        "ca_kf": {"gnss_position_stddev_m": 1.0},
+        "ctra_ekf": {"process_jerk_stddev_mps3": 2.0},
+    }
+    selector._filter_tune_editor_filter_id = ""
+    selector._filter_tune_editor = None
+    selector._apply_tune_to_filter("ca_kf", {"gnss_position_stddev_m": 4.4})
+    if selector._selected_filter_tunes["ca_kf"].get("gnss_position_stddev_m") != 4.4:
+        raise AssertionError("saved tune did not update selected filter")
+    if selector._selected_filter_tunes["ctra_ekf"].get("process_jerk_stddev_mps3") != 2.0:
+        raise AssertionError("saved tune apply leaked into another filter")
+
+
 def test_offline_recording_discovery_defaults_to_benchmark_results() -> None:
     expected = PROJECT_ROOT / DEFAULT_OFFLINE_OUTPUT_ROOT / "offline_localization" / "recordings"
     if recordings_root() != expected:
@@ -428,6 +570,11 @@ def run_all() -> None:
     test_offline_recording_warmup_does_not_trigger_route_failure()
     test_startup_gui_uses_mode_based_tabs()
     test_startup_tune_storage_feeds_closed_loop_and_offline_requests()
+    test_registry_reads_optional_auto_tune_profile()
+    test_parameter_editor_mousewheel_uses_mouse_position_without_event_pos()
+    with tempfile.TemporaryDirectory() as directory:
+        test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(Path(directory))
+    test_saved_tune_apply_updates_only_selected_filter()
     test_offline_recording_discovery_defaults_to_benchmark_results()
 
 

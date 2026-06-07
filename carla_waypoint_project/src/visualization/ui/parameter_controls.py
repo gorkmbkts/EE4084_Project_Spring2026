@@ -96,10 +96,16 @@ class ParameterEditor:
                 self._drag_key = None
                 return True
 
-        if not hasattr(event, "pos"):
+        if event.type == pygame.MOUSEWHEEL:
+            try:
+                position = pygame.mouse.get_pos()
+            except pygame.error:
+                position = self._last_rect.center
+        elif hasattr(event, "pos"):
+            position = event.pos
+        else:
             return False
 
-        position = event.pos
         if not self._last_rect.collidepoint(position):
             if event.type == pygame.MOUSEBUTTONDOWN and self._active_input_key is not None:
                 self._commit_active_input(call_callback=True)
@@ -156,6 +162,7 @@ class ParameterEditor:
 
         editor_rect = pygame.Rect(content.left, editor_top, content.width, max(20, content.bottom - editor_top))
         self._last_content_rect = editor_rect.copy()
+        self._scroll_y = self._clamp_int(self._scroll_y, 0, self._max_scroll_y())
         old_clip = surface.get_clip()
         surface.set_clip(editor_rect)
 
