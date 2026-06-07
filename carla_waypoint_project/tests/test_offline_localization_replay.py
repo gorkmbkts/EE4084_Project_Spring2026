@@ -1210,6 +1210,32 @@ def test_route_tab_lines_do_not_require_metrics() -> None:
         raise AssertionError("route tab lines did not render basic route state")
 
 
+def test_live_evaluation_lines_do_not_require_position_nees() -> None:
+    class EmptyLogger:
+        current_raw_gnss_error_m = None
+        current_position_error_m = None
+
+        def running_sample_count(self, phases=None) -> int:
+            return 0
+
+        def running_metrics(self) -> dict[str, object]:
+            return {
+                "filtered_rmse_m": None,
+                "raw_gnss_rmse_m": None,
+                "mean_position_nees": None,
+                "mean_position_nees_diagonal_approx": None,
+            }
+
+    app = SimulationApp.__new__(SimulationApp)
+    app._active_performance_logger = lambda: EmptyLogger()
+    app._filter_manager = None
+    app._latest_ground_truth_state = None
+    app._latest_estimated_state = None
+    lines = app._live_evaluation_lines()
+    if not any(line.startswith("Position NEES approx:") for line in lines):
+        raise AssertionError(f"live evaluation lines did not render guarded NEES line: {lines}")
+
+
 def test_closed_loop_auto_tune_builder_requires_one_validation_route(tmp_path: Path) -> None:
     selector = _closed_loop_autotune_selector(tmp_path)
     selector._closed_loop_auto_tune_validation_route_index = None

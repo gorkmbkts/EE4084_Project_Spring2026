@@ -2880,6 +2880,11 @@ class SimulationApp:
         filtered_rmse = metrics.get("filtered_rmse_m")
         if raw_rmse is not None and raw_rmse > 0.0 and filtered_rmse is not None:
             improvement = 100.0 * (raw_rmse - filtered_rmse) / raw_rmse
+        position_nees = metrics.get("mean_position_nees")
+        position_nees_label = "Position NEES"
+        if position_nees is None:
+            position_nees = metrics.get("mean_position_nees_diagonal_approx")
+            position_nees_label = "Position NEES approx"
         lines = [
             f"Metric source: {metric_phase_label}",
             f"Current position error: {self._format_optional_metric(logger.current_position_error_m, 'm')}",
