@@ -63,6 +63,7 @@ class PendingClosedLoopAutoTuneSession:
     handoff_path: Optional[str] = None
     base_tune: dict[str, object] = field(default_factory=dict)
     auto_tune_profile: dict[str, object] = field(default_factory=dict)
+    validation_route_data: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -80,6 +81,7 @@ class ClosedLoopValidationRoute:
     map_name: str
     route_id: str = ""
     route_signature: str = ""
+    route_data: dict[str, object] = field(default_factory=dict)
 
     @staticmethod
     def from_object(value: object) -> "ClosedLoopValidationRoute":
@@ -89,13 +91,38 @@ class ClosedLoopValidationRoute:
             name = str(value.get("name") or value.get("route_name") or "")
             map_name = str(value.get("map_name") or value.get("map") or "")
             route_id = str(value.get("route_id") or value.get("id") or "")
-            route_signature = str(value.get("route_signature") or value.get("signature") or "")
-            return ClosedLoopValidationRoute(name=name, map_name=map_name, route_id=route_id, route_signature=route_signature)
+            route_data = value.get("route_data")
+            if not isinstance(route_data, dict):
+                route_data = {
+                    key: value[key]
+                    for key in ("name", "start", "goal", "map_name", "created_from")
+                    if key in value
+                }
+            route_signature = str(value.get("route_signature") or value.get("signature") or config_signature(route_data))
+            return ClosedLoopValidationRoute(
+                name=name,
+                map_name=map_name,
+                route_id=route_id,
+                route_signature=route_signature,
+                route_data=dict(route_data),
+            )
         name = str(getattr(value, "name", "") or getattr(value, "route_name", ""))
         map_name = str(getattr(value, "map_name", "") or getattr(value, "map", ""))
         route_id = str(getattr(value, "route_id", "") or getattr(value, "id", ""))
-        route_signature = str(getattr(value, "route_signature", "") or getattr(value, "signature", ""))
-        return ClosedLoopValidationRoute(name=name, map_name=map_name, route_id=route_id, route_signature=route_signature)
+        route_data: dict[str, object] = {}
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            payload = to_dict()
+            if isinstance(payload, dict):
+                route_data = dict(payload)
+        route_signature = str(getattr(value, "route_signature", "") or getattr(value, "signature", "") or config_signature(route_data))
+        return ClosedLoopValidationRoute(
+            name=name,
+            map_name=map_name,
+            route_id=route_id,
+            route_signature=route_signature,
+            route_data=route_data,
+        )
 
     def identity(self) -> str:
         return self.route_id or self.route_signature or f"{self.name}@{self.map_name}"
@@ -106,6 +133,7 @@ class ClosedLoopValidationRoute:
             "map_name": self.map_name,
             "route_id": self.route_id,
             "route_signature": self.route_signature,
+            "route_data": dict(self.route_data),
         }
 
 
@@ -150,6 +178,7 @@ class ClosedLoopAutoTuneRequest:
                     name=session.validation_route_name,
                     map_name=session.validation_route_map,
                     route_id=session.validation_route_id,
+                    route_data=dict(session.validation_route_data),
                 ),
             ),
             sensor_noise_config=dict(session.sensor_config),

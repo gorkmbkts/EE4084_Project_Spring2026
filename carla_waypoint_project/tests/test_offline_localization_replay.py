@@ -44,7 +44,12 @@ from src.evaluation.benchmark_config import (  # noqa: E402
     sensor_noise_config_from_values,
     validate_benchmark_config,
 )
-from src.evaluation.closed_loop_auto_tune import PendingClosedLoopAutoTuneSession  # noqa: E402
+from src.evaluation.closed_loop_auto_tune import (  # noqa: E402
+    ClosedLoopFinalist,
+    ClosedLoopValidationRequest,
+    ClosedLoopValidationRoute,
+    PendingClosedLoopAutoTuneSession,
+)
 from src.evaluation.consistency_metrics import position_nees, summarize_nis_by_type  # noqa: E402
 from src.evaluation.sensor_noise_tune_mapper import (  # noqa: E402
     SensorNoiseTuneMapper,
@@ -74,6 +79,7 @@ from src.visualization.startup_map_selector import (  # noqa: E402
     TOP_LEVEL_TABS,
     StartupMapSelector,
 )
+from src.core.app import AppClosedLoopValidationRunner  # noqa: E402
 
 
 def test_offline_replay_runs_on_short_saved_route_log(tmp_path: Path) -> None:
@@ -1009,6 +1015,104 @@ def test_pending_closed_loop_auto_tune_session_saves_explicit_handoff(tmp_path: 
         raise AssertionError("pending closed-loop auto tune handoff did not preserve offline log paths")
 
 
+def test_closed_loop_auto_tune_builder_requires_one_validation_route(tmp_path: Path) -> None:
+    selector = _closed_loop_autotune_selector(tmp_path)
+    selector._closed_loop_auto_tune_validation_route_index = None
+    try:
+        selector._build_closed_loop_auto_tune_request_from_modal()
+    except ValueError as exc:
+        if "exactly one validation route" not in str(exc):
+            raise AssertionError(f"wrong validation-route rejection: {exc}") from exc
+    else:
+        raise AssertionError("closed-loop autotune builder accepted missing validation route")
+
+
+def test_closed_loop_auto_tune_builder_rejects_mixed_noise_logs(tmp_path: Path) -> None:
+    selector = _closed_loop_autotune_selector(tmp_path, include_mixed_noise=True)
+    selector._closed_loop_auto_tune_selected_log_indices = {0, 1}
+    try:
+        selector._build_closed_loop_auto_tune_request_from_modal()
+    except ValueError as exc:
+        if "mixed sensor noise" not in str(exc):
+            raise AssertionError(f"wrong mixed-noise rejection: {exc}") from exc
+    else:
+        raise AssertionError("closed-loop autotune builder accepted mixed-noise offline logs")
+
+
+def test_closed_loop_auto_tune_builder_includes_explicit_session_fields(tmp_path: Path) -> None:
+    selector = _closed_loop_autotune_selector(tmp_path)
+    request = selector._build_closed_loop_auto_tune_request_from_modal()
+    if request.filter_id != "ca_kf" or request.tracking_mode != TRACKING_MODE_ACTIVE:
+        raise AssertionError("closed-loop autotune request did not preserve selected filter/tracking mode")
+    if len(request.offline_log_paths) != 1 or not str(request.offline_log_paths[0]).endswith("sensor_log.csv"):
+        raise AssertionError("closed-loop autotune request did not preserve selected offline log")
+    if len(request.validation_routes) != 1:
+        raise AssertionError("closed-loop autotune request did not preserve exactly one validation route")
+    route = request.validation_routes[0]
+    if not route.route_data or route.name != _short_saved_route().name:
+        raise AssertionError("closed-loop autotune request did not serialize validation route data")
+    if request.sensor_noise_profile != "Medium Noise":
+        raise AssertionError("closed-loop autotune request did not preserve sensor preset")
+    if request.vehicle_behavior_config.get("preset_name") != "Balanced":
+        raise AssertionError("closed-loop autotune request did not preserve behavior config")
+    if not request.actuator_realism_config.get("enabled"):
+        raise AssertionError("closed-loop autotune request did not preserve actuator realism config")
+    if request.trial_count != 12 or request.finalist_count != 2:
+        raise AssertionError("closed-loop autotune request did not preserve trial/finalist counts")
+    pending = request.metadata.get("pending_session")
+    if not isinstance(pending, dict) or pending.get("validation_route_data") != route.route_data:
+        raise AssertionError("closed-loop autotune request did not include explicit pending-session handoff metadata")
+
+
+def test_closed_loop_auto_tune_modal_not_available_for_raw_gnss() -> None:
+    selector = StartupMapSelector.__new__(StartupMapSelector)
+    selector._setup_filter_records = [
+        SimpleNamespace(filter_id="raw_gnss", auto_tune_enabled=False, auto_tune_profile=None)
+    ]
+    selector._closed_loop_saved_tune_status = ""
+    selector._closed_loop_auto_tune_modal_open = False
+    selector._open_closed_loop_auto_tune_modal("raw_gnss")
+    if selector._closed_loop_auto_tune_modal_open:
+        raise AssertionError("closed-loop autotune modal should not open for raw_gnss")
+    if "unavailable" not in selector._closed_loop_saved_tune_status:
+        raise AssertionError("raw_gnss closed-loop autotune guard did not show a clear status")
+
+
+def test_app_closed_loop_validation_runner_delegates_to_app() -> None:
+    class FakeApp:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def _run_closed_loop_auto_tune_validation(self, request: object) -> dict[str, object]:
+            self.requests.append(request)
+            return {"route_completion_success": True, "eval_filtered_rmse_m": 1.0}
+
+    app = FakeApp()
+    finalist = ClosedLoopFinalist(
+        rank=1,
+        candidate_tune={"process_jerk_stddev_mps3": 1.2},
+        offline_score=0.5,
+        offline_metrics={},
+        trial_index=7,
+        source_output_folder=None,
+    )
+    request = ClosedLoopValidationRequest(
+        filter_id="ca_kf",
+        tracking_mode=TRACKING_MODE_PASSIVE,
+        finalist=finalist,
+        validation_route=ClosedLoopValidationRoute.from_object(_short_saved_route()),
+        sensor_noise_config={},
+        vehicle_behavior_config={},
+        actuator_realism_config={},
+        output_folder=Path("validation_output"),
+    )
+    result = AppClosedLoopValidationRunner(app).run(request)
+    if result.get("route_completion_success") is not True:
+        raise AssertionError("app closed-loop validation runner did not return app metrics")
+    if app.requests != [request]:
+        raise AssertionError("app closed-loop validation runner did not pass through the validation request")
+
+
 def test_auto_tune_modal_requires_primary_profile() -> None:
     selector = StartupMapSelector.__new__(StartupMapSelector)
     raw = SimpleNamespace(
@@ -1038,6 +1142,95 @@ def test_offline_recording_discovery_defaults_to_benchmark_results() -> None:
     expected = PROJECT_ROOT / DEFAULT_OFFLINE_OUTPUT_ROOT / "offline_localization" / "recordings"
     if recordings_root() != expected:
         raise AssertionError(f"offline recordings default path changed: {recordings_root()} != {expected}")
+
+
+def _closed_loop_autotune_selector(tmp_path: Path, include_mixed_noise: bool = False) -> StartupMapSelector:
+    selector = StartupMapSelector.__new__(StartupMapSelector)
+    selector._setup_filter_records = [record for record in discover_filters() if record.valid]
+    selector._selected_filter_id = "ca_kf"
+    selector._closed_loop_auto_tune_filter_id = "ca_kf"
+    selector._tracking_mode = TRACKING_MODE_ACTIVE
+    selector._selected_filter_tunes = {
+        "ca_kf": {"gnss_position_stddev_m": 1.0, "process_jerk_stddev_mps3": 1.2}
+    }
+    selector._filter_tune_editor = None
+    selector._filter_tune_editor_filter_id = ""
+    selector._sensor_editor = None
+    selector._sensor_preset = "Medium Noise"
+    selector._behavior_editor = None
+    selector._behavior_preset = "Balanced"
+    selector._closed_loop_auto_tune_trials = 12
+    selector._closed_loop_auto_tune_finalists = 2
+    selector._closed_loop_auto_tune_status_lines = []
+    selector._recommendation_applied_by_filter = {}
+    selector._selected_route_indices = set()
+
+    route = _short_saved_route()
+    selector._route_items = [
+        SimpleNamespace(index=0, route=route, straight_line_length_m=100.0, compatible_with_available_maps=True)
+    ]
+    selector._closed_loop_auto_tune_validation_route_index = 0
+
+    sensor = sensor_noise_config_from_values(SENSOR_NOISE_PRESETS["Medium Noise"], preset_name="Medium Noise").to_dict()
+    log_a = _recorded_log_info(tmp_path, "run_001", "route_001", sensor)
+    logs = [log_a]
+    if include_mixed_noise:
+        other_sensor = dict(sensor)
+        other_sensor["gnss_noise_lat_stddev_deg"] = float(other_sensor.get("gnss_noise_lat_stddev_deg", 0.0)) + 0.00001
+        other_sensor["preset_name"] = "Different Noise"
+        logs.append(_recorded_log_info(tmp_path, "run_001", "route_002", other_sensor))
+    selector._recorded_logs = logs
+    selector._closed_loop_auto_tune_selected_log_indices = {0}
+    return selector
+
+
+def _recorded_log_info(
+    tmp_path: Path,
+    run_id: str,
+    route_folder_name: str,
+    sensor_config: dict[str, object],
+) -> object:
+    route = _short_saved_route()
+    run_folder = tmp_path / "benchmark_results" / "offline_localization" / "recordings" / run_id
+    route_folder = run_folder / route_folder_name
+    route_folder.mkdir(parents=True, exist_ok=True)
+    log_path = route_folder / "sensor_log.csv"
+    log_path.write_text("timestamp\n0.0\n", encoding="utf-8")
+    write_json(
+        route_folder / "route_metadata.json",
+        {
+            "route": route.to_dict(),
+            "map_name": route.map_name,
+            "sensor_noise_config": dict(sensor_config),
+            "vehicle_behavior_config": {"preset_name": "Balanced"},
+            "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+        },
+    )
+    write_json(
+        route_folder / "recording_summary.json",
+        {
+            "route_name": route.name,
+            "map_name": route.map_name,
+            "sample_count": 1,
+            "duration_s": 0.1,
+            "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+        },
+    )
+    return SimpleNamespace(
+        route_folder=route_folder,
+        sensor_log_path=log_path,
+        run_folder=run_folder,
+        recording_id=run_id,
+        route_name=route.name,
+        map_name=route.map_name or "",
+        sample_count=1,
+        duration_s=0.1,
+        recording_driver=RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+        sensor_noise_preset=str(sensor_config.get("preset_name") or ""),
+        vehicle_behavior_preset="Balanced",
+        created_at="2026-06-07T00:00:00",
+        failure_reason="",
+    )
 
 
 def _short_saved_route():

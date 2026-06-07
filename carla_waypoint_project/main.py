@@ -41,6 +41,7 @@ def main() -> None:
             existing_display_surface=selector.surface,
             benchmark_config=selection.benchmark_config,
             offline_recording_config=selection.offline_recording_config,
+            closed_loop_auto_tune_request=selection.closed_loop_auto_tune_request,
         )
         try:
             app.run()
