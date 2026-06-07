@@ -43,11 +43,21 @@ def generate_offline_route_plots(route_folder: Path) -> list[Path]:
         ),
     ]
     nis = _plot_metric_if_available(plots_dir / "nis_comparison.png", estimate_files, "nis", "NIS")
-    nees = _plot_metric_if_available(plots_dir / "nees_comparison.png", estimate_files, "nees", "NEES")
+    nees = _plot_metric_if_available(plots_dir / "nees_comparison.png", estimate_files, "position_nees", "Position NEES (full 2x2)")
+    if nees is None:
+        nees = _plot_metric_if_available(
+            plots_dir / "nees_comparison.png",
+            estimate_files,
+            "position_nees_diagonal_approx",
+            "Position NEES (diagonal approx)",
+        )
+    legacy_nees = _plot_metric_if_available(plots_dir / "legacy_nees_comparison.png", estimate_files, "nees", "Legacy NEES")
     if nis is not None:
         outputs.append(nis)
     if nees is not None:
         outputs.append(nees)
+    if legacy_nees is not None:
+        outputs.append(legacy_nees)
     return outputs
 
 

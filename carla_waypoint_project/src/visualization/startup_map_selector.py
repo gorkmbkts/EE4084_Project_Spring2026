@@ -39,10 +39,12 @@ from src.evaluation.filter_auto_tuner import (
     list_saved_tune_configs,
     load_saved_tune_config,
     noise_profile_summary,
+    tune_config_compatibility,
 )
 from src.evaluation.offline_replay_runner import OfflineReplayRequest, OfflineReplayRunner
 from src.evaluation.sensor_log_recorder import OfflineRecordingConfig
 from src.evaluation.test_route_store import SavedTestRoute
+from src.evaluation.tune_config_schema import TuneContext, closed_loop_tune_context, offline_tune_context
 from src.utils.map_names import display_map_name, maps_compatible, normalize_map_name
 from src.visualization.ui.parameter_controls import ParameterEditor
 from src.visualization.windowing import create_display_surface, display_flags_from_settings
@@ -816,6 +818,39 @@ class StartupMapSelector:
             return self._sensor_editor.values()
         return SENSOR_NOISE_PRESETS["Medium Noise"]
 
+    def _current_sensor_noise_config(self) -> object:
+        return sensor_noise_config_from_values(self._current_sensor_values(), preset_name=self._sensor_preset)
+
+    def _current_vehicle_behavior_config(self) -> dict[str, object]:
+        values = self._behavior_editor.values() if self._behavior_editor is not None else BEHAVIOR_PRESETS["Balanced"]
+        preset = self._behavior_editor.active_preset if self._behavior_editor is not None else self._behavior_preset
+        return driving_behavior_from_values(values, preset_name=preset)
+
+    def _selected_offline_sensor_noise_config(self) -> object | None:
+        if self._selected_recorded_log_index is None or self._selected_recorded_log_index >= len(self._recorded_logs):
+            return None
+        metadata = read_json(self._recorded_logs[self._selected_recorded_log_index].route_folder / "route_metadata.json")
+        config = metadata.get("sensor_noise_config")
+        return config if isinstance(config, dict) else None
+
+    def _saved_tune_context(self, filter_id: str, context: str) -> TuneContext:
+        if context == "closed_loop":
+            return closed_loop_tune_context(
+                filter_id=filter_id,
+                tracking_mode=self._tracking_mode,
+                sensor_noise_config=self._current_sensor_noise_config(),
+                vehicle_behavior_config=self._current_vehicle_behavior_config(),
+            )
+        return offline_tune_context(
+            filter_id=filter_id,
+            sensor_noise_config=self._selected_offline_sensor_noise_config(),
+        )
+
+    def _saved_tune_configs(self, filter_id: str, context: str) -> list[dict[str, object]]:
+        if context != "closed_loop" and self._selected_offline_sensor_noise_config() is None:
+            return []
+        return list_saved_tune_configs(filter_id, context=self._saved_tune_context(filter_id, context))
+
     def _current_recommendation(self, filter_id: Optional[str] = None, force_passive: bool = False) -> TuneRecommendation:
         record = self._filter_record(filter_id or self._selected_filter_id)
         if record is None:
@@ -934,20 +969,18 @@ class StartupMapSelector:
             return _NoSelection
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and hasattr(event, "pos"):
             position = event.pos
-            if self._active_closed_loop_subtab == "Routes" and self._select_all_routes_rect.collidepoint(position):
-                self._selected_route_indices = {item.index for item in self._route_items}
-                return _NoSelection
-            if self._active_closed_loop_subtab == "Routes" and self._clear_routes_rect.collidepoint(position):
+            if (
+                self._active_closed_loop_subtab == "Routes"
+                and self._clear_routes_rect.width > 1
+                and self._clear_routes_rect.collidepoint(position)
+            ):
                 self._selected_route_indices.clear()
                 return _NoSelection
             if self._active_closed_loop_subtab == "Routes":
                 for index, rect in self._route_rects.items():
                     if not rect.collidepoint(position):
                         continue
-                    if index in self._selected_route_indices:
-                        self._selected_route_indices.remove(index)
-                    else:
-                        self._selected_route_indices.add(index)
+                    self._selected_route_indices = {index}
                     return _NoSelection
             if self._start_benchmark_rect.collidepoint(position):
                 return self._start_benchmark_from_setup(client)
@@ -1093,8 +1126,8 @@ class StartupMapSelector:
             self._draw_route_selection(
                 work,
                 selected_indices=set(self._selected_route_indices),
-                multi_select=True,
-                title="Saved Test Routes",
+                multi_select=False,
+                title="Saved Test Route",
             )
         self._draw_closed_loop_footer(bottom)
 
@@ -1499,7 +1532,7 @@ class StartupMapSelector:
             text = "This filter does not expose AUTO_TUNE_PROFILE. Manual tuning is still available."
             color = DASHBOARD.warning_color
         self._draw_wrapped_text(text, pygame.Rect(content.left, content.top + 28, content.width, 36), self._small_font, color)
-        saved = list_saved_tune_configs(filter_id)
+        saved = self._saved_tune_configs(filter_id, context="offline")
         status = self._offline_saved_tune_status or (f"Saved configs: {len(saved)}" if saved else "No saved tune config yet.")
         self._draw_text(status, (content.left, content.bottom - 26), self._small_font, DASHBOARD.text_color, content.width - 300)
         self._offline_auto_tune_rect = pygame.Rect(content.right - 310, content.bottom - 30, 132, 24)
@@ -1523,8 +1556,8 @@ class StartupMapSelector:
         list_top = content.top + 38
         if context == "closed_loop":
             note = (
-                "Saved auto-tune configs were optimized in offline localization replay. "
-                "Validate in closed-loop before trusting final benchmark results."
+                "Only closed-loop configs matching this filter, tracking mode, noise, and behavior are shown. "
+                "Offline and opposite tracking-mode tunes are hidden."
             )
             self._draw_wrapped_text(
                 note,
@@ -1533,9 +1566,9 @@ class StartupMapSelector:
                 DASHBOARD.warning_color,
             )
             list_top = content.top + 80
-        configs = list_saved_tune_configs(filter_id)
+        configs = self._saved_tune_configs(filter_id, context=context)
         if not configs:
-            self._draw_text("No saved tune configs for this filter.", (content.left, list_top + 4), self._font, DASHBOARD.warning_color, content.width)
+            self._draw_text("No compatible saved tune configs for this context.", (content.left, list_top + 4), self._font, DASHBOARD.warning_color, content.width)
             return
         row_h = 62
         y = list_top
@@ -1550,8 +1583,11 @@ class StartupMapSelector:
             rmse = item.get("mean_eval_position_rmse_m")
             score_text = f"score {float(score):.3f}" if isinstance(score, (int, float)) else "score n/a"
             rmse_text = f"RMSE {float(rmse):.3f}m" if isinstance(rmse, (int, float)) else "RMSE n/a"
-            title = f"{name} | {item.get('noise_profile_label') or 'Unknown Noise'} | {score_text} | {rmse_text}"
-            detail = f"{item.get('log_count') or 0} log(s) | {item.get('created_at') or ''}"
+            mode = item.get("benchmark_mode") or "unknown"
+            tracking = item.get("tracking_mode") or "unknown"
+            route = item.get("validation_route_name")
+            title = f"{name} | {mode}/{tracking} | {item.get('noise_profile_label') or 'Unknown Noise'} | {score_text} | {rmse_text}"
+            detail = f"{item.get('log_count') or 0} log(s) | route {route or 'n/a'} | {item.get('created_at') or ''}"
             self._draw_text(title, (row.left + 10, row.top + 7), self._small_font, DASHBOARD.title_color, row.width - 100)
             self._draw_text(detail, (row.left + 10, row.top + 30), self._small_font, DASHBOARD.muted_text_color, row.width - 100)
             self._draw_button(apply_rect, "Apply")
@@ -1586,7 +1622,8 @@ class StartupMapSelector:
             return
         row_h = 56
         visible = max(1, list_rect.height // row_h)
-        if multi_select:
+        use_closed_loop_scroll = title == "Saved Test Route"
+        if multi_select or use_closed_loop_scroll:
             self._closed_loop_route_scroll = min(self._closed_loop_route_scroll, max(0, len(self._route_items) - visible))
             scroll = self._closed_loop_route_scroll
         else:
@@ -1631,12 +1668,13 @@ class StartupMapSelector:
 
     def _closed_loop_summary_text(self) -> str:
         routes = [item.route for item in self._route_items if item.index in self._selected_route_indices]
-        maps = sorted({display_map_name(route.map_name) for route in routes})
+        route = routes[0] if routes else None
         filter_label = self._selected_filter_id or "none"
-        map_text = ", ".join(maps[:3]) + ("..." if len(maps) > 3 else "")
+        route_text = route.name if route is not None else "none"
+        map_text = display_map_name(route.map_name) if route is not None else "none"
         return (
-            f"Closed-loop | Filter {filter_label} | Tracking {self._tracking_mode} | Routes {len(routes)} | "
-            f"Maps {map_text or 'none'} | Sensor {self._sensor_preset} | Behavior {self._behavior_preset}"
+            f"Closed-loop | Filter {filter_label} | Tracking {self._tracking_mode} | Route {route_text} | "
+            f"Map {map_text or 'none'} | Sensor {self._sensor_preset} | Behavior {self._behavior_preset}"
         )
 
     def _offline_summary_text(self) -> str:
@@ -1650,11 +1688,19 @@ class StartupMapSelector:
         return f"Offline localization | Log {log_label} | Filters {filters} + raw_gnss | Sensor {sensor}"
 
     def _apply_saved_tune_config(self, filter_id: str, config_index: int, context: str = "offline") -> None:
-        configs = list_saved_tune_configs(filter_id)
+        configs = self._saved_tune_configs(filter_id, context=context)
         if config_index < 0 or config_index >= len(configs):
             return
         config_path = Path(str(configs[config_index].get("path") or ""))
         config = load_saved_tune_config(config_path)
+        compatible, reason = tune_config_compatibility(config, self._saved_tune_context(filter_id, context))
+        if not compatible:
+            status = f"Rejected incompatible saved tune: {reason}"
+            if context == "closed_loop":
+                self._closed_loop_saved_tune_status = status
+            else:
+                self._offline_saved_tune_status = status
+            return
         best_tune = config.get("best_tune")
         if not isinstance(best_tune, dict):
             status = "Saved tune config is missing best_tune."
@@ -2008,9 +2054,9 @@ class StartupMapSelector:
         objective = str(profile.get("objective") or "rmse_consistency")
         lines = [
             f"Trials: {self._auto_tune_trials or search.get('default_trials') or 30}",
-            f"Strategy: {search.get('strategy') or 'random_plus_coordinate_refinement'}",
+            "Strategy: optuna_tpe when available; fallback random_plus_coordinate_refinement",
             f"Objective: {objective} | Trial plots: {'ON' if bool(search.get('generate_trial_plots', False)) else 'OFF'}",
-            "Use current GUI tune as base: ON",
+            "Process-only: ON | Sensor noise locked from selected log signature",
         ]
         self._draw_text("Auto Tune Settings", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
         y = content.top + 28
@@ -2069,6 +2115,10 @@ class StartupMapSelector:
     def _start_benchmark_from_setup(self, client: object) -> object:
         self._commit_filter_tune_editor()
         routes = [item.route for item in self._route_items if item.index in self._selected_route_indices]
+        if len(routes) != 1:
+            self._error = "Select exactly one saved route before starting a closed-loop benchmark."
+            self._active_closed_loop_subtab = "Routes"
+            return _NoSelection
         sensor_values = self._sensor_editor.values() if self._sensor_editor is not None else SENSOR_NOISE_PRESETS["Medium Noise"]
         behavior_values = self._behavior_editor.values() if self._behavior_editor is not None else BEHAVIOR_PRESETS["Balanced"]
         if self._sensor_editor is not None:

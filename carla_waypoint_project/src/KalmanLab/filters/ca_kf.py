@@ -42,6 +42,7 @@ FILTER_INFO = {
         "longitudinal_accel_mps2",
         "lateral_accel_mps2",
         "covariance_diagonal",
+        "position_covariance_2x2",
         "raw_state_vector",
     ),
     "safe_for_autonomous_control": True,
@@ -445,11 +446,16 @@ class Filter:
     def get_diagnostics(self) -> dict[str, object]:
         snapshot = self._filter.snapshot()
         covariance = self._filter.covariance
+        position_covariance_2x2 = [
+            [float(covariance[0, 0]), float(covariance[0, 1])],
+            [float(covariance[1, 0]), float(covariance[1, 1])],
+        ]
         return {
             "filter_id": FILTER_INFO["id"],
             "initialized": self.initialized,
             "state_vector": [float(value) for value in self._filter.state_vector.reshape(-1)],
             "covariance_diagonal": [float(value) for value in np.diag(covariance)],
+            "position_covariance_2x2": position_covariance_2x2,
             "last_update_type": self._filter.last_update_type,
             "innovation": self._filter.last_innovation,
             "nis": self._filter.last_nis,
@@ -539,6 +545,10 @@ class Filter:
         lateral_accel = -math.sin(yaw_rad) * snapshot.ax + math.cos(yaw_rad) * snapshot.ay
         state_vector = self._filter.state_vector.reshape(-1)
         covariance = self._filter.covariance
+        position_covariance_2x2 = (
+            (float(covariance[0, 0]), float(covariance[0, 1])),
+            (float(covariance[1, 0]), float(covariance[1, 1])),
+        )
         self._latest_state = VehicleState(
             x=snapshot.px,
             y=snapshot.py,
@@ -552,6 +562,7 @@ class Filter:
             longitudinal_accel_mps2=longitudinal_accel,
             lateral_accel_mps2=lateral_accel,
             covariance_diagonal=tuple(float(value) for value in np.diag(covariance)),
+            position_covariance_2x2=position_covariance_2x2,
             source_filter_id=FILTER_INFO["id"],
             model_type=FILTER_INFO["model_type"],
             raw_state_vector=tuple(float(value) for value in state_vector),

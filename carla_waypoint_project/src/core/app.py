@@ -947,6 +947,11 @@ class SimulationApp:
         other_map_count = store.other_map_route_count() if store is not None else 0
         endpoints_ready = self._map_selector is not None and self._map_selector.endpoints is not None
         route = self.route_planner.get_route() if self.route_planner is not None else []
+        position_nees = metrics.get("mean_position_nees")
+        position_nees_label = "Position NEES"
+        if position_nees is None:
+            position_nees = metrics.get("mean_position_nees_diagonal_approx")
+            position_nees_label = "Position NEES approx"
         lines = [
             "Route:",
             f"Active map: {self._active_map_display_name()}",
@@ -2531,8 +2536,9 @@ class SimulationApp:
             f"Raw GNSS RMSE: {self._format_optional_metric(metrics.get('raw_gnss_rmse_m'), 'm')}",
             f"Filtered RMSE: {self._format_optional_metric(metrics.get('filtered_rmse_m'), 'm')}",
             f"Improvement: {self._format_optional_metric(improvement, '%')}",
-            f"Mean NIS: {self._format_optional_metric(metrics.get('mean_nis'), '')}",
-            f"Mean NEES: {self._format_optional_metric(metrics.get('mean_nees'), '')}",
+            f"Legacy mixed NIS: {self._format_optional_metric(metrics.get('legacy_mean_nis_mixed') or metrics.get('mean_nis'), '')}",
+            f"{position_nees_label}: {self._format_optional_metric(position_nees, '')}",
+            f"Legacy NEES: {self._format_optional_metric(metrics.get('mean_nees'), '')}",
             f"P95 position error: {self._format_optional_metric(metrics.get('filtered_p95_error_m'), 'm')}",
             f"Max position error: {self._format_optional_metric(metrics.get('filtered_max_error_m'), 'm')}",
             f"Innovation norm: {self._format_optional_metric(metrics.get('innovation_mean'), '')}",

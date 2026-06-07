@@ -6,6 +6,11 @@ import math
 from typing import Iterable, Optional
 
 from config.settings import BENCHMARK
+from src.evaluation.consistency_metrics import (
+    position_nees,
+    summarize_nis_by_type,
+    summarize_position_nees,
+)
 
 
 def compute_localization_metrics(
@@ -70,8 +75,18 @@ def compute_localization_metrics(
         "velocity_rmse_mps": eval_metrics["eval_velocity_rmse_mps"],
         "mean_nis": eval_metrics["eval_mean_nis"],
         "mean_nees": eval_metrics["eval_mean_nees"],
+        "legacy_mean_nis_mixed": eval_metrics["eval_mean_nis"],
+        "legacy_mean_nis_mixed_note": "Legacy mixed scalar NIS; prefer nis_by_type_summary.",
+        "nis_by_type_summary": eval_metrics["eval_nis_by_type_summary"],
+        "position_nees_summary": eval_metrics["eval_position_nees_summary"],
+        "position_nees_diagonal_approx_summary": eval_metrics["eval_position_nees_diagonal_approx_summary"],
+        "position_nees_source": eval_metrics["eval_position_nees_source"],
+        "mean_position_nees": eval_metrics["eval_mean_position_nees"],
+        "mean_position_nees_diagonal_approx": eval_metrics["eval_mean_position_nees_diagonal_approx"],
         "nis_available": bool(eval_metrics["eval_nis_available"]),
         "nees_available": bool(eval_metrics["eval_nees_available"]),
+        "position_nees_available": bool(eval_metrics["eval_position_nees_available"]),
+        "position_nees_diagonal_approx_available": bool(eval_metrics["eval_position_nees_diagonal_approx_available"]),
     }
     return metrics
 
@@ -82,7 +97,8 @@ def _metric_group(rows: list[dict[str, object]], prefix: str) -> dict[str, objec
     speed_errors = _finite_values(row.get("speed_error_mps") for row in rows)
     velocity_errors = _finite_values(row.get("velocity_error_mps") for row in rows)
     nis_values = _finite_values(row.get("nis") for row in rows)
-    nees_values = _finite_values(row.get("nees") for row in rows)
+    nees_summary = summarize_position_nees(rows)
+    nis_by_type = summarize_nis_by_type(rows)
     return {
         f"{prefix}_position_rmse_m": _rmse(position_errors),
         f"{prefix}_position_mae_m": _mean(position_errors),
@@ -94,9 +110,18 @@ def _metric_group(rows: list[dict[str, object]], prefix: str) -> dict[str, objec
         f"{prefix}_speed_rmse_mps": _rmse(speed_errors),
         f"{prefix}_velocity_rmse_mps": _rmse(velocity_errors),
         f"{prefix}_mean_nis": _mean(nis_values) if nis_values else None,
-        f"{prefix}_mean_nees": _mean(nees_values) if nees_values else None,
+        f"{prefix}_mean_nees": nees_summary["mean_nees"],
+        f"{prefix}_nis_by_type_summary": nis_by_type,
+        f"{prefix}_position_nees_summary": nees_summary["position_nees_summary"],
+        f"{prefix}_position_nees_diagonal_approx_summary": nees_summary["position_nees_diagonal_approx_summary"],
+        f"{prefix}_legacy_nees_summary": nees_summary["legacy_nees_summary"],
+        f"{prefix}_position_nees_source": nees_summary["position_nees_source"],
+        f"{prefix}_mean_position_nees": nees_summary["mean_position_nees"],
+        f"{prefix}_mean_position_nees_diagonal_approx": nees_summary["mean_position_nees_diagonal_approx"],
         f"{prefix}_nis_available": bool(nis_values),
-        f"{prefix}_nees_available": bool(nees_values),
+        f"{prefix}_nees_available": bool(nees_summary["nees_available"]),
+        f"{prefix}_position_nees_available": bool(nees_summary["position_nees_available"]),
+        f"{prefix}_position_nees_diagonal_approx_available": bool(nees_summary["position_nees_diagonal_approx_available"]),
     }
 
 
@@ -127,18 +152,15 @@ def nees_xy(
     x_error_m: object,
     y_error_m: object,
     covariance_diagonal: object,
+    position_covariance_2x2: object = None,
 ) -> Optional[float]:
-    x_error = _optional_float(x_error_m)
-    y_error = _optional_float(y_error_m)
-    if x_error is None or y_error is None:
-        return None
-    if not isinstance(covariance_diagonal, (list, tuple)) or len(covariance_diagonal) < 2:
-        return None
-    var_x = _optional_float(covariance_diagonal[0])
-    var_y = _optional_float(covariance_diagonal[1])
-    if var_x is None or var_y is None or var_x <= 1.0e-9 or var_y <= 1.0e-9:
-        return None
-    return x_error * x_error / var_x + y_error * y_error / var_y
+    result = position_nees(
+        x_error_m=x_error_m,
+        y_error_m=y_error_m,
+        position_covariance_2x2=position_covariance_2x2,
+        covariance_diagonal=covariance_diagonal,
+    )
+    return _optional_float(result.get("nees"))
 
 
 def _finite_values(values: Iterable[object]) -> list[float]:

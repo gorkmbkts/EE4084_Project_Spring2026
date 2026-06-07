@@ -40,6 +40,7 @@ FILTER_INFO = {
         "yaw_rate_radps",
         "curvature_1pm",
         "covariance_diagonal",
+        "position_covariance_2x2",
         "raw_state_vector",
     ),
     "safe_for_autonomous_control": True,
@@ -242,6 +243,7 @@ class _CtrvEkfCore:
         self.latest_predicted_state: Optional[list[float]] = None
         self.innovations_by_type: dict[str, list[float]] = {}
         self.nis_by_type: dict[str, float] = {}
+        self.nis_update_counts_by_type: dict[str, int] = {}
 
     @property
     def timestamp(self) -> Optional[float]:
@@ -267,6 +269,7 @@ class _CtrvEkfCore:
         self.latest_predicted_state = None
         self.innovations_by_type.clear()
         self.nis_by_type.clear()
+        self.nis_update_counts_by_type.clear()
 
     def initialize(
         self,
@@ -438,6 +441,7 @@ class _CtrvEkfCore:
         self.last_runtime_warning = None
         self.innovations_by_type[update_type] = innovation_list
         self.nis_by_type[update_type] = nis
+        self.nis_update_counts_by_type[update_type] = self.nis_update_counts_by_type.get(update_type, 0) + 1
 
     def _process_noise(self, yaw: float, dt: float) -> np.ndarray:
         cos_yaw = math.cos(yaw)
@@ -630,6 +634,10 @@ class Filter:
     def get_diagnostics(self) -> dict[str, object]:
         snapshot = self._filter.snapshot()
         covariance = self._filter.covariance
+        position_covariance_2x2 = [
+            [float(covariance[0, 0]), float(covariance[0, 1])],
+            [float(covariance[1, 0]), float(covariance[1, 1])],
+        ]
         state_vector = [float(value) for value in self._filter.state_vector.reshape(-1)]
         yaw_rate = snapshot.yaw_rate_radps if snapshot is not None else None
         speed = snapshot.speed if snapshot is not None else None
@@ -644,6 +652,7 @@ class Filter:
             "safe_for_autonomous_control": bool(FILTER_INFO["safe_for_autonomous_control"]),
             "state_vector": state_vector,
             "covariance_diagonal": [float(value) for value in np.diag(covariance)],
+            "position_covariance_2x2": position_covariance_2x2,
             "yaw_deg": normalize_angle_deg(math.degrees(snapshot.yaw_rad)) if snapshot is not None else None,
             "speed_mps": speed,
             "yaw_rate_radps": yaw_rate,
@@ -662,6 +671,12 @@ class Filter:
             "innovations_by_type": dict(innovations),
             "nis": self._filter.last_nis,
             "nis_by_type": dict(self._filter.nis_by_type),
+            "nis_update_counts_by_type": dict(self._filter.nis_update_counts_by_type),
+            "nis_expected_dimensions_by_type": {
+                "gnss_position": 2,
+                "imu_yaw": 1,
+                "imu_yaw_rate": 1,
+            },
             "last_update_type": self._filter.last_update_type,
             "latest_predicted_state": self._filter.latest_predicted_state,
             "latest_gnss_local": self._local_gnss_dict(self._latest_gnss_local),
@@ -758,6 +773,10 @@ class Filter:
         curvature = self._curvature(snapshot.yaw_rate_radps, speed)
         state_vector = self._filter.state_vector.reshape(-1)
         covariance = self._filter.covariance
+        position_covariance_2x2 = (
+            (float(covariance[0, 0]), float(covariance[0, 1])),
+            (float(covariance[1, 0]), float(covariance[1, 1])),
+        )
         self._latest_state = VehicleState(
             x=float(snapshot.px),
             y=float(snapshot.py),
@@ -770,6 +789,7 @@ class Filter:
             yaw_rate_radps=float(snapshot.yaw_rate_radps),
             curvature_1pm=curvature,
             covariance_diagonal=tuple(float(value) for value in np.diag(covariance)),
+            position_covariance_2x2=position_covariance_2x2,
             source_filter_id=FILTER_INFO["id"],
             model_type=FILTER_INFO["model_type"],
             raw_state_vector=tuple(float(value) for value in state_vector),

@@ -38,7 +38,8 @@ def generate_benchmark_plots(benchmark_folder: Path) -> list[Path]:
         _plot_speed_comparison(plots_dir / "ground_truth_vs_estimated_speed.png", metadata, samples),
         _plot_yaw_comparison(plots_dir / "ground_truth_vs_estimated_yaw.png", metadata, samples),
         _plot_metric_over_time(plots_dir / "nis_over_time.png", metadata, samples, "nis", "NIS"),
-        _plot_metric_over_time(plots_dir / "nees_over_time.png", metadata, samples, "nees", "NEES"),
+        _plot_position_nees_over_time(plots_dir / "nees_over_time.png", metadata, samples),
+        _plot_metric_over_time(plots_dir / "legacy_nees_over_time.png", metadata, samples, "nees", "Legacy NEES"),
         _plot_sigma_bounds(plots_dir / "estimation_error_2sigma_bounds.png", metadata, samples),
         _plot_segment_rmse(plots_dir / "segment_rmse_bar_chart.png", metadata, summary),
         _plot_curvature_vs_error(plots_dir / "curvature_severity_vs_position_error.png", metadata, samples),
@@ -59,7 +60,14 @@ def generate_aggregate_benchmark_plots(run_folder: Path) -> list[Path]:
         _plot_aggregate_bar(plots_dir / "position_rmse_per_route.png", rows, "filtered_rmse_m", "Position RMSE (m)"),
         _plot_aggregate_raw_vs_filtered(plots_dir / "raw_gnss_rmse_vs_filtered_rmse.png", rows),
         _plot_aggregate_bar(plots_dir / "improvement_percentage_per_route.png", rows, "improvement_percent", "Improvement (%)"),
-        _plot_aggregate_dual_metric(plots_dir / "mean_nees_nis_per_route.png", rows, "mean_nees", "mean_nis", "Mean NEES", "Mean NIS"),
+        _plot_aggregate_dual_metric(
+            plots_dir / "mean_nees_nis_per_route.png",
+            rows,
+            "mean_position_nees",
+            "legacy_mean_nis_mixed",
+            "Position NEES",
+            "Legacy Mixed NIS",
+        ),
         _plot_aggregate_segments(plots_dir / "segment_rmse_summary.png", run_folder),
     ]
     return outputs
@@ -168,6 +176,18 @@ def _plot_metric_over_time(
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
     return output_path
+
+
+def _plot_position_nees_over_time(output_path: Path, metadata: dict[str, object], samples: list[dict[str, object]]) -> Path:
+    if _has_metric_values(samples, "position_nees"):
+        return _plot_metric_over_time(output_path, metadata, samples, "position_nees", "Position NEES (full 2x2)")
+    if _has_metric_values(samples, "position_nees_diagonal_approx"):
+        return _plot_metric_over_time(output_path, metadata, samples, "position_nees_diagonal_approx", "Position NEES (diagonal approx)")
+    return _plot_metric_over_time(output_path, metadata, samples, "nees", "Legacy NEES")
+
+
+def _has_metric_values(samples: list[dict[str, object]], field: str) -> bool:
+    return any(_to_float(sample.get(field)) is not None for sample in samples)
 
 
 def _plot_sigma_bounds(output_path: Path, metadata: dict[str, object], samples: list[dict[str, object]]) -> Path:
@@ -477,9 +497,16 @@ def _summary_text(
         )
     if active_control_used is None:
         active_control_used = active_filter.get("active_control_input_used")
-    driving_mean_nis = _primary(summary, "driving_mean_nis", "mean_nis")
-    driving_mean_nees = _primary(summary, "driving_mean_nees", "mean_nees")
-    consistency_warning = _consistency_warning(driving_mean_nis, driving_mean_nees)
+    driving_legacy_nis = _first(summary, "driving_legacy_mean_nis_mixed", "legacy_mean_nis_mixed", "driving_mean_nis", "mean_nis")
+    driving_position_nees = _first(summary, "driving_mean_position_nees", "mean_position_nees")
+    driving_position_nees_label = "Driving Position NEES"
+    if driving_position_nees is None:
+        driving_position_nees = _first(summary, "driving_mean_position_nees_diagonal_approx", "mean_position_nees_diagonal_approx")
+        driving_position_nees_label = "Driving Position NEES (diag approx)"
+    driving_legacy_nees = _primary(summary, "driving_mean_nees", "mean_nees")
+    position_nees_source = _first(summary, "driving_position_nees_source", "position_nees_source") or "unavailable"
+    nis_by_type_line = _nis_by_type_line(_first(summary, "driving_nis_by_type_summary", "nis_by_type_summary"))
+    consistency_warning = _consistency_warning(driving_legacy_nis, driving_position_nees)
 
     lines = [
         "KalmanLab Benchmark Summary",
@@ -518,10 +545,11 @@ def _summary_text(
         f"Max CTE: {_fmt(_primary(summary, 'driving_max_cross_track_error_m', 'max_cross_track_error_m'))} m",
         "",
         "Consistency (Driving Phase)",
-        f"Driving Mean NIS: {_fmt(driving_mean_nis)}",
-        f"Driving Mean NEES: {_fmt(driving_mean_nees)}",
-        f"Overall Mean NIS: {_fmt(summary.get('mean_nis'))}",
-        f"Overall Mean NEES: {_fmt(summary.get('mean_nees'))}",
+        f"NIS by type: {nis_by_type_line}",
+        f"Legacy mixed NIS: {_fmt(driving_legacy_nis)}",
+        f"{driving_position_nees_label}: {_fmt(driving_position_nees)}",
+        f"Position NEES source: {position_nees_source}",
+        f"Legacy Mean NEES: {_fmt(driving_legacy_nees)}",
         "",
         "Completion",
         f"Success: {summary.get('route_completion_success')}",
@@ -954,6 +982,25 @@ def _first(data: dict[str, object], *keys: str) -> object:
         if value is not None:
             return value
     return None
+
+
+def _nis_by_type_line(value: object) -> str:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = {}
+        value = parsed
+    if not isinstance(value, dict) or not value:
+        return "n/a"
+    parts = []
+    for update_type, stats in list(sorted(value.items()))[:3]:
+        if not isinstance(stats, dict):
+            continue
+        mean_value = _fmt(stats.get("mean"))
+        count = stats.get("sample_count")
+        parts.append(f"{update_type} mean {mean_value} n={count}")
+    return "; ".join(parts) if parts else "n/a"
 
 
 def _tracking_mode_label(

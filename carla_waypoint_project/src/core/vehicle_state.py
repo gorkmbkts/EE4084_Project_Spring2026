@@ -30,6 +30,7 @@ class VehicleState:
     yaw_rate_radps: Optional[float] = None
     curvature_1pm: Optional[float] = None
     covariance_diagonal: Optional[tuple[float, ...]] = None
+    position_covariance_2x2: Optional[tuple[tuple[float, float], tuple[float, float]]] = None
     confidence: Optional[float] = None
     source_filter_id: str = ""
     model_type: str = ""
@@ -53,6 +54,7 @@ class VehicleState:
         ):
             object.__setattr__(self, name, finite_or_none(getattr(self, name)))
         object.__setattr__(self, "covariance_diagonal", finite_tuple_or_none(self.covariance_diagonal))
+        object.__setattr__(self, "position_covariance_2x2", finite_2x2_or_none(self.position_covariance_2x2))
         object.__setattr__(self, "raw_state_vector", finite_tuple_or_none(self.raw_state_vector))
         object.__setattr__(self, "source_filter_id", str(self.source_filter_id or ""))
         object.__setattr__(self, "model_type", str(self.model_type or ""))
@@ -96,6 +98,8 @@ class VehicleState:
             fields.append("acceleration")
         if self.covariance_diagonal is not None:
             fields.append("covariance")
+        if self.position_covariance_2x2 is not None:
+            fields.append("position_covariance_2x2")
         return tuple(fields)
 
     def distance_xy_to(self, location: object) -> float:
@@ -121,3 +125,18 @@ def finite_tuple_or_none(value: object) -> Optional[tuple[float, ...]]:
             return None
         result.append(number)
     return tuple(result)
+
+
+def finite_2x2_or_none(value: object) -> Optional[tuple[tuple[float, float], tuple[float, float]]]:
+    if not isinstance(value, (tuple, list)) or len(value) < 2:
+        return None
+    rows: list[tuple[float, float]] = []
+    for row in value[:2]:
+        if not isinstance(row, (tuple, list)) or len(row) < 2:
+            return None
+        first = finite_or_none(row[0])
+        second = finite_or_none(row[1])
+        if first is None or second is None:
+            return None
+        rows.append((first, second))
+    return (rows[0], rows[1])

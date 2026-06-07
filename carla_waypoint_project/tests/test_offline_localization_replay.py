@@ -10,6 +10,7 @@ import sys
 from types import SimpleNamespace
 
 import pygame
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -32,6 +33,7 @@ from src.evaluation.offline_replay_runner import (  # noqa: E402
 )
 import src.evaluation.offline_replay_runner as offline_replay_runner_module  # noqa: E402
 from src.evaluation.filter_auto_tuner import AutoTuneRequest, FilterAutoTuner  # noqa: E402
+import src.evaluation.filter_auto_tuner as filter_auto_tuner_module  # noqa: E402
 from src.evaluation.sensor_log_recorder import SENSOR_LOG_FIELDNAMES  # noqa: E402
 from src.evaluation.test_route_store import TestRouteStore  # noqa: E402
 from src.evaluation.benchmark_config import (  # noqa: E402
@@ -40,10 +42,30 @@ from src.evaluation.benchmark_config import (  # noqa: E402
     ParameterSpec,
     SENSOR_NOISE_PRESETS,
     sensor_noise_config_from_values,
+    validate_benchmark_config,
+)
+from src.evaluation.closed_loop_auto_tune import PendingClosedLoopAutoTuneSession  # noqa: E402
+from src.evaluation.consistency_metrics import position_nees, summarize_nis_by_type  # noqa: E402
+from src.evaluation.sensor_noise_tune_mapper import (  # noqa: E402
+    SensorNoiseTuneMapper,
+    noise_signature,
+    process_only_auto_tune_profile,
+)
+from src.evaluation.tune_config_schema import (  # noqa: E402
+    BENCHMARK_MODE_CLOSED_LOOP,
+    BENCHMARK_MODE_OFFLINE,
+    SCHEMA_VERSION,
+    TRACKING_ACTIVE,
+    TRACKING_PASSIVE,
+    TUNE_SCOPE_CLOSED_LOOP_VALIDATED,
+    TUNE_SCOPE_OFFLINE,
+    TuneCompatibility,
+    closed_loop_tune_context,
+    offline_tune_context,
 )
 from src.visualization.ui.parameter_controls import ParameterEditor  # noqa: E402
 from src.KalmanLab.registry import discover_filters  # noqa: E402
-from src.KalmanLab.filter_base import TRACKING_MODE_PASSIVE  # noqa: E402
+from src.KalmanLab.filter_base import TRACKING_MODE_ACTIVE, TRACKING_MODE_PASSIVE  # noqa: E402
 import src.visualization.startup_map_selector as startup_map_selector_module  # noqa: E402
 from src.visualization.startup_map_selector import (  # noqa: E402
     CLOSED_LOOP_SUBTABS,
@@ -386,6 +408,80 @@ def test_registry_reads_optional_auto_tune_profile() -> None:
         raise AssertionError("raw_gnss should remain valid but not auto-tuneable")
 
 
+def test_type_aware_nis_and_position_nees_helpers() -> None:
+    nis = summarize_nis_by_type(
+        [
+            {"nis_by_type": {"gnss_position": 2.0, "imu_yaw": 1.0}},
+            {"nis_by_type": json.dumps({"gnss_position": 6.0, "imu_yaw_rate": 4.0})},
+        ]
+    )
+    if nis["gnss_position"]["mean"] != 4.0 or nis["gnss_position"]["sample_count"] != 2:
+        raise AssertionError("GNSS position NIS was not summarized separately")
+    if nis["gnss_position"]["expected_dimension"] != 2:
+        raise AssertionError("GNSS position NIS expected dimension was not reported")
+    if nis["imu_yaw"]["expected_dimension"] != 1 or nis["imu_yaw_rate"]["expected_dimension"] != 1:
+        raise AssertionError("IMU scalar NIS dimensions were not reported")
+
+    full = position_nees(1.0, 2.0, position_covariance_2x2=((4.0, 1.0), (1.0, 9.0)), covariance_diagonal=(4.0, 9.0))
+    expected_full = (9.0 - 4.0 + 16.0) / 35.0
+    if not math.isclose(float(full["position_nees"]), expected_full, rel_tol=1.0e-9):
+        raise AssertionError("full 2x2 position NEES was not computed with covariance cross-term")
+    if full["position_nees_source"] != "full_2x2" or full["position_nees_diagonal_approx"] is not None:
+        raise AssertionError("full covariance NEES source was not labeled correctly")
+
+    approx = position_nees(1.0, 2.0, covariance_diagonal=(4.0, 9.0))
+    if approx["position_nees"] is not None or approx["position_nees_source"] != "diagonal_approx":
+        raise AssertionError("diagonal fallback was not clearly labeled as approximate")
+
+
+def test_localization_metrics_expose_type_aware_nis_and_corrected_nees() -> None:
+    metrics = compute_localization_metrics(
+        [
+            {
+                "valid_for_metrics": True,
+                "position_error_m": 1.0,
+                "nis": 99.0,
+                "nis_by_type": {"gnss_position": 2.0, "imu_yaw": 1.0},
+                "nees": 3.0,
+                "position_nees": 2.5,
+                "position_nees_source": "full_2x2",
+            }
+        ]
+    )
+    if metrics["legacy_mean_nis_mixed"] != 99.0:
+        raise AssertionError("legacy mixed NIS scalar was not preserved")
+    if metrics["nis_by_type_summary"]["gnss_position"]["mean"] != 2.0:
+        raise AssertionError("type-aware NIS summary was not exposed")
+    if metrics["mean_position_nees"] != 2.5 or metrics["position_nees_source"] != "full_2x2":
+        raise AssertionError("corrected position NEES summary was not exposed")
+
+
+def test_sensor_noise_locking_removes_r_keys_from_process_search() -> None:
+    profile = {
+        "enabled": True,
+        "primary": [
+            {"key": "process_jerk_stddev_mps3", "min": 0.1, "max": 5.0},
+            {"key": "gnss_position_stddev_m", "min": 0.4, "max": 6.0},
+            {"key": "imu_accel_stddev_mps2", "min": 0.05, "max": 3.0},
+        ],
+    }
+    process_only = process_only_auto_tune_profile(profile)
+    keys = {item["key"] for item in process_only["primary"]}
+    if keys != {"process_jerk_stddev_mps3"}:
+        raise AssertionError(f"process-only profile still contains measurement-noise keys: {keys}")
+
+    locked = SensorNoiseTuneMapper.locked_values(
+        "ca_kf",
+        {"gnss_position_stddev_m": 5.0, "imu_accel_stddev_mps2": 5.0, "process_jerk_stddev_mps3": 1.2},
+        {"preset_name": "Synthetic", "gnss_position_stddev_m": 1.25, "imu_accel_stddev_mps2": 0.45},
+    )
+    if locked.values.get("gnss_position_stddev_m") != 1.25 or locked.values.get("imu_accel_stddev_mps2") != 0.45:
+        raise AssertionError("sensor-noise tune values were not locked from the selected profile")
+    merged = SensorNoiseTuneMapper.apply_locked_values("ca_kf", {"gnss_position_stddev_m": 5.0}, locked.representative_config)
+    if merged.get("gnss_position_stddev_m") != 1.25:
+        raise AssertionError("locked sensor noise was not applied to the tune dictionary")
+
+
 def test_parameter_editor_mousewheel_uses_mouse_position_without_event_pos() -> None:
     pygame.font.init()
     surface = pygame.Surface((360, 160))
@@ -447,7 +543,7 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
             folder = Path(request.run_folder_override)
             folder.mkdir(parents=True)
             tune = request.filter_tunes["ca_kf"]
-            rmse = float(tune.get("gnss_position_stddev_m", 9.0))
+            rmse = float(tune.get("process_jerk_stddev_mps3", 9.0))
             write_json(
                 folder / "aggregate_summary.json",
                 {
@@ -470,7 +566,10 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
         base_tune={"gnss_position_stddev_m": 1.25, "process_jerk_stddev_mps3": 1.2},
         auto_tune_profile={
             "enabled": True,
-            "primary": [{"key": "gnss_position_stddev_m", "scale": "log", "min": 0.5, "max": 2.0}],
+            "primary": [
+                {"key": "process_jerk_stddev_mps3", "scale": "log", "min": 0.5, "max": 2.0},
+                {"key": "gnss_position_stddev_m", "scale": "log", "min": 0.5, "max": 2.0},
+            ],
             "search": {"default_trials": 2, "strategy": "random_plus_coordinate_refinement"},
             "objective": "rmse_consistency",
         },
@@ -489,12 +588,14 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
             raise AssertionError("auto tuner should tune exactly one filter")
         if "ca_kf" not in call.filter_tunes:
             raise AssertionError("candidate tune was not passed through filter_tunes")
+        if call.filter_tunes["ca_kf"].get("gnss_position_stddev_m") != 1.25:
+            raise AssertionError("auto tuner changed locked GNSS measurement noise")
         if call.replay_context != "auto_tune_trial":
             raise AssertionError("auto tuner did not mark replay context")
         if call.generate_plots:
             raise AssertionError("auto-tune trials should disable replay plots by default")
         path_text = str(call.run_folder_override).replace("\\", "/")
-        if "/offline_localization/auto_tune/ca_kf/" not in path_text or not path_text.rsplit("/", 1)[-1].startswith("t"):
+        if "/offline_localization/auto_tune/offline_passive/ca_kf/" not in path_text or not path_text.rsplit("/", 1)[-1].startswith("t"):
             raise AssertionError(f"auto-tune trial output override used wrong location: {call.run_folder_override}")
         run_id = Path(call.run_folder_override).parent.name
         if not run_id.startswith("a") or len(run_id) > 16:
@@ -507,10 +608,21 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
     config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
     if config.get("filter_id") != "ca_kf" or "best_tune" not in config:
         raise AssertionError("saved best tune config is incomplete")
+    if config.get("schema_version") != SCHEMA_VERSION:
+        raise AssertionError("saved best tune config did not use schema version 2")
+    if config.get("benchmark_mode") != BENCHMARK_MODE_OFFLINE or config.get("tracking_mode") != TRACKING_PASSIVE:
+        raise AssertionError("offline auto tuner did not save an offline passive tune config")
+    if config.get("tune_scope") != TUNE_SCOPE_OFFLINE or not config.get("process_only_tune"):
+        raise AssertionError("offline auto tuner did not mark process-only offline tuning scope")
+    if config.get("locked_sensor_noise_values", {}).get("gnss_position_stddev_m") != 1.25:
+        raise AssertionError("saved config did not record locked GNSS measurement noise")
+    saved_primary_keys = {item.get("key") for item in (config.get("auto_tune_profile") or {}).get("primary", [])}
+    if "gnss_position_stddev_m" in saved_primary_keys:
+        raise AssertionError("schema v2 saved process-only search profile still includes GNSS measurement noise")
     if len(config.get("selected_logs") or []) != 2:
         raise AssertionError("saved best tune config did not preserve selected logs")
     best_output = str((config.get("best_metrics") or {}).get("output_folder") or "").replace("\\", "/")
-    if "/offline_localization/auto_tune/ca_kf/" not in best_output or not best_output.rsplit("/", 1)[-1].startswith("t"):
+    if "/offline_localization/auto_tune/offline_passive/ca_kf/" not in best_output or not best_output.rsplit("/", 1)[-1].startswith("t"):
         raise AssertionError("best tune metadata did not reference auto_tune trial output")
     for key in ("objective_name", "score_formula", "score_notes", "nis_nees_policy", "unavailable_metrics_policy"):
         if not config.get(key):
@@ -523,6 +635,94 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
         raise AssertionError(f"keep_only_best_trial_output should keep exactly one replay output, got {kept_outputs}")
     if str(kept_outputs[0]).replace("\\", "/") != best_output:
         raise AssertionError("retention did not keep the best trial output")
+
+
+def test_filter_auto_tuner_rejects_mixed_noise_signatures_by_default(tmp_path: Path) -> None:
+    output_root = tmp_path / "benchmark_results"
+    logs = []
+    for index, gnss_stddev in enumerate((1.25, 2.5)):
+        route_folder = output_root / "offline_localization" / "recordings" / "run_001" / f"route_{index + 1:03d}"
+        route_folder.mkdir(parents=True)
+        log_path = route_folder / "sensor_log.csv"
+        log_path.write_text("timestamp\n0.0\n", encoding="utf-8")
+        write_json(
+            route_folder / "route_metadata.json",
+            {
+                "route": {"name": f"route_{index + 1}", "map_name": "Town01"},
+                "map_name": "Town01",
+                "sensor_noise_config": {"preset_name": "Synthetic", "gnss_position_stddev_m": gnss_stddev},
+                "vehicle_behavior_config": {"preset_name": "Balanced"},
+                "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+            },
+        )
+        write_json(route_folder / "recording_summary.json", {"route_name": f"route_{index + 1}", "map_name": "Town01"})
+        logs.append(log_path)
+
+    request = AutoTuneRequest(
+        filter_id="ca_kf",
+        sensor_log_paths=tuple(logs),
+        base_tune={"gnss_position_stddev_m": 1.25, "process_jerk_stddev_mps3": 1.2},
+        auto_tune_profile={"enabled": True, "primary": [{"key": "process_jerk_stddev_mps3", "min": 0.5, "max": 2.0}]},
+        max_trials=1,
+        output_root=str(output_root),
+    )
+    with pytest.raises(ValueError, match="mixed sensor noise signatures"):
+        FilterAutoTuner().run(request)
+
+
+def test_filter_auto_tuner_uses_fallback_when_optuna_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output_root = tmp_path / "benchmark_results"
+    route_folder = output_root / "offline_localization" / "recordings" / "run_001" / "route_001"
+    route_folder.mkdir(parents=True)
+    log_path = route_folder / "sensor_log.csv"
+    log_path.write_text("timestamp\n0.0\n", encoding="utf-8")
+    write_json(
+        route_folder / "route_metadata.json",
+        {
+            "route": {"name": "route_1", "map_name": "Town01"},
+            "map_name": "Town01",
+            "sensor_noise_config": {"preset_name": "Synthetic", "gnss_position_stddev_m": 1.25},
+            "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+        },
+    )
+    write_json(route_folder / "recording_summary.json", {"route_name": "route_1", "map_name": "Town01", "sample_count": 1})
+
+    class FakeRunner:
+        def run(self, request: OfflineReplayRequest) -> SimpleNamespace:
+            folder = Path(request.run_folder_override)
+            folder.mkdir(parents=True)
+            write_json(
+                folder / "aggregate_summary.json",
+                {
+                    "route_count": len(request.sensor_log_paths),
+                    "aggregate_rows": [
+                        {
+                            "filter_id": "ca_kf",
+                            "eval_position_rmse_m": float(request.filter_tunes["ca_kf"].get("process_jerk_stddev_mps3", 1.0)),
+                            "yaw_rmse_deg": 0.0,
+                            "divergence_event_count": 0,
+                        }
+                    ],
+                },
+            )
+            return SimpleNamespace(output_folder=folder, failures=())
+
+    monkeypatch.setattr(filter_auto_tuner_module, "optuna", None)
+    result = FilterAutoTuner(runner_factory=FakeRunner).run(
+        AutoTuneRequest(
+            filter_id="ca_kf",
+            sensor_log_paths=(log_path,),
+            base_tune={"gnss_position_stddev_m": 1.25, "process_jerk_stddev_mps3": 1.2},
+            auto_tune_profile={"enabled": True, "primary": [{"key": "process_jerk_stddev_mps3", "min": 0.5, "max": 2.0}]},
+            max_trials=1,
+            output_root=str(output_root),
+        )
+    )
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    if config.get("candidate_generation_strategy") != "random_plus_coordinate_refinement":
+        raise AssertionError("auto tuner did not record fallback search strategy when Optuna was unavailable")
+    if config.get("optuna_available") is not False:
+        raise AssertionError("saved config did not record Optuna availability correctly")
 
 
 def test_saved_tune_apply_updates_only_selected_filter() -> None:
@@ -552,11 +752,27 @@ def test_closed_loop_saved_tune_config_apply_updates_selected_filter() -> None:
     selector._filter_tune_editor = None
     selector._closed_loop_saved_tune_status = ""
     selector._closed_loop_filter_saved_tune_mode = True
+    selector._tracking_mode = TRACKING_MODE_PASSIVE
+    selector._sensor_editor = None
+    selector._sensor_preset = "Medium Noise"
+    selector._behavior_editor = None
+    selector._behavior_preset = "Balanced"
+    selector._selected_recorded_log_index = None
+    selector._recorded_logs = []
     config_path = Path("synthetic_auto_tune") / "best_tune.json"
+    sensor_config = sensor_noise_config_from_values(SENSOR_NOISE_PRESETS["Medium Noise"], preset_name="Medium Noise")
     original_list = startup_map_selector_module.list_saved_tune_configs
     original_load = startup_map_selector_module.load_saved_tune_config
-    startup_map_selector_module.list_saved_tune_configs = lambda filter_id: [{"path": str(config_path)}] if filter_id == "ca_kf" else []
-    startup_map_selector_module.load_saved_tune_config = lambda path: {"best_tune": {"gnss_position_stddev_m": 4.4}}
+    startup_map_selector_module.list_saved_tune_configs = lambda filter_id, **kwargs: [{"path": str(config_path)}] if filter_id == "ca_kf" else []
+    startup_map_selector_module.load_saved_tune_config = lambda path: {
+        "schema_version": SCHEMA_VERSION,
+        "filter_id": "ca_kf",
+        "benchmark_mode": BENCHMARK_MODE_CLOSED_LOOP,
+        "tracking_mode": TRACKING_PASSIVE,
+        "tune_scope": TUNE_SCOPE_CLOSED_LOOP_VALIDATED,
+        "noise_signature": noise_signature(sensor_config),
+        "best_tune": {"gnss_position_stddev_m": 4.4},
+    }
     try:
         selector._apply_saved_tune_config("ca_kf", 0, context="closed_loop")
     finally:
@@ -570,6 +786,145 @@ def test_closed_loop_saved_tune_config_apply_updates_selected_filter() -> None:
         raise AssertionError("closed-loop saved tune browser did not close after applying")
     if "ca_kf" not in selector._closed_loop_saved_tune_status:
         raise AssertionError("closed-loop saved tune apply status did not name target filter")
+
+
+def test_saved_tune_apply_rejects_incompatible_tracking_mode() -> None:
+    selector = StartupMapSelector.__new__(StartupMapSelector)
+    selector._setup_filter_records = [record for record in discover_filters() if record.valid]
+    selector._selected_filter_tunes = {"ca_kf": {"gnss_position_stddev_m": 1.0}}
+    selector._filter_tune_editor_filter_id = ""
+    selector._filter_tune_editor = None
+    selector._closed_loop_saved_tune_status = ""
+    selector._closed_loop_filter_saved_tune_mode = True
+    selector._tracking_mode = TRACKING_MODE_ACTIVE
+    selector._sensor_editor = None
+    selector._sensor_preset = "Medium Noise"
+    selector._behavior_editor = None
+    selector._behavior_preset = "Balanced"
+    selector._selected_recorded_log_index = None
+    selector._recorded_logs = []
+    sensor_config = sensor_noise_config_from_values(SENSOR_NOISE_PRESETS["Medium Noise"], preset_name="Medium Noise")
+    config_path = Path("synthetic_auto_tune") / "best_tune.json"
+    original_list = startup_map_selector_module.list_saved_tune_configs
+    original_load = startup_map_selector_module.load_saved_tune_config
+    startup_map_selector_module.list_saved_tune_configs = lambda filter_id, **kwargs: [{"path": str(config_path)}] if filter_id == "ca_kf" else []
+    startup_map_selector_module.load_saved_tune_config = lambda path: {
+        "schema_version": SCHEMA_VERSION,
+        "filter_id": "ca_kf",
+        "benchmark_mode": BENCHMARK_MODE_CLOSED_LOOP,
+        "tracking_mode": TRACKING_PASSIVE,
+        "tune_scope": TUNE_SCOPE_CLOSED_LOOP_VALIDATED,
+        "noise_signature": noise_signature(sensor_config),
+        "best_tune": {"gnss_position_stddev_m": 4.4},
+    }
+    try:
+        selector._apply_saved_tune_config("ca_kf", 0, context="closed_loop")
+    finally:
+        startup_map_selector_module.list_saved_tune_configs = original_list
+        startup_map_selector_module.load_saved_tune_config = original_load
+    if selector._selected_filter_tunes["ca_kf"].get("gnss_position_stddev_m") != 1.0:
+        raise AssertionError("incompatible passive tune was applied in active tracking mode")
+    if "tracking_mode" not in selector._closed_loop_saved_tune_status:
+        raise AssertionError("incompatible apply rejection did not explain tracking mismatch")
+
+
+def test_saved_tune_browse_filters_mode_tracking_noise_and_legacy(tmp_path: Path) -> None:
+    output_root = tmp_path / "benchmark_results"
+    sensor_config = {"preset_name": "Synthetic", "gnss_position_stddev_m": 1.25}
+    other_sensor_config = {"preset_name": "Synthetic", "gnss_position_stddev_m": 2.5}
+    signature = noise_signature(sensor_config)
+    other_signature = noise_signature(other_sensor_config)
+    offline_dir = output_root / "offline_localization" / "auto_tune" / "offline_passive" / "ca_kf"
+    closed_passive_dir = output_root / "closed_loop" / "auto_tune" / "passive" / "ca_kf"
+    closed_active_dir = output_root / "closed_loop" / "auto_tune" / "active" / "ca_kf"
+    offline_dir.mkdir(parents=True)
+    closed_passive_dir.mkdir(parents=True)
+    closed_active_dir.mkdir(parents=True)
+
+    def write_config(directory: Path, name: str, mode: str, tracking: str, scope: str, noise_sig: str) -> Path:
+        config_path = directory / f"{name}.json"
+        write_json(
+            config_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "filter_id": "ca_kf",
+                "benchmark_mode": mode,
+                "tracking_mode": tracking,
+                "tune_scope": scope,
+                "noise_signature": noise_sig,
+                "best_tune": {"process_jerk_stddev_mps3": 1.2},
+            },
+        )
+        return config_path
+
+    offline_path = write_config(offline_dir, "offline", BENCHMARK_MODE_OFFLINE, TRACKING_PASSIVE, TUNE_SCOPE_OFFLINE, signature)
+    offline_other_noise_path = write_config(offline_dir, "offline_other_noise", BENCHMARK_MODE_OFFLINE, TRACKING_PASSIVE, TUNE_SCOPE_OFFLINE, other_signature)
+    legacy_path = offline_dir / "legacy.json"
+    write_json(legacy_path, {"filter_id": "ca_kf", "best_tune": {"process_jerk_stddev_mps3": 9.9}})
+    closed_passive_path = write_config(
+        closed_passive_dir,
+        "closed_passive",
+        BENCHMARK_MODE_CLOSED_LOOP,
+        TRACKING_PASSIVE,
+        TUNE_SCOPE_CLOSED_LOOP_VALIDATED,
+        signature,
+    )
+    closed_active_path = write_config(
+        closed_active_dir,
+        "closed_active",
+        BENCHMARK_MODE_CLOSED_LOOP,
+        TRACKING_ACTIVE,
+        TUNE_SCOPE_CLOSED_LOOP_VALIDATED,
+        signature,
+    )
+    write_json(
+        offline_dir / "saved_tune_configs.json",
+        {
+            "configs": [
+                {"path": str(offline_path), "score": 1.0},
+                {"path": str(offline_other_noise_path), "score": 2.0},
+                {"path": str(legacy_path), "score": 3.0},
+            ]
+        },
+    )
+    write_json(closed_passive_dir / "saved_tune_configs.json", {"configs": [{"path": str(closed_passive_path), "score": 4.0}]})
+    write_json(closed_active_dir / "saved_tune_configs.json", {"configs": [{"path": str(closed_active_path), "score": 5.0}]})
+
+    offline_items = filter_auto_tuner_module.list_saved_tune_configs(
+        "ca_kf",
+        output_root=str(output_root),
+        context=offline_tune_context("ca_kf", sensor_noise_config=sensor_config),
+    )
+    if [Path(str(item["path"])).name for item in offline_items] != ["offline.json"]:
+        raise AssertionError(f"offline browse returned incompatible or legacy configs: {offline_items}")
+
+    passive_items = filter_auto_tuner_module.list_saved_tune_configs(
+        "ca_kf",
+        output_root=str(output_root),
+        context=closed_loop_tune_context("ca_kf", TRACKING_PASSIVE, sensor_noise_config=sensor_config),
+    )
+    if [Path(str(item["path"])).name for item in passive_items] != ["closed_passive.json"]:
+        raise AssertionError("closed-loop passive browse did not isolate passive configs")
+
+    active_items = filter_auto_tuner_module.list_saved_tune_configs(
+        "ca_kf",
+        output_root=str(output_root),
+        context=closed_loop_tune_context("ca_kf", TRACKING_ACTIVE, sensor_noise_config=sensor_config),
+    )
+    if [Path(str(item["path"])).name for item in active_items] != ["closed_active.json"]:
+        raise AssertionError("closed-loop active browse did not isolate active configs")
+
+    incompatible = {
+        "schema_version": SCHEMA_VERSION,
+        "filter_id": "ca_kf",
+        "benchmark_mode": BENCHMARK_MODE_CLOSED_LOOP,
+        "tracking_mode": TRACKING_PASSIVE,
+        "tune_scope": TUNE_SCOPE_CLOSED_LOOP_VALIDATED,
+        "noise_signature": signature,
+    }
+    result = TuneCompatibility.check(incompatible, closed_loop_tune_context("ca_kf", TRACKING_ACTIVE, sensor_noise_config=sensor_config))
+    if result.compatible:
+        raise AssertionError("compatibility helper allowed passive config in active context")
 
 
 def test_closed_loop_apply_recommended_still_updates_tune() -> None:
@@ -589,6 +944,69 @@ def test_closed_loop_apply_recommended_still_updates_tune() -> None:
         raise AssertionError("closed-loop Apply Recommended did not mark recommendation as applied")
     if selector._selected_filter_tunes["ca_kf"].get("gnss_position_stddev_m") == 9.0:
         raise AssertionError("closed-loop Apply Recommended did not update CA-KF tune values")
+
+
+def test_closed_loop_benchmark_config_rejects_multiple_routes() -> None:
+    route_a = _short_saved_route()
+    config = BenchmarkConfig(
+        selected_filter="ca_kf",
+        selected_routes=(route_a, route_a),
+        sensor_noise_config=sensor_noise_config_from_values(SENSOR_NOISE_PRESETS["Medium Noise"], preset_name="Medium Noise"),
+        vehicle_behavior_config=BEHAVIOR_PRESETS["Balanced"],
+        selected_filter_tune={"process_jerk_stddev_mps3": 1.2},
+        tracking_mode=TRACKING_MODE_PASSIVE,
+    )
+    errors = validate_benchmark_config(config, valid_filter_ids=("ca_kf",), available_maps=(route_a.map_name or "",))
+    if not any("exactly one" in error for error in errors):
+        raise AssertionError(f"multiple closed-loop routes were not rejected: {errors}")
+
+
+def test_closed_loop_route_selection_stores_single_route() -> None:
+    selector = StartupMapSelector.__new__(StartupMapSelector)
+    selector._auto_tune_modal_open = False
+    selector._closed_loop_subtab_rects = {}
+    selector._active_closed_loop_subtab = "Routes"
+    selector._closed_loop_filter_saved_tune_mode = False
+    selector._setup_filter_buttons = {}
+    selector._tracking_button_rects = {}
+    selector._filter_tune_editor = None
+    selector._sensor_editor = None
+    selector._behavior_editor = None
+    selector._select_all_routes_rect = pygame.Rect(0, 0, 1, 1)
+    selector._clear_routes_rect = pygame.Rect(0, 0, 1, 1)
+    selector._route_rects = {1: pygame.Rect(10, 10, 80, 20), 2: pygame.Rect(10, 40, 80, 20)}
+    selector._selected_route_indices = {1, 2}
+    selector._start_benchmark_rect = pygame.Rect(500, 500, 1, 1)
+    event = pygame.event.Event(pygame.MOUSEBUTTONDOWN, {"button": 1, "pos": (20, 45)})
+    selector._handle_closed_loop_event(event, client=None)
+    if selector._selected_route_indices != {2}:
+        raise AssertionError("closed-loop route click did not reduce selection to exactly one route")
+
+
+def test_pending_closed_loop_auto_tune_session_saves_explicit_handoff(tmp_path: Path) -> None:
+    handoff_path = tmp_path / "closed_loop" / "auto_tune" / "active" / "ca_kf" / "run_001" / "pending_session.json"
+    session = PendingClosedLoopAutoTuneSession(
+        selected_filter="ca_kf",
+        tracking_mode=TRACKING_ACTIVE,
+        offline_log_paths=("log_a.csv", "log_b.csv"),
+        noise_signature="noise_sig",
+        validation_route_name="route_1",
+        validation_route_map="Town01",
+        validation_route_id="route_1@Town01",
+        sensor_config={"preset_name": "Synthetic"},
+        vehicle_behavior_config={"preset_name": "Balanced"},
+        actuator_realism_config={"enabled": True},
+        trial_count=20,
+        finalist_count=3,
+        strategy="optuna_tpe",
+        output_root=str(tmp_path),
+    )
+    session.save(handoff_path)
+    payload = json.loads(handoff_path.read_text(encoding="utf-8"))
+    if payload.get("tracking_mode") != TRACKING_ACTIVE or payload.get("finalist_count") != 3:
+        raise AssertionError("pending closed-loop auto tune handoff did not serialize required fields")
+    if len(payload.get("offline_log_paths") or []) != 2:
+        raise AssertionError("pending closed-loop auto tune handoff did not preserve offline log paths")
 
 
 def test_auto_tune_modal_requires_primary_profile() -> None:

@@ -399,6 +399,8 @@ def validate_benchmark_config(
         errors.append(f"Filter is not benchmark-selectable: {config.selected_filter}.")
     if not config.selected_routes:
         errors.append("Select at least one saved test route.")
+    elif len(config.selected_routes) != 1:
+        errors.append("Closed-loop benchmark requires exactly one selected route.")
     if _normalize_tracking_mode(config.tracking_mode) != config.tracking_mode:
         errors.append(f"Unsupported tracking mode: {config.tracking_mode}.")
 

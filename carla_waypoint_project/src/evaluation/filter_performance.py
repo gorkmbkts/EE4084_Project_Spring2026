@@ -14,6 +14,11 @@ from config.settings import BENCHMARK
 from src.core.vehicle_state import VehicleState
 from src.control.driving_behavior import SpeedPlan
 from src.control.waypoint_tracker import TrackingStatus
+from src.evaluation.consistency_metrics import (
+    position_nees,
+    summarize_nis_by_type,
+    summarize_position_nees,
+)
 from src.localization.gnss_projection import GnssDiagnostics
 
 
@@ -69,7 +74,12 @@ class FilterPerformanceSample:
     curvature_rad_per_m: Optional[float]
     curvature_mode: Optional[str]
     nis: Optional[float]
+    nis_by_type: dict[str, float]
+    nis_expected_dimensions_by_type: dict[str, int]
     nees: Optional[float]
+    position_nees: Optional[float]
+    position_nees_diagonal_approx: Optional[float]
+    position_nees_source: str
     innovation_norm: Optional[float]
     covariance_x_std_m: Optional[float]
     covariance_y_std_m: Optional[float]
@@ -102,6 +112,7 @@ class FilterPerformanceLogger:
         self._timeout = False
         self._abort_reason: Optional[str] = None
         self._last_export_paths: Optional[tuple[Path, Path]] = None
+        self._last_nis_update_counts_by_type: dict[str, int] = {}
 
     @property
     def samples(self) -> tuple[FilterPerformanceSample, ...]:
@@ -138,6 +149,7 @@ class FilterPerformanceLogger:
         self._timeout = False
         self._abort_reason = None
         self._last_export_paths = None
+        self._last_nis_update_counts_by_type = {}
 
     def mark_completed(self) -> None:
         self._completed = True
@@ -182,11 +194,22 @@ class FilterPerformanceLogger:
         covariance_diag = diagnostics.get("covariance_diagonal")
         if covariance_diag is None and filtered_state is not None:
             covariance_diag = filtered_state.covariance_diagonal
+        position_covariance = diagnostics.get("position_covariance_2x2") if isinstance(diagnostics, dict) else None
+        if position_covariance is None and filtered_state is not None:
+            position_covariance = filtered_state.position_covariance_2x2
         covariance_x_std = self._covariance_std(covariance_diag, 0)
         covariance_y_std = self._covariance_std(covariance_diag, 1)
         nis = self._finite_or_none(diagnostics.get("nis") if isinstance(diagnostics, dict) else None)
+        nis_by_type = self._fresh_nis_by_type(diagnostics if isinstance(diagnostics, dict) else {})
+        nis_expected_dimensions = self._nis_expected_dimensions(diagnostics if isinstance(diagnostics, dict) else {})
         innovation_norm = self._innovation_norm(diagnostics.get("innovation") if isinstance(diagnostics, dict) else None)
-        nees = self._position_nees(x_error, y_error, covariance_x_std, covariance_y_std)
+        nees_result = position_nees(
+            x_error_m=x_error,
+            y_error_m=y_error,
+            position_covariance_2x2=position_covariance,
+            covariance_diagonal=covariance_diag,
+        )
+        nees = self._finite_or_none(nees_result.get("nees"))
         gnss_frame = self._optional_int(diagnostics.get("last_gnss_frame") if isinstance(diagnostics, dict) else None)
         imu_frame = self._optional_int(diagnostics.get("last_imu_frame") if isinstance(diagnostics, dict) else None)
         metric_valid = bool(valid_for_metrics) if valid_for_metrics is not None else phase in ("driving", "completed")
@@ -244,7 +267,12 @@ class FilterPerformanceLogger:
             curvature_rad_per_m=self._finite_or_none(speed_plan.curvature_rad_per_m if speed_plan is not None else None),
             curvature_mode=speed_plan.mode if speed_plan is not None else None,
             nis=nis,
+            nis_by_type=nis_by_type,
+            nis_expected_dimensions_by_type=nis_expected_dimensions,
             nees=nees,
+            position_nees=self._finite_or_none(nees_result.get("position_nees")),
+            position_nees_diagonal_approx=self._finite_or_none(nees_result.get("position_nees_diagonal_approx")),
+            position_nees_source=str(nees_result.get("position_nees_source") or "unavailable"),
             innovation_norm=innovation_norm,
             covariance_x_std_m=covariance_x_std,
             covariance_y_std_m=covariance_y_std,
@@ -335,6 +363,13 @@ class FilterPerformanceLogger:
             "eval_yaw_rmse_deg": eval_metrics["yaw_rmse_deg"],
             "eval_mean_nis": eval_metrics["mean_nis"],
             "eval_mean_nees": eval_metrics["mean_nees"],
+            "eval_legacy_mean_nis_mixed": eval_metrics["mean_nis"],
+            "eval_nis_by_type_summary": eval_metrics["nis_by_type_summary"],
+            "eval_position_nees_summary": eval_metrics["position_nees_summary"],
+            "eval_position_nees_diagonal_approx_summary": eval_metrics["position_nees_diagonal_approx_summary"],
+            "eval_position_nees_source": eval_metrics["position_nees_source"],
+            "eval_mean_position_nees": eval_metrics["mean_position_nees"],
+            "eval_mean_position_nees_diagonal_approx": eval_metrics["mean_position_nees_diagonal_approx"],
             "filtered_mae_m": overall_metrics["filtered_mae_m"],
             "x_rmse_m": overall_metrics["x_rmse_m"],
             "y_rmse_m": overall_metrics["y_rmse_m"],
@@ -365,6 +400,14 @@ class FilterPerformanceLogger:
             "mean_abs_acceleration_mps2": overall_metrics["mean_abs_acceleration_mps2"],
             "mean_nis": overall_metrics["mean_nis"],
             "mean_nees": overall_metrics["mean_nees"],
+            "legacy_mean_nis_mixed": overall_metrics["mean_nis"],
+            "legacy_mean_nis_mixed_note": "Legacy mixed scalar NIS; prefer nis_by_type_summary.",
+            "nis_by_type_summary": overall_metrics["nis_by_type_summary"],
+            "position_nees_summary": overall_metrics["position_nees_summary"],
+            "position_nees_diagonal_approx_summary": overall_metrics["position_nees_diagonal_approx_summary"],
+            "position_nees_source": overall_metrics["position_nees_source"],
+            "mean_position_nees": overall_metrics["mean_position_nees"],
+            "mean_position_nees_diagonal_approx": overall_metrics["mean_position_nees_diagonal_approx"],
             "innovation_mean": overall_metrics["innovation_mean"],
             "innovation_std": overall_metrics["innovation_std"],
             "within_2sigma_x_pct": overall_metrics["within_2sigma_x_pct"],
@@ -405,6 +448,13 @@ class FilterPerformanceLogger:
             "driving_mean_abs_acceleration_mps2": driving_metrics["mean_abs_acceleration_mps2"],
             "driving_mean_nis": driving_metrics["mean_nis"],
             "driving_mean_nees": driving_metrics["mean_nees"],
+            "driving_legacy_mean_nis_mixed": driving_metrics["mean_nis"],
+            "driving_nis_by_type_summary": driving_metrics["nis_by_type_summary"],
+            "driving_position_nees_summary": driving_metrics["position_nees_summary"],
+            "driving_position_nees_diagonal_approx_summary": driving_metrics["position_nees_diagonal_approx_summary"],
+            "driving_position_nees_source": driving_metrics["position_nees_source"],
+            "driving_mean_position_nees": driving_metrics["mean_position_nees"],
+            "driving_mean_position_nees_diagonal_approx": driving_metrics["mean_position_nees_diagonal_approx"],
             "driving_segment_metrics": self._segment_metrics(driving_samples),
             "stabilization_sample_count": len(stabilization_samples),
             "stabilization_filtered_max_error_m": stabilization_metrics["filtered_max_error_m"],
@@ -522,6 +572,47 @@ class FilterPerformanceLogger:
             return None
         return (x_error * x_error / x_var) + (y_error * y_error / y_var)
 
+    def _fresh_nis_by_type(self, diagnostics: dict[str, object]) -> dict[str, float]:
+        raw_values = diagnostics.get("nis_by_type")
+        if not isinstance(raw_values, dict):
+            return {}
+        counts = self._nis_update_counts(diagnostics)
+        fresh: dict[str, float] = {}
+        for update_type, count in counts.items():
+            if count <= self._last_nis_update_counts_by_type.get(update_type, 0):
+                continue
+            value = self._finite_or_none(raw_values.get(update_type))
+            if value is not None:
+                fresh[update_type] = value
+        self._last_nis_update_counts_by_type = counts
+        return fresh
+
+    @staticmethod
+    def _nis_update_counts(diagnostics: dict[str, object]) -> dict[str, int]:
+        raw = diagnostics.get("nis_update_counts_by_type")
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, int] = {}
+        for key, value in raw.items():
+            try:
+                result[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    @staticmethod
+    def _nis_expected_dimensions(diagnostics: dict[str, object]) -> dict[str, int]:
+        raw = diagnostics.get("nis_expected_dimensions_by_type")
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, int] = {}
+        for key, value in raw.items():
+            try:
+                result[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return result
+
     @staticmethod
     def _within_sigma(error: Optional[float], stddev: Optional[float], sigma: float) -> Optional[bool]:
         if error is None or stddev is None or stddev <= 0.0:
@@ -562,7 +653,16 @@ class FilterPerformanceLogger:
         speed_errors = cls._finite_values(sample.speed_error_mps for sample in sample_list)
         yaw_errors = [abs(value) for value in cls._finite_values(sample.yaw_error_deg for sample in sample_list)]
         nis_values = cls._finite_values(sample.nis for sample in sample_list)
-        nees_values = cls._finite_values(sample.nees for sample in sample_list)
+        consistency_rows = [
+            {
+                "nis_by_type": sample.nis_by_type,
+                "nees": sample.nees,
+                "position_nees": sample.position_nees,
+                "position_nees_diagonal_approx": sample.position_nees_diagonal_approx,
+            }
+            for sample in sample_list
+        ]
+        nees_summary = summarize_position_nees(consistency_rows)
         innovation_values = cls._finite_values(sample.innovation_norm for sample in sample_list)
         yaw_rate_values = cls._finite_values(sample.filtered_yaw_rate_radps for sample in sample_list)
         curvature_values = cls._finite_values(sample.filtered_curvature_1pm for sample in sample_list)
@@ -601,7 +701,16 @@ class FilterPerformanceLogger:
             "mean_abs_curvature_1pm": cls._mean([abs(value) for value in curvature_values]),
             "mean_abs_acceleration_mps2": cls._mean([abs(value) for value in acceleration_values]),
             "mean_nis": cls._mean(nis_values),
-            "mean_nees": cls._mean(nees_values),
+            "mean_nees": nees_summary["mean_nees"],
+            "nis_by_type_summary": summarize_nis_by_type(consistency_rows),
+            "position_nees_summary": nees_summary["position_nees_summary"],
+            "position_nees_diagonal_approx_summary": nees_summary["position_nees_diagonal_approx_summary"],
+            "legacy_nees_summary": nees_summary["legacy_nees_summary"],
+            "position_nees_source": nees_summary["position_nees_source"],
+            "mean_position_nees": nees_summary["mean_position_nees"],
+            "mean_position_nees_diagonal_approx": nees_summary["mean_position_nees_diagonal_approx"],
+            "position_nees_available": nees_summary["position_nees_available"],
+            "position_nees_diagonal_approx_available": nees_summary["position_nees_diagonal_approx_available"],
             "innovation_mean": cls._mean(innovation_values),
             "innovation_std": cls._stddev(innovation_values),
             "within_2sigma_x_pct": cls._boolean_percentage(sample.within_2sigma_x for sample in sample_list),
@@ -650,6 +759,15 @@ class FilterPerformanceLogger:
                 "yaw_rmse_deg": cls._rmse([abs(value) for value in cls._finite_values(item.yaw_error_deg for item in segment_samples)]),
                 "mean_nis": cls._mean(cls._finite_values(item.nis for item in segment_samples)),
                 "mean_nees": cls._mean(cls._finite_values(item.nees for item in segment_samples)),
+                "nis_by_type_summary": summarize_nis_by_type({"nis_by_type": item.nis_by_type} for item in segment_samples),
+                "position_nees_source": summarize_position_nees(
+                    {
+                        "nees": item.nees,
+                        "position_nees": item.position_nees,
+                        "position_nees_diagonal_approx": item.position_nees_diagonal_approx,
+                    }
+                    for item in segment_samples
+                )["position_nees_source"],
             }
             for segment, segment_samples in sorted(buckets.items())
         }

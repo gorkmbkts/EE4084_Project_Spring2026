@@ -671,6 +671,10 @@ class RouteTestRunner:
             "mean_driving_raw_gnss_rmse_m": _mean(_finite_summary_values(self._route_summaries, "driving_raw_gnss_rmse_m")),
             "mean_overall_filtered_rmse_m": _mean(_finite_summary_values(self._route_summaries, "filtered_rmse_m")),
             "mean_overall_raw_gnss_rmse_m": _mean(_finite_summary_values(self._route_summaries, "raw_gnss_rmse_m")),
+            "mean_position_nees": _mean(_finite_row_values(primary_rows, "mean_position_nees")),
+            "mean_position_nees_diagonal_approx": _mean(_finite_row_values(primary_rows, "mean_position_nees_diagonal_approx")),
+            "position_nees_source": _aggregate_position_nees_source(primary_rows),
+            "legacy_mean_nis_mixed": _mean(_finite_row_values(primary_rows, "legacy_mean_nis_mixed")),
             "route_summaries": self._route_summaries,
             "segment_rmse_summary": self._aggregate_segment_metrics(),
         }
@@ -694,6 +698,10 @@ class RouteTestRunner:
             "yaw_rmse_deg",
             "mean_nees",
             "mean_nis",
+            "legacy_mean_nis_mixed",
+            "mean_position_nees",
+            "mean_position_nees_diagonal_approx",
+            "position_nees_source",
             "eval_filtered_rmse_m",
             "eval_raw_gnss_rmse_m",
             "eval_improvement_percent",
@@ -707,6 +715,10 @@ class RouteTestRunner:
             "driving_yaw_rmse_deg",
             "driving_mean_nees",
             "driving_mean_nis",
+            "driving_legacy_mean_nis_mixed",
+            "driving_mean_position_nees",
+            "driving_mean_position_nees_diagonal_approx",
+            "driving_position_nees_source",
             "overall_filtered_rmse_m",
             "overall_raw_gnss_rmse_m",
             "overall_improvement_percent",
@@ -714,6 +726,10 @@ class RouteTestRunner:
             "overall_yaw_rmse_deg",
             "overall_mean_nees",
             "overall_mean_nis",
+            "overall_legacy_mean_nis_mixed",
+            "overall_mean_position_nees",
+            "overall_mean_position_nees_diagonal_approx",
+            "overall_position_nees_source",
             "completion_time_s",
             "route_folder",
             "error",
@@ -742,6 +758,10 @@ class RouteTestRunner:
                         "yaw_rmse_deg": metrics.get("yaw_rmse_deg"),
                         "mean_nees": metrics.get("mean_nees"),
                         "mean_nis": metrics.get("mean_nis"),
+                        "legacy_mean_nis_mixed": metrics.get("legacy_mean_nis_mixed"),
+                        "mean_position_nees": metrics.get("mean_position_nees"),
+                        "mean_position_nees_diagonal_approx": metrics.get("mean_position_nees_diagonal_approx"),
+                        "position_nees_source": metrics.get("position_nees_source"),
                         "eval_filtered_rmse_m": metrics.get("eval_filtered_rmse_m"),
                         "eval_raw_gnss_rmse_m": metrics.get("eval_raw_gnss_rmse_m"),
                         "eval_improvement_percent": metrics.get("eval_improvement_percent"),
@@ -755,6 +775,10 @@ class RouteTestRunner:
                         "driving_yaw_rmse_deg": metrics.get("driving_yaw_rmse_deg"),
                         "driving_mean_nees": metrics.get("driving_mean_nees"),
                         "driving_mean_nis": metrics.get("driving_mean_nis"),
+                        "driving_legacy_mean_nis_mixed": metrics.get("driving_legacy_mean_nis_mixed"),
+                        "driving_mean_position_nees": metrics.get("driving_mean_position_nees"),
+                        "driving_mean_position_nees_diagonal_approx": metrics.get("driving_mean_position_nees_diagonal_approx"),
+                        "driving_position_nees_source": metrics.get("driving_position_nees_source"),
                         "overall_filtered_rmse_m": metrics.get("overall_filtered_rmse_m"),
                         "overall_raw_gnss_rmse_m": metrics.get("overall_raw_gnss_rmse_m"),
                         "overall_improvement_percent": metrics.get("overall_improvement_percent"),
@@ -762,6 +786,10 @@ class RouteTestRunner:
                         "overall_yaw_rmse_deg": metrics.get("overall_yaw_rmse_deg"),
                         "overall_mean_nees": metrics.get("overall_mean_nees"),
                         "overall_mean_nis": metrics.get("overall_mean_nis"),
+                        "overall_legacy_mean_nis_mixed": metrics.get("overall_legacy_mean_nis_mixed"),
+                        "overall_mean_position_nees": metrics.get("overall_mean_position_nees"),
+                        "overall_mean_position_nees_diagonal_approx": metrics.get("overall_mean_position_nees_diagonal_approx"),
+                        "overall_position_nees_source": metrics.get("overall_position_nees_source"),
                         "completion_time_s": summary.get("completion_time_s"),
                         "route_folder": summary.get("route_folder"),
                         "error": summary.get("error"),
@@ -956,6 +984,14 @@ def _prefer_eval_metric(
     return _prefer_driving_metric(summary, driving_key, overall_key)
 
 
+def _prefer_consistency_source(summary: dict[str, object], eval_key: str, driving_key: str, overall_key: str) -> str:
+    for key in (eval_key, driving_key, overall_key):
+        value = str(summary.get(key) or "")
+        if value:
+            return value
+    return ""
+
+
 def _primary_metric_row(summary: dict[str, object]) -> dict[str, Optional[float] | str]:
     eval_filtered = _optional_float(summary.get("eval_filtered_rmse_m"))
     eval_raw = _optional_float(summary.get("eval_raw_gnss_rmse_m"))
@@ -982,6 +1018,15 @@ def _primary_metric_row(summary: dict[str, object]) -> dict[str, Optional[float]
         "yaw_rmse_deg": _prefer_eval_metric(summary, "eval_yaw_rmse_deg", "driving_yaw_rmse_deg", "yaw_rmse_deg"),
         "mean_nees": _prefer_eval_metric(summary, "eval_mean_nees", "driving_mean_nees", "mean_nees"),
         "mean_nis": _prefer_eval_metric(summary, "eval_mean_nis", "driving_mean_nis", "mean_nis"),
+        "legacy_mean_nis_mixed": _prefer_eval_metric(summary, "eval_legacy_mean_nis_mixed", "driving_legacy_mean_nis_mixed", "legacy_mean_nis_mixed"),
+        "mean_position_nees": _prefer_eval_metric(summary, "eval_mean_position_nees", "driving_mean_position_nees", "mean_position_nees"),
+        "mean_position_nees_diagonal_approx": _prefer_eval_metric(
+            summary,
+            "eval_mean_position_nees_diagonal_approx",
+            "driving_mean_position_nees_diagonal_approx",
+            "mean_position_nees_diagonal_approx",
+        ),
+        "position_nees_source": _prefer_consistency_source(summary, "eval_position_nees_source", "driving_position_nees_source", "position_nees_source"),
         "eval_filtered_rmse_m": eval_filtered,
         "eval_raw_gnss_rmse_m": eval_raw,
         "eval_improvement_percent": _improvement_percent(eval_raw, eval_filtered),
@@ -992,6 +1037,10 @@ def _primary_metric_row(summary: dict[str, object]) -> dict[str, Optional[float]
         "driving_yaw_rmse_deg": _optional_float(summary.get("driving_yaw_rmse_deg")),
         "driving_mean_nees": _optional_float(summary.get("driving_mean_nees")),
         "driving_mean_nis": _optional_float(summary.get("driving_mean_nis")),
+        "driving_legacy_mean_nis_mixed": _optional_float(summary.get("driving_legacy_mean_nis_mixed")),
+        "driving_mean_position_nees": _optional_float(summary.get("driving_mean_position_nees")),
+        "driving_mean_position_nees_diagonal_approx": _optional_float(summary.get("driving_mean_position_nees_diagonal_approx")),
+        "driving_position_nees_source": str(summary.get("driving_position_nees_source") or ""),
         "overall_filtered_rmse_m": overall_filtered,
         "overall_raw_gnss_rmse_m": overall_raw,
         "overall_improvement_percent": _improvement_percent(overall_raw, overall_filtered),
@@ -999,6 +1048,10 @@ def _primary_metric_row(summary: dict[str, object]) -> dict[str, Optional[float]
         "overall_yaw_rmse_deg": _optional_float(summary.get("yaw_rmse_deg")),
         "overall_mean_nees": _optional_float(summary.get("mean_nees")),
         "overall_mean_nis": _optional_float(summary.get("mean_nis")),
+        "overall_legacy_mean_nis_mixed": _optional_float(summary.get("legacy_mean_nis_mixed")),
+        "overall_mean_position_nees": _optional_float(summary.get("mean_position_nees")),
+        "overall_mean_position_nees_diagonal_approx": _optional_float(summary.get("mean_position_nees_diagonal_approx")),
+        "overall_position_nees_source": str(summary.get("position_nees_source") or ""),
     }
 
 
@@ -1031,6 +1084,15 @@ def _finite_row_values(rows: Sequence[dict[str, object]], key: str) -> list[floa
         if value is not None:
             values.append(value)
     return values
+
+
+def _aggregate_position_nees_source(rows: Sequence[dict[str, object]]) -> str:
+    sources = {str(row.get("position_nees_source") or "") for row in rows if row.get("position_nees_source")}
+    if "full_2x2" in sources:
+        return "full_2x2"
+    if "diagonal_approx" in sources:
+        return "diagonal_approx"
+    return "unavailable"
 
 
 def _mean(values: Sequence[float]) -> Optional[float]:

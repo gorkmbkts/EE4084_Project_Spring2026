@@ -36,6 +36,7 @@ from src.evaluation.localization_metrics import (
     position_error,
     yaw_error_deg,
 )
+from src.evaluation.consistency_metrics import position_nees
 from src.evaluation.offline_plots import generate_aggregate_rmse_plot, generate_offline_route_plots
 from src.localization.gnss_projection import LocalGnssMeasurement
 
@@ -83,7 +84,13 @@ ESTIMATE_FIELDNAMES = [
     "speed_error_mps",
     "velocity_error_mps",
     "nis",
+    "nis_by_type",
+    "nis_expected_dimensions_by_type",
     "nees",
+    "position_nees",
+    "position_nees_diagonal_approx",
+    "position_nees_source",
+    "position_covariance_2x2",
 ]
 
 AUTO_TUNE_REPLAY_CONTEXT = "auto_tune_trial"
@@ -428,6 +435,7 @@ class OfflineReplayRunner:
         estimates: list[dict[str, object]] = []
         last_gnss_frame: Optional[int] = None
         last_imu_frame: Optional[int] = None
+        last_nis_update_counts_by_type: dict[str, int] = {}
         failures = 0
         last_diagnostics: dict[str, object] = {}
         for row in rows:
@@ -442,12 +450,15 @@ class OfflineReplayRunner:
                     last_gnss_frame = int(gnss.frame)
                 state = getattr(filter_instance, "get_state")()
                 diagnostics = _filter_diagnostics(filter_instance)
+                fresh_nis_by_type = _fresh_nis_by_type(diagnostics, last_nis_update_counts_by_type)
+                last_nis_update_counts_by_type = _nis_update_counts(diagnostics)
                 last_diagnostics = diagnostics
             except Exception:
                 failures += 1
                 state = None
                 diagnostics = {}
-            estimates.append(_estimate_row(row, filter_id, state, diagnostics))
+                fresh_nis_by_type = {}
+            estimates.append(_estimate_row(row, filter_id, state, diagnostics, fresh_nis_by_type=fresh_nis_by_type))
         return estimates, {
             "failed_sample_updates": failures,
             "last_gnss_frame": last_gnss_frame,
@@ -533,6 +544,7 @@ def _estimate_row(
     filter_id: str,
     state: Optional[VehicleState],
     diagnostics: dict[str, object],
+    fresh_nis_by_type: Optional[dict[str, float]] = None,
 ) -> dict[str, object]:
     gt_x = _first_float(row.get("metric_ground_truth_x"), row.get("ground_truth_x"))
     gt_y = _first_float(row.get("metric_ground_truth_y"), row.get("ground_truth_y"))
@@ -554,6 +566,17 @@ def _estimate_row(
     covariance = diagnostics.get("covariance_diagonal")
     if covariance is None and state is not None:
         covariance = state.covariance_diagonal
+    position_covariance = diagnostics.get("position_covariance_2x2")
+    if position_covariance is None and state is not None:
+        position_covariance = state.position_covariance_2x2
+    nees_result = position_nees(
+        x_error_m=x_error,
+        y_error_m=y_error,
+        position_covariance_2x2=position_covariance,
+        covariance_diagonal=covariance,
+    )
+    nis_by_type = fresh_nis_by_type or {}
+    expected_dimensions = diagnostics.get("nis_expected_dimensions_by_type")
     return {
         "timestamp": row.get("timestamp"),
         "sample_timestamp": row.get("timestamp"),
@@ -597,7 +620,15 @@ def _estimate_row(
         "speed_error_mps": speed_error,
         "velocity_error_mps": velocity_error,
         "nis": diagnostics.get("nis"),
-        "nees": nees_xy(x_error, y_error, covariance),
+        "nis_by_type": json.dumps(nis_by_type, sort_keys=True) if nis_by_type else "",
+        "nis_expected_dimensions_by_type": (
+            json.dumps(expected_dimensions, sort_keys=True) if isinstance(expected_dimensions, dict) else ""
+        ),
+        "nees": nees_result.get("nees"),
+        "position_nees": nees_result.get("position_nees"),
+        "position_nees_diagonal_approx": nees_result.get("position_nees_diagonal_approx"),
+        "position_nees_source": nees_result.get("position_nees_source"),
+        "position_covariance_2x2": json.dumps(position_covariance) if position_covariance is not None else "",
     }
 
 
@@ -649,6 +680,37 @@ def _filter_diagnostics(filter_instance: object) -> dict[str, object]:
     except Exception:
         return {}
     return diagnostics if isinstance(diagnostics, dict) else {}
+
+
+def _nis_update_counts(diagnostics: dict[str, object]) -> dict[str, int]:
+    raw = diagnostics.get("nis_update_counts_by_type")
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, value in raw.items():
+        try:
+            result[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _fresh_nis_by_type(
+    diagnostics: dict[str, object],
+    previous_counts: dict[str, int],
+) -> dict[str, float]:
+    nis_by_type = diagnostics.get("nis_by_type")
+    if not isinstance(nis_by_type, dict):
+        return {}
+    counts = _nis_update_counts(diagnostics)
+    result: dict[str, float] = {}
+    for update_type, count in counts.items():
+        if count <= previous_counts.get(update_type, 0):
+            continue
+        value = _optional_float(nis_by_type.get(update_type))
+        if value is not None:
+            result[update_type] = value
+    return result
 
 
 def _annotated_log_rows(path: Path) -> tuple[list[dict[str, object]], dict[str, object]]:
@@ -859,8 +921,17 @@ def _summary_row(
         "velocity_rmse_mps": metrics.get("velocity_rmse_mps"),
         "mean_nis": metrics.get("mean_nis"),
         "mean_nees": metrics.get("mean_nees"),
+        "legacy_mean_nis_mixed": metrics.get("legacy_mean_nis_mixed"),
+        "mean_position_nees": metrics.get("mean_position_nees"),
+        "mean_position_nees_diagonal_approx": metrics.get("mean_position_nees_diagonal_approx"),
+        "position_nees_source": metrics.get("position_nees_source"),
+        "nis_by_type_summary": metrics.get("nis_by_type_summary"),
+        "position_nees_summary": metrics.get("position_nees_summary"),
+        "position_nees_diagonal_approx_summary": metrics.get("position_nees_diagonal_approx_summary"),
         "nis_available": metrics.get("nis_available"),
         "nees_available": metrics.get("nees_available"),
+        "position_nees_available": metrics.get("position_nees_available"),
+        "position_nees_diagonal_approx_available": metrics.get("position_nees_diagonal_approx_available"),
         "replay_runtime_s": replay_runtime_s,
     }
 
@@ -904,8 +975,17 @@ def _summary_fieldnames() -> list[str]:
         "velocity_rmse_mps",
         "mean_nis",
         "mean_nees",
+        "legacy_mean_nis_mixed",
+        "mean_position_nees",
+        "mean_position_nees_diagonal_approx",
+        "position_nees_source",
+        "nis_by_type_summary",
+        "position_nees_summary",
+        "position_nees_diagonal_approx_summary",
         "nis_available",
         "nees_available",
+        "position_nees_available",
+        "position_nees_diagonal_approx_available",
         "replay_runtime_s",
     ]
 
