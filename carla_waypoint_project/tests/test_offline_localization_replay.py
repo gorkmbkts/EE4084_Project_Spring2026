@@ -602,11 +602,14 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
         if call.generate_plots:
             raise AssertionError("auto-tune trials should disable replay plots by default")
         path_text = str(call.run_folder_override).replace("\\", "/")
-        if "/offline_localization/auto_tune/offline_passive/ca_kf/" not in path_text or not path_text.rsplit("/", 1)[-1].startswith("t"):
-            raise AssertionError(f"auto-tune trial output override used wrong location: {call.run_folder_override}")
+        if "/_tmp/at/" not in path_text or not path_text.rsplit("/", 1)[-1].startswith("t"):
+            raise AssertionError(f"auto-tune trial output override did not use compact staging: {call.run_folder_override}")
+        metrics_path = Path(call.run_folder_override) / "r001" / "met" / "summary_metrics.json"
+        if len(str(metrics_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
+            raise AssertionError(f"auto-tune trial metrics path is too long: {metrics_path}")
         run_id = Path(call.run_folder_override).parent.name
-        if not run_id.startswith("a") or len(run_id) > 16:
-            raise AssertionError(f"auto-tune run id is not compact: {run_id}")
+        if not run_id.startswith("at") or len(run_id) > 18:
+            raise AssertionError(f"auto-tune staging run id is not compact: {run_id}")
     evaluations = output_root / "offline_localization" / "evaluations"
     if evaluations.exists() and any(evaluations.iterdir()):
         raise AssertionError("auto tuner polluted normal offline evaluations output")
@@ -629,12 +632,17 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
     if len(config.get("selected_logs") or []) != 2:
         raise AssertionError("saved best tune config did not preserve selected logs")
     best_output = str((config.get("best_metrics") or {}).get("output_folder") or "").replace("\\", "/")
-    if "/offline_localization/auto_tune/offline_passive/ca_kf/" not in best_output or not best_output.rsplit("/", 1)[-1].startswith("t"):
+    if "/_tmp/at/" not in best_output or not best_output.rsplit("/", 1)[-1].startswith("t"):
         raise AssertionError("best tune metadata did not reference auto_tune trial output")
+    if not str(config.get("noise_signature") or ""):
+        raise AssertionError("saved config did not preserve full noise_signature")
     for key in ("objective_name", "score_formula", "score_notes", "nis_nees_policy", "unavailable_metrics_policy"):
         if not config.get(key):
             raise AssertionError(f"saved best tune config missing objective metadata: {key}")
     summary = json.loads((result.output_folder / "auto_tune_summary.json").read_text(encoding="utf-8"))
+    staging_folder = str((summary.get("metadata") or {}).get("offline_candidate_staging_folder") or "").replace("\\", "/")
+    if "/_tmp/at/" not in staging_folder:
+        raise AssertionError("auto-tune summary did not record compact candidate staging folder")
     if summary.get("trial_output_policy", {}).get("normal_evaluations_directory_used") is not False:
         raise AssertionError("auto-tune summary did not document trial output policy")
     kept_outputs = [trial.output_folder for trial in result.trial_results if trial.output_folder is not None and trial.output_folder.exists()]

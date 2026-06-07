@@ -21,7 +21,8 @@ from src.evaluation.closed_loop_auto_tune import (  # noqa: E402
     closed_loop_objective_score,
 )
 from src.evaluation.evaluation_artifacts import write_json  # noqa: E402
-from src.evaluation.filter_auto_tuner import AutoTuneResult, AutoTuneTrialResult  # noqa: E402
+from src.evaluation.filter_auto_tuner import AutoTuneResult, AutoTuneTrialResult, OfflineBenchmarkAutoTuner  # noqa: E402
+import src.evaluation.offline_replay_runner as offline_replay_runner_module  # noqa: E402
 from src.evaluation.sensor_noise_tune_mapper import noise_signature  # noqa: E402
 from src.evaluation.tune_config_schema import (  # noqa: E402
     BENCHMARK_MODE_CLOSED_LOOP,
@@ -113,6 +114,72 @@ def test_closed_loop_autotuner_selects_top_finalists_and_validates_only_them(tmp
         raise AssertionError(f"passive closed-loop tune was saved to the wrong folder: {path_text}")
     if len(config.get("closed_loop_validation_results") or []) != 2:
         raise AssertionError("saved config did not preserve finalist validation results")
+
+
+def test_closed_loop_autotuner_candidate_generation_uses_compact_replay_staging(tmp_path: Path) -> None:
+    long_root = tmp_path / "long_project_segment" / "benchmark_results"
+    log_path, sensor = _recorded_log(long_root.parent, "route_001")
+    replay_calls = []
+
+    class FakeReplayRunner:
+        def run(self, request: object) -> object:
+            replay_calls.append(request)
+            folder = Path(request.run_folder_override)
+            folder.mkdir(parents=True, exist_ok=True)
+            write_json(
+                folder / "aggregate_summary.json",
+                {
+                    "route_count": len(request.sensor_log_paths),
+                    "best_filter_id": "ca_kf",
+                    "aggregate_rows": [
+                        {
+                            "filter_id": "ca_kf",
+                            "eval_position_rmse_m": 1.0,
+                            "yaw_rmse_deg": 0.0,
+                            "divergence_event_count": 0,
+                        }
+                    ],
+                },
+            )
+            return SimpleNamespace(output_folder=folder, failures=())
+
+    runner = _FakeValidationRunner({1: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0}})
+    request = _request(
+        long_root.parent,
+        (log_path,),
+        sensor,
+        finalist_count=1,
+        trial_count=1,
+        strategy="random_plus_coordinate_refinement",
+    )
+    request = ClosedLoopAutoTuneRequest(
+        **{**request.to_dict(), "offline_log_paths": request.offline_log_paths, "validation_routes": request.validation_routes, "output_root": str(long_root)}
+    )
+    result = ClosedLoopBenchmarkAutoTuner(
+        offline_tuner=OfflineBenchmarkAutoTuner(runner_factory=FakeReplayRunner),
+        validation_runner=runner,
+    ).run(request)
+
+    if len(replay_calls) != 1:
+        raise AssertionError("closed-loop candidate generation did not run one offline replay trial")
+    replay_path = Path(replay_calls[0].run_folder_override)
+    path_text = str(replay_path).replace("\\", "/")
+    if "/_tmp/at/" not in path_text:
+        raise AssertionError(f"closed-loop candidate replay did not use compact staging: {replay_path}")
+    metrics_path = replay_path / "r001" / "met" / "summary_metrics.json"
+    if len(str(metrics_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
+        raise AssertionError(f"closed-loop candidate replay metrics path is too long: {metrics_path}")
+
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    path_parts = [part for part in result.saved_config_path.parts]
+    if "closed_loop" not in path_parts or "auto_tune" not in path_parts:
+        raise AssertionError(f"closed-loop final output folder moved unexpectedly: {result.saved_config_path}")
+    if not any(part.startswith("n_") and len(part) <= 12 for part in path_parts):
+        raise AssertionError(f"closed-loop final output did not use short noise slug: {result.saved_config_path}")
+    if config.get("noise_signature") != noise_signature(sensor):
+        raise AssertionError("closed-loop saved config did not preserve full noise_signature")
+    if "/_tmp/at/" not in str(config.get("offline_candidate_staging_folder") or "").replace("\\", "/"):
+        raise AssertionError("closed-loop saved config did not link compact offline candidate staging folder")
 
 
 def test_closed_loop_autotuner_saves_active_config_separately(tmp_path: Path) -> None:

@@ -273,6 +273,5 @@ def config_signature(config: object) -> str:
 
 def noise_signature_slug(value: object) -> str:
     text = str(value or "unknown_noise")
-    if len(text) > 80:
-        text = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
-    return slugify(text, "noise")
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+    return slugify(f"n_{digest}", "noise")

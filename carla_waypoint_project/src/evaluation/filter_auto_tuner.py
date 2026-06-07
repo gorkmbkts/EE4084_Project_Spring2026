@@ -29,7 +29,7 @@ from src.evaluation.evaluation_artifacts import (
     unique_folder,
     write_json,
 )
-from src.evaluation.offline_replay_runner import OfflineReplayRequest, OfflineReplayRunner
+from src.evaluation.offline_replay_runner import OfflineReplayRequest, OfflineReplayRunner, _validate_windows_path_length
 from src.evaluation.sensor_noise_tune_mapper import SensorNoiseTuneMapper, noise_signature, process_only_auto_tune_profile
 from src.evaluation.tune_config_schema import (
     BENCHMARK_MODE_CLOSED_LOOP,
@@ -160,7 +160,22 @@ class FilterAutoTuner:
             _offline_auto_tune_noise_root(request.output_root, request.filter_id, locked.signature),
             _run_folder_name(request.filter_id, request.sensor_log_paths, request.output_root),
         )
+        _validate_windows_path_length(run_folder / "auto_tune_summary.json", "Auto-tune summary file")
         run_folder.mkdir(parents=True, exist_ok=False)
+        trial_staging_folder = _auto_tune_trial_staging_folder(request, run_folder)
+        _validate_windows_path_length(
+            trial_staging_folder / "t001" / "r001" / "met" / "summary_metrics.json",
+            "Auto-tune trial metrics file",
+        )
+        trial_staging_folder.mkdir(parents=True, exist_ok=True)
+        request = replace(
+            request,
+            metadata={
+                **dict(request.metadata),
+                "offline_candidate_staging_folder": str(trial_staging_folder),
+                "auto_tune_final_output_folder": str(run_folder),
+            },
+        )
         trial_results: list[AutoTuneTrialResult] = []
         best_tune: dict[str, object] = dict(request.base_tune)
         best_score: Optional[float] = None
@@ -277,7 +292,8 @@ class FilterAutoTuner:
                 "log_count": len(request.sensor_log_paths),
             },
         )
-        replay_folder = run_folder / f"t{trial_index:03d}"
+        staging_folder = Path(str(request.metadata.get("offline_candidate_staging_folder") or run_folder))
+        replay_folder = staging_folder / f"t{trial_index:03d}"
         try:
             result = self._runner_factory().run(
                 OfflineReplayRequest(
@@ -735,6 +751,22 @@ def _offline_auto_tune_noise_root(output_root: str, filter_id: str, noise_signat
     return _offline_auto_tune_filter_root(output_root, filter_id) / noise_signature_slug(noise_signature)
 
 
+def _auto_tune_trial_staging_root(output_root: str) -> Path:
+    root = Path(output_root)
+    if not root.is_absolute():
+        root = Path(__file__).resolve().parents[2] / root
+    return root / "_tmp" / "at"
+
+
+def _auto_tune_trial_staging_folder(request: AutoTuneRequest, run_folder: Path) -> Path:
+    configured = request.metadata.get("offline_candidate_staging_folder")
+    if configured:
+        return Path(str(configured))
+    name = run_folder.name
+    suffix = name[1:] if name.startswith("a") else name
+    return _auto_tune_trial_staging_root(request.output_root) / slugify(f"at{suffix}", "at")[:18]
+
+
 def _closed_loop_auto_tune_filter_root(output_root: str, filter_id: str, tracking_mode: str) -> Path:
     root = Path(output_root)
     if not root.is_absolute():
@@ -973,7 +1005,7 @@ def _unavailable_metrics_policy() -> str:
 
 def _trial_output_policy(request: AutoTuneRequest) -> dict[str, object]:
     return {
-        "trial_outputs_root": ".",
+        "trial_outputs_root": str(request.metadata.get("offline_candidate_staging_folder") or "."),
         "trial_output_folder_pattern": "t###",
         "compact_trial_paths": True,
         "keep_trial_outputs": bool(request.keep_trial_outputs),

@@ -25,6 +25,7 @@ from src.evaluation.filter_auto_tuner import (
     OfflineBenchmarkAutoTuner,
     noise_profile_summary,
 )
+from src.evaluation.offline_replay_runner import _validate_windows_path_length
 from src.evaluation.sensor_noise_tune_mapper import SensorNoiseTuneMapper, noise_signature
 from src.evaluation.tune_config_schema import (
     BENCHMARK_MODE_CLOSED_LOOP,
@@ -356,6 +357,10 @@ class ClosedLoopBenchmarkAutoTuner:
             _closed_loop_noise_root(request.output_root, request.filter_id, request.tracking_mode, locked.signature),
             _run_folder_name(),
         )
+        _validate_windows_path_length(
+            run_folder / "closed_loop_auto_tune_summary.json",
+            "Closed-loop auto-tune summary file",
+        )
         run_folder.mkdir(parents=True, exist_ok=False)
         write_json(run_folder / "closed_loop_auto_tune_request.json", request.to_dict())
 
@@ -663,11 +668,14 @@ def _closed_loop_extra_metadata(
     offline_result: AutoTuneResult,
     locked_sensor_noise_sources: dict[str, str],
 ) -> dict[str, object]:
+    offline_summary = read_json(Path(offline_result.output_folder) / "auto_tune_summary.json")
+    offline_metadata = offline_summary.get("metadata") if isinstance(offline_summary.get("metadata"), dict) else {}
     return {
         "source": "closed_loop_auto_tune",
         "candidate_generation_stage": "offline_replay_process_only",
         "closed_loop_validation_stage": "finalists_only",
         "offline_auto_tune_output_folder": str(offline_result.output_folder),
+        "offline_candidate_staging_folder": str(offline_metadata.get("offline_candidate_staging_folder") or ""),
         "locked_sensor_noise_sources": dict(locked_sensor_noise_sources),
         "metadata": dict(request.metadata),
         "active_control_parameter_policy": (
