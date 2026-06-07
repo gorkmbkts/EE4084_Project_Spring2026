@@ -151,6 +151,11 @@ class StartupMapSelector:
         self._tracking_mode = TRACKING_MODE_PASSIVE
         self._tracking_button_rects: dict[str, pygame.Rect] = {}
         self._apply_recommended_rect = pygame.Rect(0, 0, 1, 1)
+        self._closed_loop_saved_tunes_rect = pygame.Rect(0, 0, 1, 1)
+        self._closed_loop_back_to_sliders_rect = pygame.Rect(0, 0, 1, 1)
+        self._closed_loop_saved_tune_apply_rects: dict[int, pygame.Rect] = {}
+        self._closed_loop_filter_saved_tune_mode = False
+        self._closed_loop_saved_tune_status = ""
         self._recommendation_applied_by_filter: dict[str, bool] = {}
         self._sensor_editor: Optional[ParameterEditor] = None
         self._behavior_editor: Optional[ParameterEditor] = None
@@ -868,6 +873,14 @@ class StartupMapSelector:
                     self._commit_filter_tune_editor()
                     self._active_closed_loop_subtab = subtab
                     return _NoSelection
+            if self._active_closed_loop_subtab == "Filters" and self._closed_loop_filter_saved_tune_mode:
+                if self._closed_loop_back_to_sliders_rect.collidepoint(position):
+                    self._closed_loop_filter_saved_tune_mode = False
+                    return _NoSelection
+                for index, rect in self._closed_loop_saved_tune_apply_rects.items():
+                    if rect.collidepoint(position):
+                        self._apply_saved_tune_config(self._selected_filter_id, index, context="closed_loop")
+                        return _NoSelection
             for filter_id, rect in self._setup_filter_buttons.items():
                 if rect.collidepoint(position):
                     record = self._filter_record(filter_id)
@@ -877,6 +890,7 @@ class StartupMapSelector:
                     self._commit_filter_tune_editor()
                     self._selected_filter_id = filter_id
                     self._ensure_filter_tune_editor(filter_id)
+                    self._closed_loop_filter_saved_tune_mode = False
                     self._error = ""
                     return _NoSelection
             for mode, rect in self._tracking_button_rects.items():
@@ -887,9 +901,14 @@ class StartupMapSelector:
                 self._commit_filter_tune_editor()
                 self._apply_recommended_setup_tune(self._selected_filter_id)
                 return _NoSelection
+            if self._active_closed_loop_subtab == "Filters" and self._closed_loop_saved_tunes_rect.collidepoint(position):
+                self._commit_filter_tune_editor()
+                self._closed_loop_filter_saved_tune_mode = True
+                return _NoSelection
 
         if (
             self._active_closed_loop_subtab == "Filters"
+            and not self._closed_loop_filter_saved_tune_mode
             and self._filter_tune_editor is not None
             and self._filter_tune_editor.handle_event(event)
         ):
@@ -960,7 +979,7 @@ class StartupMapSelector:
                         return _NoSelection
                     for index, rect in self._offline_saved_tune_apply_rects.items():
                         if rect.collidepoint(position):
-                            self._apply_saved_tune_config(index)
+                            self._apply_saved_tune_config(self._active_offline_filter_id, index, context="offline")
                             return _NoSelection
                 for filter_id, rect in self._offline_filter_include_rects.items():
                     if rect.collidepoint(position):
@@ -1052,12 +1071,18 @@ class StartupMapSelector:
                 left = pygame.Rect(work.left, work.top, max(320, int(work.width * 0.42)), work.height)
                 right = pygame.Rect(left.right + gap, work.top, work.right - left.right - gap, work.height)
                 self._draw_closed_loop_filter_selection(left)
-                self._draw_filter_tune_panel(right, self._selected_filter_id)
+                if self._closed_loop_filter_saved_tune_mode:
+                    self._draw_saved_tune_browser(right, self._selected_filter_id, context="closed_loop")
+                else:
+                    self._draw_filter_tune_panel(right, self._selected_filter_id)
             else:
                 top = pygame.Rect(work.left, work.top, work.width, max(220, int(work.height * 0.48)))
                 lower = pygame.Rect(work.left, top.bottom + gap, work.width, work.bottom - top.bottom - gap)
                 self._draw_closed_loop_filter_selection(top)
-                self._draw_filter_tune_panel(lower, self._selected_filter_id)
+                if self._closed_loop_filter_saved_tune_mode:
+                    self._draw_saved_tune_browser(lower, self._selected_filter_id, context="closed_loop")
+                else:
+                    self._draw_filter_tune_panel(lower, self._selected_filter_id)
         elif self._active_closed_loop_subtab == "Sensor Noise":
             if self._sensor_editor is not None:
                 self._sensor_editor.draw(self._surface, work)
@@ -1349,7 +1374,7 @@ class StartupMapSelector:
             self._draw_text(line, (content.left, y), self._small_font, color, content.width)
             y += 17
         if self._offline_filter_saved_tune_mode:
-            self._draw_saved_tune_browser(tune_rect, record.filter_id)
+            self._draw_saved_tune_browser(tune_rect, record.filter_id, context="offline")
         else:
             self._draw_filter_tune_panel(tune_rect, record.filter_id, force_passive=True)
 
@@ -1452,7 +1477,11 @@ class StartupMapSelector:
             color = DASHBOARD.warning_color if line in recommendation.warnings else DASHBOARD.muted_text_color
             self._draw_text(line, (content.left, line_y), self._small_font, color, content.width)
             line_y += 17
+        if self._closed_loop_saved_tune_status and line_y + 16 < content.bottom - 30:
+            self._draw_text(self._closed_loop_saved_tune_status, (content.left, line_y), self._small_font, DASHBOARD.text_color, content.width - 320)
         self._apply_recommended_rect = pygame.Rect(content.right - 142, content.bottom - 28, 142, 24)
+        self._closed_loop_saved_tunes_rect = pygame.Rect(content.right - 320, content.bottom - 28, 170, 24)
+        self._draw_button(self._closed_loop_saved_tunes_rect, "Browse Saved Tunes")
         self._draw_button(self._apply_recommended_rect, "Apply Recommended", muted=not recommendation.has_values)
 
     def _draw_auto_tune_card(self, rect: pygame.Rect, filter_id: str) -> None:
@@ -1478,26 +1507,44 @@ class StartupMapSelector:
         self._draw_button(self._offline_auto_tune_rect, "Start Auto Tune", muted=not available or self._auto_tune_running)
         self._draw_button(self._offline_saved_tunes_rect, "Browse Saved Tunes", muted=self._auto_tune_running)
 
-    def _draw_saved_tune_browser(self, rect: pygame.Rect, filter_id: str) -> None:
+    def _draw_saved_tune_browser(self, rect: pygame.Rect, filter_id: str, context: str = "offline") -> None:
         pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, rect, border_radius=6)
         pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
         content = rect.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
-        self._offline_saved_tune_apply_rects.clear()
-        self._draw_text("Saved Tune Configs", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
-        self._offline_back_to_sliders_rect = pygame.Rect(content.right - 210, content.top, 210, 26)
-        self._draw_button(self._offline_back_to_sliders_rect, "Back to Manual Tune Sliders")
+        apply_rects = self._closed_loop_saved_tune_apply_rects if context == "closed_loop" else self._offline_saved_tune_apply_rects
+        apply_rects.clear()
+        self._draw_text("Saved Auto-Tune Configs", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+        back_rect = pygame.Rect(content.right - 210, content.top, 210, 26)
+        if context == "closed_loop":
+            self._closed_loop_back_to_sliders_rect = back_rect
+        else:
+            self._offline_back_to_sliders_rect = back_rect
+        self._draw_button(back_rect, "Back to Manual Tune Sliders")
+        list_top = content.top + 38
+        if context == "closed_loop":
+            note = (
+                "Saved auto-tune configs were optimized in offline localization replay. "
+                "Validate in closed-loop before trusting final benchmark results."
+            )
+            self._draw_wrapped_text(
+                note,
+                pygame.Rect(content.left, content.top + 32, content.width, 42),
+                self._small_font,
+                DASHBOARD.warning_color,
+            )
+            list_top = content.top + 80
         configs = list_saved_tune_configs(filter_id)
         if not configs:
-            self._draw_text("No saved tune configs for this filter.", (content.left, content.top + 42), self._font, DASHBOARD.warning_color, content.width)
+            self._draw_text("No saved tune configs for this filter.", (content.left, list_top + 4), self._font, DASHBOARD.warning_color, content.width)
             return
         row_h = 62
-        y = content.top + 38
-        for index, item in enumerate(configs[: max(1, (content.height - 38) // row_h)]):
+        y = list_top
+        for index, item in enumerate(configs[: max(1, (content.bottom - list_top) // row_h)]):
             row = pygame.Rect(content.left, y, content.width, row_h - 8)
             pygame.draw.rect(self._surface, (24, 30, 39), row, border_radius=5)
             pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, row, width=1, border_radius=5)
             apply_rect = pygame.Rect(row.right - 78, row.top + 14, 68, 26)
-            self._offline_saved_tune_apply_rects[index] = apply_rect
+            apply_rects[index] = apply_rect
             name = Path(str(item.get("path") or "")).parent.name or str(item.get("created_at") or "saved tune")
             score = item.get("score")
             rmse = item.get("mean_eval_position_rmse_m")
@@ -1602,20 +1649,29 @@ class StartupMapSelector:
         filters = ", ".join(sorted(self._offline_filter_ids)) or "none"
         return f"Offline localization | Log {log_label} | Filters {filters} + raw_gnss | Sensor {sensor}"
 
-    def _apply_saved_tune_config(self, config_index: int) -> None:
-        configs = list_saved_tune_configs(self._active_offline_filter_id)
+    def _apply_saved_tune_config(self, filter_id: str, config_index: int, context: str = "offline") -> None:
+        configs = list_saved_tune_configs(filter_id)
         if config_index < 0 or config_index >= len(configs):
             return
         config_path = Path(str(configs[config_index].get("path") or ""))
         config = load_saved_tune_config(config_path)
         best_tune = config.get("best_tune")
         if not isinstance(best_tune, dict):
-            self._offline_saved_tune_status = "Saved tune config is missing best_tune."
+            status = "Saved tune config is missing best_tune."
+            if context == "closed_loop":
+                self._closed_loop_saved_tune_status = status
+            else:
+                self._offline_saved_tune_status = status
             return
-        self._apply_tune_to_filter(self._active_offline_filter_id, best_tune)
+        self._apply_tune_to_filter(filter_id, best_tune)
         name = config_path.parent.name or config_path.name
-        self._offline_saved_tune_status = f"Applied saved tune config {name} to {self._active_offline_filter_id}."
-        self._offline_filter_saved_tune_mode = False
+        status = f"Applied saved auto-tune config {name} to {filter_id}."
+        if context == "closed_loop":
+            self._closed_loop_saved_tune_status = status
+            self._closed_loop_filter_saved_tune_mode = False
+        else:
+            self._offline_saved_tune_status = status
+            self._offline_filter_saved_tune_mode = False
 
     def _apply_tune_to_filter(self, filter_id: str, tune: dict[str, object]) -> None:
         record = self._filter_record(filter_id)
@@ -1631,8 +1687,13 @@ class StartupMapSelector:
 
     def _open_auto_tune_modal(self, filter_id: str) -> None:
         record = self._filter_record(filter_id)
-        if record is None or not record.auto_tune_enabled or not isinstance(record.auto_tune_profile, dict):
-            self._offline_saved_tune_status = "No auto-tune profile for this filter."
+        if (
+            record is None
+            or not record.auto_tune_enabled
+            or not isinstance(record.auto_tune_profile, dict)
+            or not record.auto_tune_profile.get("primary")
+        ):
+            self._offline_saved_tune_status = "No auto-tune profile with primary parameters for this filter."
             return
         self._auto_tune_modal_open = True
         self._auto_tune_filter_id = filter_id
@@ -1696,7 +1757,7 @@ class StartupMapSelector:
             return _NoSelection
         if self._auto_tune_save_rect.collidepoint(position):
             if self._auto_tune_result is not None and self._auto_tune_result.saved_config_path is not None:
-                self._append_auto_tune_status(f"Best tune already saved: {self._auto_tune_result.saved_config_path}")
+                self._append_auto_tune_status(f"Best tune saved at: {self._auto_tune_result.saved_config_path}")
             return _NoSelection
         if self._auto_tune_apply_rect.collidepoint(position):
             if self._auto_tune_result is not None and self._auto_tune_result.best_tune:
@@ -1708,9 +1769,15 @@ class StartupMapSelector:
 
     def _start_auto_tune_from_modal(self) -> None:
         record = self._filter_record(self._auto_tune_filter_id)
-        if record is None or not isinstance(record.auto_tune_profile, dict):
-            self._append_auto_tune_status("No auto-tune profile for this filter.")
+        if (
+            record is None
+            or not record.auto_tune_enabled
+            or not isinstance(record.auto_tune_profile, dict)
+            or not record.auto_tune_profile.get("primary")
+        ):
+            self._append_auto_tune_status("No auto-tune profile with primary parameters for this filter.")
             return
+        search = record.auto_tune_profile.get("search") if isinstance(record.auto_tune_profile.get("search"), dict) else {}
         selected_logs = [
             info.sensor_log_path
             for index, info in enumerate(self._recorded_logs)
@@ -1731,6 +1798,9 @@ class StartupMapSelector:
             auto_tune_profile=dict(record.auto_tune_profile),
             max_trials=max(1, int(self._auto_tune_trials or 30)),
             objective_name=str(record.auto_tune_profile.get("objective") or "rmse_consistency"),
+            keep_trial_outputs=bool(search.get("keep_trial_outputs", True)),
+            keep_only_best_trial_output=bool(search.get("keep_only_best_trial_output", False)),
+            generate_trial_plots=bool(search.get("generate_trial_plots", False)),
             metadata={"startup_mode": "offline_auto_tune", "random_seed": 4084},
         )
         try:
@@ -1743,31 +1813,55 @@ class StartupMapSelector:
             self._append_auto_tune_status(f"Auto tune failed: {exc}")
         finally:
             self._auto_tune_running = False
-            if self._auto_tune_result is not None:
-                score = self._auto_tune_result.best_score
-                score_text = f"{score:.3f}" if isinstance(score, (int, float)) else "n/a"
-                self._append_auto_tune_status(f"Auto tune complete. Best score: {score_text}")
+            self._redraw_auto_tune_modal_frame()
 
     def _auto_tune_progress_callback(self, event_name: str, payload: dict[str, object]) -> None:
+        def number_text(value: object, suffix: str = "") -> str:
+            return f"{float(value):.3f}{suffix}" if isinstance(value, (int, float)) else "n/a"
+
         if event_name == "trial_started":
             trial = payload.get("trial_index")
+            total = payload.get("trial_total") or self._auto_tune_trials
+            log_count = payload.get("log_count")
             tune = payload.get("candidate_tune") if isinstance(payload.get("candidate_tune"), dict) else {}
             shown = ", ".join(f"{key}={float(value):.3g}" for key, value in list(tune.items())[:4] if isinstance(value, (int, float)))
-            self._append_auto_tune_status(f"Trial {trial}/{self._auto_tune_trials} | {self._auto_tune_filter_id} | {shown}", redraw=False)
+            self._append_auto_tune_status(
+                f"Trial {trial}/{total} started | {self._auto_tune_filter_id} | logs {log_count or 0} | {shown or 'base tune'}",
+                redraw=False,
+            )
         elif event_name == "trial_finished":
             score = payload.get("score")
+            best_score = payload.get("best_score")
             failed = bool(payload.get("failed"))
+            metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
             if failed:
-                self._append_auto_tune_status(f"Trial {payload.get('trial_index')} failed: {payload.get('failure_reason')}", redraw=False)
+                self._append_auto_tune_status(
+                    f"Trial {payload.get('trial_index')}/{payload.get('trial_total') or self._auto_tune_trials} failed | reason: {payload.get('failure_reason')}",
+                    redraw=False,
+                )
             else:
-                score_text = f"{float(score):.3f}" if isinstance(score, (int, float)) else "n/a"
-                self._append_auto_tune_status(f"Trial {payload.get('trial_index')} score: {score_text}", redraw=False)
+                rmse_text = number_text(metrics.get("mean_eval_position_rmse_m"), " m")
+                score_text = number_text(score)
+                best_text = number_text(best_score)
+                failure_count = metrics.get("failure_count")
+                self._append_auto_tune_status(
+                    f"Trial {payload.get('trial_index')}/{payload.get('trial_total') or self._auto_tune_trials} finished | "
+                    f"mean RMSE {rmse_text} | score {score_text} | best {best_text} | failures {failure_count or 0}",
+                    redraw=False,
+                )
         elif event_name == "new_best":
             score = payload.get("score")
-            score_text = f"{float(score):.3f}" if isinstance(score, (int, float)) else "n/a"
-            self._append_auto_tune_status(f"New best tune found. Score: {score_text}", redraw=False)
+            metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+            self._append_auto_tune_status(
+                f"New best tune found | score {number_text(score)} | mean RMSE {number_text(metrics.get('mean_eval_position_rmse_m'), ' m')}",
+                redraw=False,
+            )
         elif event_name == "completed":
-            self._append_auto_tune_status(f"Saved best tune: {payload.get('saved_config_path')}", redraw=False)
+            metrics = payload.get("best_metrics") if isinstance(payload.get("best_metrics"), dict) else {}
+            self._append_auto_tune_status("Auto tune complete.", redraw=False)
+            self._append_auto_tune_status(f"Best score: {number_text(payload.get('best_score'))}", redraw=False)
+            self._append_auto_tune_status(f"Mean eval RMSE: {number_text(metrics.get('mean_eval_position_rmse_m'), ' m')}", redraw=False)
+            self._append_auto_tune_status(f"Best tune saved: {payload.get('saved_config_path')}", redraw=False)
         self._redraw_auto_tune_modal_frame()
         self._pump_auto_tune_cancel_events()
 
@@ -1915,7 +2009,7 @@ class StartupMapSelector:
         lines = [
             f"Trials: {self._auto_tune_trials or search.get('default_trials') or 30}",
             f"Strategy: {search.get('strategy') or 'random_plus_coordinate_refinement'}",
-            f"Objective: {objective}",
+            f"Objective: {objective} | Trial plots: {'ON' if bool(search.get('generate_trial_plots', False)) else 'OFF'}",
             "Use current GUI tune as base: ON",
         ]
         self._draw_text("Auto Tune Settings", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
@@ -1943,7 +2037,7 @@ class StartupMapSelector:
         self._auto_tune_apply_rect = pygame.Rect(self._auto_tune_save_rect.right + 8, rect.top + 4, 126, 30)
         self._draw_button(self._auto_tune_start_rect, "Start", muted=self._auto_tune_running, primary=True)
         self._draw_button(self._auto_tune_cancel_rect, "Cancel / Stop", muted=not self._auto_tune_running)
-        self._draw_button(self._auto_tune_save_rect, "Save Best Tune", muted=self._auto_tune_result is None)
+        self._draw_button(self._auto_tune_save_rect, "Show Saved Path", muted=self._auto_tune_result is None)
         self._draw_button(self._auto_tune_apply_rect, "Apply Best Tune", muted=self._auto_tune_result is None)
         selected_paths = [info.sensor_log_path for index, info in enumerate(self._recorded_logs) if index in self._auto_tune_selected_log_indices]
         logs = [

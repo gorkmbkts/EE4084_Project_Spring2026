@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import random
+import shutil
 from typing import Callable, Optional
 
 from src.KalmanLab.registry import discover_filters
@@ -37,6 +38,9 @@ class AutoTuneRequest:
     max_trials: int = 30
     objective_name: str = "rmse_consistency"
     output_root: str = "benchmark_results"
+    keep_trial_outputs: bool = True
+    keep_only_best_trial_output: bool = False
+    generate_trial_plots: bool = False
     metadata: dict[str, object] = field(default_factory=dict)
 
 
@@ -111,26 +115,28 @@ class FilterAutoTuner:
             if stop_requested is not None and stop_requested():
                 self._emit(progress_callback, "stopped", {"trial_index": trial_index})
                 break
-            result = self._run_trial(request, run_folder, trial_index, candidate, progress_callback)
+            result = self._run_trial(request, run_folder, trial_index, max_trials, candidate, progress_callback)
             trial_results.append(result)
             if not result.failed and result.score is not None and (best_score is None or result.score < best_score):
                 best_score = result.score
                 best_tune = dict(result.candidate_tune)
                 best_metrics = dict(result.metrics)
-                self._emit(progress_callback, "new_best", {"trial_index": trial_index, "score": best_score})
+                self._emit(progress_callback, "new_best", {"trial_index": trial_index, "score": best_score, "metrics": best_metrics})
+            self._emit_trial_finished(progress_callback, request, result, max_trials, best_score)
             trial_index += 1
 
         for candidate in self._coordinate_candidates(request, best_tune, remaining=max_trials - len(trial_results)):
             if stop_requested is not None and stop_requested():
                 self._emit(progress_callback, "stopped", {"trial_index": trial_index})
                 break
-            result = self._run_trial(request, run_folder, trial_index, candidate, progress_callback)
+            result = self._run_trial(request, run_folder, trial_index, max_trials, candidate, progress_callback)
             trial_results.append(result)
             if not result.failed and result.score is not None and (best_score is None or result.score < best_score):
                 best_score = result.score
                 best_tune = dict(result.candidate_tune)
                 best_metrics = dict(result.metrics)
-                self._emit(progress_callback, "new_best", {"trial_index": trial_index, "score": best_score})
+                self._emit(progress_callback, "new_best", {"trial_index": trial_index, "score": best_score, "metrics": best_metrics})
+            self._emit_trial_finished(progress_callback, request, result, max_trials, best_score)
             trial_index += 1
 
         self._write_trials_csv(run_folder / "trials.csv", trial_results)
@@ -139,7 +145,16 @@ class FilterAutoTuner:
         saved_config_path = None
         if best_score is not None:
             saved_config_path = self.save_best_tune(request, record.display_name, run_folder, best_tune, best_score, best_metrics, trial_results)
-        self._emit(progress_callback, "completed", {"best_score": best_score, "saved_config_path": str(saved_config_path) if saved_config_path else ""})
+        self._apply_retention_policy(request, trial_results, best_score)
+        self._emit(
+            progress_callback,
+            "completed",
+            {
+                "best_score": best_score,
+                "best_metrics": best_metrics,
+                "saved_config_path": str(saved_config_path) if saved_config_path else "",
+            },
+        )
         return AutoTuneResult(
             filter_id=request.filter_id,
             best_tune=best_tune,
@@ -156,6 +171,7 @@ class FilterAutoTuner:
         request: AutoTuneRequest,
         run_folder: Path,
         trial_index: int,
+        trial_total: int,
         candidate_tune: dict[str, object],
         progress_callback: Optional[ProgressCallback],
     ) -> AutoTuneTrialResult:
@@ -164,11 +180,13 @@ class FilterAutoTuner:
             "trial_started",
             {
                 "trial_index": trial_index,
+                "trial_total": trial_total,
                 "filter_id": request.filter_id,
                 "candidate_tune": dict(candidate_tune),
                 "log_count": len(request.sensor_log_paths),
             },
         )
+        replay_folder = run_folder / "trial_outputs" / f"trial_{trial_index:03d}" / "replay_output"
         try:
             result = self._runner_factory().run(
                 OfflineReplayRequest(
@@ -177,9 +195,13 @@ class FilterAutoTuner:
                     filter_tunes={request.filter_id: dict(candidate_tune)},
                     output_root=request.output_root,
                     include_raw_gnss_baseline=True,
+                    run_folder_override=replay_folder,
+                    generate_plots=request.generate_trial_plots,
+                    replay_context="auto_tune_trial",
                 )
             )
             metrics = self._trial_metrics(result.output_folder, request.filter_id)
+            metrics["failure_count"] = len(result.failures)
             score = objective_score(metrics, objective_name=request.objective_name, failure_count=len(result.failures))
             failed = not math.isfinite(score)
             failure_reason = "" if not failed else "Objective score was not finite."
@@ -203,16 +225,6 @@ class FilterAutoTuner:
                 failure_reason=str(exc),
             )
         write_json(run_folder / f"trial_{trial_index:03d}.json", _trial_to_dict(trial_result))
-        self._emit(
-            progress_callback,
-            "trial_finished",
-            {
-                "trial_index": trial_index,
-                "score": trial_result.score,
-                "failed": trial_result.failed,
-                "failure_reason": trial_result.failure_reason,
-            },
-        )
         return trial_result
 
     def save_best_tune(
@@ -314,12 +326,17 @@ class FilterAutoTuner:
             "filter_display_name": filter_display_name,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "objective": request.objective_name,
+            "objective_name": request.objective_name,
             "score_formula": _score_formula_description(),
+            "score_notes": _score_notes(),
+            "nis_nees_policy": _nis_nees_policy(),
+            "unavailable_metrics_policy": _unavailable_metrics_policy(),
             "best_score": best_score,
             "best_metrics": best_metrics,
             "best_tune": dict(best_tune),
             "base_tune": dict(request.base_tune),
             "auto_tune_profile": dict(request.auto_tune_profile),
+            "trial_output_policy": _trial_output_policy(request),
             "selected_logs": [_log_metadata(path, request.output_root) for path in request.sensor_log_paths],
             "trial_count": len(trial_results),
             "project_commit": project_commit_hash(),
@@ -349,11 +366,17 @@ class FilterAutoTuner:
             "sensor_noise_config": noise.get("representative_config") or {},
             "selected_logs": logs,
             "objective": request.objective_name,
+            "objective_name": request.objective_name,
+            "score_formula": _score_formula_description(),
+            "score_notes": _score_notes(),
+            "nis_nees_policy": _nis_nees_policy(),
+            "unavailable_metrics_policy": _unavailable_metrics_policy(),
             "score": best_score,
             "best_metrics": best_metrics,
             "best_tune": dict(best_tune),
             "base_tune": dict(request.base_tune),
             "auto_tune_profile": dict(request.auto_tune_profile),
+            "trial_output_policy": _trial_output_policy(request),
             "trial_count": trial_count,
             "project_commit": project_commit_hash(),
             "output_folder": str(run_folder),
@@ -385,6 +408,56 @@ class FilterAutoTuner:
     def _emit(callback: Optional[ProgressCallback], event: str, payload: dict[str, object]) -> None:
         if callback is not None:
             callback(event, payload)
+
+    @staticmethod
+    def _emit_trial_finished(
+        callback: Optional[ProgressCallback],
+        request: AutoTuneRequest,
+        result: AutoTuneTrialResult,
+        trial_total: int,
+        best_score: Optional[float],
+    ) -> None:
+        FilterAutoTuner._emit(
+            callback,
+            "trial_finished",
+            {
+                "trial_index": result.trial_index,
+                "trial_total": trial_total,
+                "score": result.score,
+                "best_score": best_score,
+                "failed": result.failed,
+                "failure_reason": result.failure_reason,
+                "metrics": dict(result.metrics),
+                "log_count": len(request.sensor_log_paths),
+            },
+        )
+
+    @staticmethod
+    def _apply_retention_policy(
+        request: AutoTuneRequest,
+        trial_results: list[AutoTuneTrialResult],
+        best_score: Optional[float],
+    ) -> None:
+        if request.keep_trial_outputs and not request.keep_only_best_trial_output:
+            return
+        best_trial_index: Optional[int] = None
+        if request.keep_only_best_trial_output and best_score is not None:
+            for result in trial_results:
+                if result.score == best_score and not result.failed:
+                    best_trial_index = result.trial_index
+                    break
+        for result in trial_results:
+            output_folder = result.output_folder
+            if output_folder is None:
+                continue
+            if request.keep_only_best_trial_output and result.trial_index == best_trial_index:
+                continue
+            shutil.rmtree(output_folder, ignore_errors=True)
+            parent = output_folder.parent
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
 
 
 def objective_score(metrics: dict[str, object], objective_name: str = "rmse_consistency", failure_count: int = 0) -> float:
@@ -556,6 +629,36 @@ def _score_formula_description() -> str:
         "10 * divergence_event_count + 100 * failures + consistency_penalty; "
         "NIS/NEES penalties are skipped when unavailable."
     )
+
+
+def _score_notes() -> str:
+    return (
+        "rmse_consistency is a heuristic score. RMSE is the dominant term. "
+        "Yaw, divergence, failures, and large NIS/NEES values are penalized when available."
+    )
+
+
+def _nis_nees_policy() -> str:
+    return (
+        "NIS/NEES thresholds are fixed heuristic thresholds used for ranking only, "
+        "not formal chi-square acceptance bounds."
+    )
+
+
+def _unavailable_metrics_policy() -> str:
+    return (
+        "Unavailable yaw, NIS, or NEES metrics do not add penalty. Missing eval RMSE makes the trial noncompetitive."
+    )
+
+
+def _trial_output_policy(request: AutoTuneRequest) -> dict[str, object]:
+    return {
+        "trial_outputs_root": "trial_outputs",
+        "keep_trial_outputs": bool(request.keep_trial_outputs),
+        "keep_only_best_trial_output": bool(request.keep_only_best_trial_output),
+        "generate_trial_plots": bool(request.generate_trial_plots),
+        "normal_evaluations_directory_used": False,
+    }
 
 
 def _preset_name(value: object) -> str:

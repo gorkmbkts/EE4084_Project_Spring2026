@@ -96,6 +96,9 @@ class OfflineReplayRequest:
     output_root: str = "benchmark_results"
     include_raw_gnss_baseline: bool = True
     initial_condition_policy: str = "first_valid_gnss_initializes_each_filter"
+    run_folder_override: Optional[Path] = None
+    generate_plots: bool = True
+    replay_context: str = "normal_evaluation"
 
 
 @dataclass(frozen=True)
@@ -152,16 +155,22 @@ class OfflineReplayRunner:
             raise ValueError("Select at least one filter for offline replay.")
         resolved_filter_tunes = self._resolved_filter_tunes(filter_ids, request.filter_tunes)
 
-        run_folder = unique_folder(evaluations_root(request.output_root), timestamp_id())
+        if request.run_folder_override is not None:
+            run_folder = Path(request.run_folder_override)
+        else:
+            run_folder = unique_folder(evaluations_root(request.output_root), timestamp_id())
         run_folder.mkdir(parents=True, exist_ok=False)
         metadata = {
             "mode": OFFLINE_MODE_NAME,
             "report_name": OFFLINE_REPORT_NAME,
             "created_at": datetime.now().isoformat(timespec="seconds"),
+            "replay_context": request.replay_context,
+            "output_folder": str(run_folder),
             "selected_filters": filter_ids,
             "filter_tunes": resolved_filter_tunes,
             "sensor_log_paths": [str(path) for path in request.sensor_log_paths],
             "initial_condition_policy": request.initial_condition_policy,
+            "generate_plots": request.generate_plots,
             "replay_mode": "passive_offline_replay",
             "control_commands_used": False,
             "control_command_policy": "Logged throttle/brake/steer are preserved in sensor logs but are not fed to passive replay filters.",
@@ -199,6 +208,9 @@ class OfflineReplayRunner:
                 route_index=route_index,
                 filter_ids=filter_ids,
                 filter_tunes=resolved_filter_tunes,
+                initial_condition_policy=request.initial_condition_policy,
+                replay_context=request.replay_context,
+                generate_plots=request.generate_plots,
             )
             failures.extend(route_result["failures"])
             aggregate_rows.extend(route_result["aggregate_rows"])
@@ -228,7 +240,8 @@ class OfflineReplayRunner:
             "explanation": OFFLINE_LOCALIZATION_EXPLANATION,
         }
         write_json(run_folder / "aggregate_summary.json", aggregate_summary)
-        generate_aggregate_rmse_plot(run_folder)
+        if request.generate_plots:
+            generate_aggregate_rmse_plot(run_folder)
         metadata["failures"] = failures
         write_json(run_folder / "metadata.json", metadata)
 
@@ -250,6 +263,9 @@ class OfflineReplayRunner:
         route_index: int,
         filter_ids: list[str],
         filter_tunes: dict[str, dict[str, object]],
+        initial_condition_policy: str,
+        replay_context: str,
+        generate_plots: bool,
     ) -> dict[str, object]:
         rows, warmup_policy = _annotated_log_rows(log_path)
         if len(rows) < 2:
@@ -286,6 +302,7 @@ class OfflineReplayRunner:
             "mode": OFFLINE_MODE_NAME,
             "report_name": OFFLINE_REPORT_NAME,
             "created_at": datetime.now().isoformat(timespec="seconds"),
+            "replay_context": replay_context,
             "sensor_log_path": str(log_path),
             "route_name": route_name,
             "map_name": source_metadata.get("map_name"),
@@ -295,7 +312,8 @@ class OfflineReplayRunner:
                 for filter_id in filter_ids
                 if filter_id != "raw_gnss"
             },
-            "initial_condition_policy": "first_valid_gnss_initializes_each_filter",
+            "initial_condition_policy": initial_condition_policy,
+            "generate_plots": generate_plots,
             "replay_mode": "passive_offline_replay",
             "control_commands_used": False,
             "control_command_policy": "Logged controls are not fed to passive offline replay filters.",
@@ -358,7 +376,8 @@ class OfflineReplayRunner:
         write_json(metrics_dir / "summary_metrics.json", summary_json)
         route_metadata["failures"] = failures
         write_json(route_folder / "metadata.json", route_metadata)
-        generate_offline_route_plots(route_folder)
+        if generate_plots:
+            generate_offline_route_plots(route_folder)
         aggregate_rows = [
             {"route_index": route_index, **row, "sensor_log_path": str(log_path)}
             for row in summary_rows

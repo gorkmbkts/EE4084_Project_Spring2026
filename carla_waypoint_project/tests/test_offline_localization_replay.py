@@ -33,9 +33,17 @@ from src.evaluation.offline_replay_runner import (  # noqa: E402
 from src.evaluation.filter_auto_tuner import AutoTuneRequest, FilterAutoTuner  # noqa: E402
 from src.evaluation.sensor_log_recorder import SENSOR_LOG_FIELDNAMES  # noqa: E402
 from src.evaluation.test_route_store import TestRouteStore  # noqa: E402
-from src.evaluation.benchmark_config import ParameterSpec  # noqa: E402
+from src.evaluation.benchmark_config import (  # noqa: E402
+    BEHAVIOR_PRESETS,
+    BenchmarkConfig,
+    ParameterSpec,
+    SENSOR_NOISE_PRESETS,
+    sensor_noise_config_from_values,
+)
 from src.visualization.ui.parameter_controls import ParameterEditor  # noqa: E402
 from src.KalmanLab.registry import discover_filters  # noqa: E402
+from src.KalmanLab.filter_base import TRACKING_MODE_PASSIVE  # noqa: E402
+import src.visualization.startup_map_selector as startup_map_selector_module  # noqa: E402
 from src.visualization.startup_map_selector import (  # noqa: E402
     CLOSED_LOOP_SUBTABS,
     OFFLINE_SUBTABS,
@@ -92,6 +100,8 @@ def test_offline_replay_runs_on_short_saved_route_log(tmp_path: Path) -> None:
         raise AssertionError("offline replay did not evaluate one route")
     if result.failures:
         raise AssertionError(f"offline replay had failures: {result.failures}")
+    if result.output_folder.parent.name != "evaluations":
+        raise AssertionError(f"normal offline replay should write under evaluations, got {result.output_folder}")
 
     route_result = next((result.output_folder / "route_001_sadece_viraj").glob("metrics/summary_metrics.csv"))
     rows = list(csv.DictReader(route_result.open("r", newline="", encoding="utf-8")))
@@ -271,6 +281,16 @@ def test_startup_tune_storage_feeds_closed_loop_and_offline_requests() -> None:
     closed_loop_tune = selector._current_filter_tune_values()
     if closed_loop_tune.get("gnss_position_stddev_m") != 3.21:
         raise AssertionError("closed-loop selected filter tune did not come from startup storage")
+    config = BenchmarkConfig(
+        selected_filter="ca_kf",
+        selected_routes=(_short_saved_route(),),
+        sensor_noise_config=sensor_noise_config_from_values(SENSOR_NOISE_PRESETS["Medium Noise"], preset_name="Medium Noise"),
+        vehicle_behavior_config=BEHAVIOR_PRESETS["Balanced"],
+        selected_filter_tune=closed_loop_tune,
+        tracking_mode=TRACKING_MODE_PASSIVE,
+    )
+    if config.selected_filter_tune.get("gnss_position_stddev_m") != 3.21:
+        raise AssertionError("closed-loop BenchmarkConfig did not receive GUI-edited tune values")
 
     offline_tunes = selector._included_offline_filter_tunes(("ca_kf", "ctra_ekf", "raw_gnss"))
     if offline_tunes.get("ca_kf", {}).get("gnss_position_stddev_m") != 3.21:
@@ -349,7 +369,9 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
         def run(self, request: OfflineReplayRequest) -> SimpleNamespace:
             calls.append(request)
             trial_index = len(calls)
-            folder = output_root / "offline_localization" / "evaluations" / f"fake_trial_{trial_index:03d}"
+            if request.run_folder_override is None:
+                raise AssertionError("auto tuner did not pass a trial output override")
+            folder = Path(request.run_folder_override)
             folder.mkdir(parents=True)
             tune = request.filter_tunes["ca_kf"]
             rmse = float(tune.get("gnss_position_stddev_m", 9.0))
@@ -381,6 +403,8 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
         },
         max_trials=2,
         output_root=str(output_root),
+        keep_only_best_trial_output=True,
+        generate_trial_plots=False,
     )
     result = FilterAutoTuner(runner_factory=FakeRunner).run(request)
     if not calls:
@@ -392,6 +416,16 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
             raise AssertionError("auto tuner should tune exactly one filter")
         if "ca_kf" not in call.filter_tunes:
             raise AssertionError("candidate tune was not passed through filter_tunes")
+        if call.replay_context != "auto_tune_trial":
+            raise AssertionError("auto tuner did not mark replay context")
+        if call.generate_plots:
+            raise AssertionError("auto-tune trials should disable replay plots by default")
+        path_text = str(call.run_folder_override).replace("\\", "/")
+        if "/offline_localization/auto_tune/ca_kf/" not in path_text or "/trial_outputs/trial_" not in path_text:
+            raise AssertionError(f"auto-tune trial output override used wrong location: {call.run_folder_override}")
+    evaluations = output_root / "offline_localization" / "evaluations"
+    if evaluations.exists() and any(evaluations.iterdir()):
+        raise AssertionError("auto tuner polluted normal offline evaluations output")
     if result.saved_config_path is None or not result.saved_config_path.exists():
         raise AssertionError("best tune config was not saved")
     config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
@@ -399,6 +433,20 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
         raise AssertionError("saved best tune config is incomplete")
     if len(config.get("selected_logs") or []) != 2:
         raise AssertionError("saved best tune config did not preserve selected logs")
+    best_output = str((config.get("best_metrics") or {}).get("output_folder") or "").replace("\\", "/")
+    if "/offline_localization/auto_tune/ca_kf/" not in best_output or "/trial_outputs/trial_" not in best_output:
+        raise AssertionError("best tune metadata did not reference auto_tune trial output")
+    for key in ("objective_name", "score_formula", "score_notes", "nis_nees_policy", "unavailable_metrics_policy"):
+        if not config.get(key):
+            raise AssertionError(f"saved best tune config missing objective metadata: {key}")
+    summary = json.loads((result.output_folder / "auto_tune_summary.json").read_text(encoding="utf-8"))
+    if summary.get("trial_output_policy", {}).get("normal_evaluations_directory_used") is not False:
+        raise AssertionError("auto-tune summary did not document trial output policy")
+    kept_outputs = [trial.output_folder for trial in result.trial_results if trial.output_folder is not None and trial.output_folder.exists()]
+    if len(kept_outputs) != 1:
+        raise AssertionError(f"keep_only_best_trial_output should keep exactly one replay output, got {kept_outputs}")
+    if str(kept_outputs[0]).replace("\\", "/") != best_output:
+        raise AssertionError("retention did not keep the best trial output")
 
 
 def test_saved_tune_apply_updates_only_selected_filter() -> None:
@@ -415,6 +463,81 @@ def test_saved_tune_apply_updates_only_selected_filter() -> None:
         raise AssertionError("saved tune did not update selected filter")
     if selector._selected_filter_tunes["ctra_ekf"].get("process_jerk_stddev_mps3") != 2.0:
         raise AssertionError("saved tune apply leaked into another filter")
+
+
+def test_closed_loop_saved_tune_config_apply_updates_selected_filter() -> None:
+    selector = StartupMapSelector.__new__(StartupMapSelector)
+    selector._setup_filter_records = [record for record in discover_filters() if record.valid]
+    selector._selected_filter_tunes = {
+        "ca_kf": {"gnss_position_stddev_m": 1.0},
+        "ctra_ekf": {"process_jerk_stddev_mps3": 2.0},
+    }
+    selector._filter_tune_editor_filter_id = ""
+    selector._filter_tune_editor = None
+    selector._closed_loop_saved_tune_status = ""
+    selector._closed_loop_filter_saved_tune_mode = True
+    config_path = Path("synthetic_auto_tune") / "best_tune.json"
+    original_list = startup_map_selector_module.list_saved_tune_configs
+    original_load = startup_map_selector_module.load_saved_tune_config
+    startup_map_selector_module.list_saved_tune_configs = lambda filter_id: [{"path": str(config_path)}] if filter_id == "ca_kf" else []
+    startup_map_selector_module.load_saved_tune_config = lambda path: {"best_tune": {"gnss_position_stddev_m": 4.4}}
+    try:
+        selector._apply_saved_tune_config("ca_kf", 0, context="closed_loop")
+    finally:
+        startup_map_selector_module.list_saved_tune_configs = original_list
+        startup_map_selector_module.load_saved_tune_config = original_load
+    if selector._selected_filter_tunes["ca_kf"].get("gnss_position_stddev_m") != 4.4:
+        raise AssertionError("closed-loop saved config did not update selected filter tune")
+    if selector._selected_filter_tunes["ctra_ekf"].get("process_jerk_stddev_mps3") != 2.0:
+        raise AssertionError("closed-loop saved config leaked into another filter")
+    if selector._closed_loop_filter_saved_tune_mode:
+        raise AssertionError("closed-loop saved tune browser did not close after applying")
+    if "ca_kf" not in selector._closed_loop_saved_tune_status:
+        raise AssertionError("closed-loop saved tune apply status did not name target filter")
+
+
+def test_closed_loop_apply_recommended_still_updates_tune() -> None:
+    pygame.font.init()
+    selector = StartupMapSelector.__new__(StartupMapSelector)
+    selector._setup_filter_records = [record for record in discover_filters() if record.valid]
+    selector._selected_filter_id = "ca_kf"
+    selector._selected_filter_tunes = {"ca_kf": {"gnss_position_stddev_m": 9.0, "process_jerk_stddev_mps3": 1.0}}
+    selector._filter_tune_editor_filter_id = ""
+    selector._filter_tune_editor = None
+    selector._sensor_editor = None
+    selector._sensor_preset = "Medium Noise"
+    selector._tracking_mode = TRACKING_MODE_PASSIVE
+    selector._recommendation_applied_by_filter = {}
+    selector._apply_recommended_setup_tune("ca_kf")
+    if not selector._recommendation_applied_by_filter.get("ca_kf"):
+        raise AssertionError("closed-loop Apply Recommended did not mark recommendation as applied")
+    if selector._selected_filter_tunes["ca_kf"].get("gnss_position_stddev_m") == 9.0:
+        raise AssertionError("closed-loop Apply Recommended did not update CA-KF tune values")
+
+
+def test_auto_tune_modal_requires_primary_profile() -> None:
+    selector = StartupMapSelector.__new__(StartupMapSelector)
+    raw = SimpleNamespace(
+        filter_id="raw_gnss",
+        auto_tune_enabled=False,
+        auto_tune_profile=None,
+    )
+    empty = SimpleNamespace(
+        filter_id="empty_profile_filter",
+        auto_tune_enabled=True,
+        auto_tune_profile={"enabled": True, "primary": []},
+    )
+    selector._setup_filter_records = [raw, empty]
+    selector._offline_saved_tune_status = ""
+    selector._auto_tune_modal_open = False
+    selector._open_auto_tune_modal("raw_gnss")
+    if selector._auto_tune_modal_open:
+        raise AssertionError("raw_gnss should not open auto tune modal")
+    if selector._offline_saved_tune_status != "No auto-tune profile with primary parameters for this filter.":
+        raise AssertionError("raw_gnss modal guard did not show clear status")
+    selector._open_auto_tune_modal("empty_profile_filter")
+    if selector._auto_tune_modal_open:
+        raise AssertionError("empty primary profile should not open auto tune modal")
 
 
 def test_offline_recording_discovery_defaults_to_benchmark_results() -> None:
@@ -575,6 +698,9 @@ def run_all() -> None:
     with tempfile.TemporaryDirectory() as directory:
         test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(Path(directory))
     test_saved_tune_apply_updates_only_selected_filter()
+    test_closed_loop_saved_tune_config_apply_updates_selected_filter()
+    test_closed_loop_apply_recommended_still_updates_tune()
+    test_auto_tune_modal_requires_primary_profile()
     test_offline_recording_discovery_defaults_to_benchmark_results()
 
 
