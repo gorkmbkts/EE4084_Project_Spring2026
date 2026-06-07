@@ -29,6 +29,14 @@ from src.evaluation.offline_replay_runner import (  # noqa: E402
 )
 from src.evaluation.sensor_log_recorder import SENSOR_LOG_FIELDNAMES  # noqa: E402
 from src.evaluation.test_route_store import TestRouteStore  # noqa: E402
+from src.KalmanLab.registry import discover_filters  # noqa: E402
+from src.visualization.startup_map_selector import (  # noqa: E402
+    CLOSED_LOOP_SUBTABS,
+    OFFLINE_SUBTABS,
+    OFFLINE_TEST_SETUP_SUBTABS,
+    TOP_LEVEL_TABS,
+    StartupMapSelector,
+)
 
 
 def test_offline_replay_runs_on_short_saved_route_log(tmp_path: Path) -> None:
@@ -70,6 +78,7 @@ def test_offline_replay_runs_on_short_saved_route_log(tmp_path: Path) -> None:
         OfflineReplayRequest(
             sensor_log_paths=(log_path,),
             selected_filter_ids=("ca_kf",),
+            filter_tunes={"ca_kf": {"gnss_position_stddev_m": 2.75}},
             output_root=str(output_root),
         )
     )
@@ -87,6 +96,10 @@ def test_offline_replay_runs_on_short_saved_route_log(tmp_path: Path) -> None:
     metadata = json.loads((result.output_folder / "metadata.json").read_text(encoding="utf-8"))
     if metadata.get("explanation") != OFFLINE_LOCALIZATION_EXPLANATION:
         raise AssertionError("offline replay metadata explanation missing")
+    if metadata.get("filter_tunes", {}).get("ca_kf", {}).get("gnss_position_stddev_m") != 2.75:
+        raise AssertionError("offline replay run metadata did not preserve requested CA-KF tune")
+    if "raw_gnss" in metadata.get("filter_tunes", {}):
+        raise AssertionError("raw_gnss should be baseline-only and not have tune metadata")
     for relative in (
         "replay_results/raw_gnss_estimates.csv",
         "replay_results/ca_kf_estimates.csv",
@@ -101,6 +114,11 @@ def test_offline_replay_runs_on_short_saved_route_log(tmp_path: Path) -> None:
     ca_metrics = json.loads(
         (result.output_folder / "route_001_sadece_viraj" / "metrics" / "ca_kf_metrics.json").read_text(encoding="utf-8")
     )
+    route_metadata = json.loads(
+        (result.output_folder / "route_001_sadece_viraj" / "metadata.json").read_text(encoding="utf-8")
+    )
+    if route_metadata.get("filter_tunes", {}).get("ca_kf", {}).get("gnss_position_stddev_m") != 2.75:
+        raise AssertionError("offline replay route metadata did not preserve requested CA-KF tune")
     if ca_metrics.get("eval_position_rmse_m") is None:
         raise AssertionError("CA-KF eval RMSE missing")
     if "full_position_rmse_m" not in ca_metrics:
@@ -214,18 +232,47 @@ def test_offline_recording_warmup_does_not_trigger_route_failure() -> None:
         raise AssertionError("offline warm-up can still mark route_failed")
 
 
-def test_startup_test_setup_has_nested_offline_tabs() -> None:
+def test_startup_gui_uses_mode_based_tabs() -> None:
     startup_source = (PROJECT_ROOT / "src" / "visualization" / "startup_map_selector.py").read_text(encoding="utf-8")
-    for text in (
-        "Evaluation Mode",
-        "Sensor Noise",
-        "Vehicle Behavior",
-        "Offline Replay",
-        "Record Sensor Logs from Selected Routes",
-        "Run Offline Replay Evaluation",
-    ):
+    if TOP_LEVEL_TABS != ("Demo", "Closed Loop Benchmark", "Offline Localization Benchmark"):
+        raise AssertionError(f"unexpected top-level tabs: {TOP_LEVEL_TABS}")
+    if CLOSED_LOOP_SUBTABS != ("Filters", "Sensor Noise", "Vehicle Behavior", "Routes"):
+        raise AssertionError(f"unexpected closed-loop subtabs: {CLOSED_LOOP_SUBTABS}")
+    if OFFLINE_SUBTABS != ("Record Sensor Data", "Test Setup"):
+        raise AssertionError(f"unexpected offline subtabs: {OFFLINE_SUBTABS}")
+    if OFFLINE_TEST_SETUP_SUBTABS != ("Select Route", "Filters"):
+        raise AssertionError(f"unexpected offline setup subtabs: {OFFLINE_TEST_SETUP_SUBTABS}")
+    for text in ("Record Selected Route Log", "Run Offline Localization Benchmark", "Raw GNSS is always included as the baseline."):
         if text not in startup_source:
             raise AssertionError(f"startup setup missing {text!r}")
+    for removed in ('"Map Selection"', '"Evaluation Mode"', '"Offline Replay"'):
+        if removed in startup_source:
+            raise AssertionError(f"startup setup still exposes removed label {removed}")
+
+
+def test_startup_tune_storage_feeds_closed_loop_and_offline_requests() -> None:
+    selector = StartupMapSelector.__new__(StartupMapSelector)
+    selector._setup_filter_records = [record for record in discover_filters() if record.valid]
+    selector._selected_filter_tunes = {
+        "ca_kf": {"gnss_position_stddev_m": 3.21},
+        "ctra_ekf": {"process_jerk_stddev_mps3": 4.56},
+    }
+    selector._filter_tune_editor = None
+    selector._filter_tune_editor_filter_id = ""
+    selector._selected_filter_id = "ca_kf"
+    selector._recommendation_applied_by_filter = {}
+
+    closed_loop_tune = selector._current_filter_tune_values()
+    if closed_loop_tune.get("gnss_position_stddev_m") != 3.21:
+        raise AssertionError("closed-loop selected filter tune did not come from startup storage")
+
+    offline_tunes = selector._included_offline_filter_tunes(("ca_kf", "ctra_ekf", "raw_gnss"))
+    if offline_tunes.get("ca_kf", {}).get("gnss_position_stddev_m") != 3.21:
+        raise AssertionError("offline CA-KF tune was not preserved")
+    if offline_tunes.get("ctra_ekf", {}).get("process_jerk_stddev_mps3") != 4.56:
+        raise AssertionError("offline CTRA-EKF tune was not preserved")
+    if "raw_gnss" in offline_tunes:
+        raise AssertionError("raw_gnss should not require startup tune values")
 
 
 def test_offline_recording_discovery_defaults_to_benchmark_results() -> None:
@@ -379,7 +426,8 @@ def run_all() -> None:
         test_old_logs_without_valid_for_metrics_use_timestamp_fallback(Path(directory))
     test_offline_recording_does_not_feed_filter_control()
     test_offline_recording_warmup_does_not_trigger_route_failure()
-    test_startup_test_setup_has_nested_offline_tabs()
+    test_startup_gui_uses_mode_based_tabs()
+    test_startup_tune_storage_feeds_closed_loop_and_offline_requests()
     test_offline_recording_discovery_defaults_to_benchmark_results()
 
 

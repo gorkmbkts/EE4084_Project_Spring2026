@@ -150,6 +150,7 @@ class OfflineReplayRunner:
             filter_ids.insert(0, "raw_gnss")
         if not filter_ids:
             raise ValueError("Select at least one filter for offline replay.")
+        resolved_filter_tunes = self._resolved_filter_tunes(filter_ids, request.filter_tunes)
 
         run_folder = unique_folder(evaluations_root(request.output_root), timestamp_id())
         run_folder.mkdir(parents=True, exist_ok=False)
@@ -158,6 +159,7 @@ class OfflineReplayRunner:
             "report_name": OFFLINE_REPORT_NAME,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "selected_filters": filter_ids,
+            "filter_tunes": resolved_filter_tunes,
             "sensor_log_paths": [str(path) for path in request.sensor_log_paths],
             "initial_condition_policy": request.initial_condition_policy,
             "replay_mode": "passive_offline_replay",
@@ -196,7 +198,7 @@ class OfflineReplayRunner:
                 run_folder=run_folder,
                 route_index=route_index,
                 filter_ids=filter_ids,
-                filter_tunes=request.filter_tunes,
+                filter_tunes=resolved_filter_tunes,
             )
             failures.extend(route_result["failures"])
             aggregate_rows.extend(route_result["aggregate_rows"])
@@ -289,7 +291,7 @@ class OfflineReplayRunner:
             "map_name": source_metadata.get("map_name"),
             "selected_filters": filter_ids,
             "filter_tunes": {
-                filter_id: dict(filter_tunes.get(filter_id, self._records.get(filter_id).tune if self._records.get(filter_id) else {}))
+                filter_id: dict(filter_tunes.get(filter_id, {}))
                 for filter_id in filter_ids
                 if filter_id != "raw_gnss"
             },
@@ -413,6 +415,24 @@ class OfflineReplayRunner:
             "last_imu_frame": last_imu_frame,
             "last_filter_diagnostics": last_diagnostics,
         }
+
+    def _resolved_filter_tunes(
+        self,
+        filter_ids: list[str],
+        tune_overrides: dict[str, dict[str, object]],
+    ) -> dict[str, dict[str, object]]:
+        resolved: dict[str, dict[str, object]] = {}
+        for filter_id in filter_ids:
+            if filter_id == "raw_gnss":
+                continue
+            record = self._records.get(filter_id)
+            if record is None:
+                resolved[filter_id] = dict(tune_overrides.get(filter_id, {}))
+                continue
+            tune = dict(record.tune)
+            tune.update(dict(tune_overrides.get(filter_id, {})))
+            resolved[filter_id] = tune
+        return resolved
 
 
 def _instantiate_filter(filter_class: type, projector: ReplayGnssProjector, tune: dict[str, object]) -> object:
