@@ -30,7 +30,7 @@ from src.evaluation.evaluation_artifacts import (
     write_json,
 )
 from src.evaluation.offline_replay_runner import OfflineReplayRequest, OfflineReplayRunner
-from src.evaluation.sensor_noise_tune_mapper import SensorNoiseTuneMapper, process_only_auto_tune_profile
+from src.evaluation.sensor_noise_tune_mapper import SensorNoiseTuneMapper, noise_signature, process_only_auto_tune_profile
 from src.evaluation.tune_config_schema import (
     BENCHMARK_MODE_CLOSED_LOOP,
     BENCHMARK_MODE_OFFLINE,
@@ -677,7 +677,7 @@ def tune_config_compatibility(config: dict[str, object], context: TuneContext) -
 
 def noise_profile_summary(logs: list[dict[str, object]]) -> dict[str, object]:
     labels = {str(log.get("sensor_noise_preset") or "Custom") for log in logs}
-    signatures = {json.dumps(log.get("sensor_noise_config") or {}, sort_keys=True) for log in logs}
+    signatures = {noise_signature(log.get("sensor_noise_config") or {}) for log in logs}
     if not logs:
         label = "Unknown"
     elif len(labels) == 1:

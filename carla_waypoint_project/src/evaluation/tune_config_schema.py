@@ -167,6 +167,94 @@ def build_offline_schema_v2_config(
     return data
 
 
+def build_closed_loop_schema_v2_config(
+    *,
+    filter_id: str,
+    filter_display_name: str,
+    tracking_mode: str,
+    sensor_noise_profile: str,
+    noise_sig: str,
+    representative_sensor_noise_config: dict[str, object],
+    vehicle_behavior_profile: str,
+    vehicle_behavior_config: dict[str, object],
+    actuator_realism_enabled: bool,
+    actuator_realism_profile: str,
+    actuator_realism_config: dict[str, object],
+    validation_route_name: str,
+    validation_route_map: str,
+    validation_route_id: str,
+    selected_logs: list[dict[str, object]],
+    candidate_generation_strategy: str,
+    optuna_available: bool,
+    optuna_study_path: Optional[str],
+    finalist_count: int,
+    offline_candidate_results: list[dict[str, object]],
+    closed_loop_validation_results: list[dict[str, object]],
+    score: object,
+    best_metrics: dict[str, object],
+    best_tune: dict[str, object],
+    base_tune: dict[str, object],
+    locked_sensor_noise_values: dict[str, object],
+    output_folder: Path,
+    extra: Optional[dict[str, object]] = None,
+) -> dict[str, object]:
+    tracking = str(tracking_mode or TRACKING_PASSIVE)
+    recommended_usage = "closed_loop_active" if tracking == TRACKING_ACTIVE else "closed_loop_passive"
+    data: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "filter_id": filter_id,
+        "filter_display_name": filter_display_name,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "created_by": "carla_waypoint_project.auto_tuner",
+        "tuner_kind": TUNER_KIND_CLOSED_LOOP,
+        "benchmark_mode": BENCHMARK_MODE_CLOSED_LOOP,
+        "tracking_mode": tracking,
+        "tune_scope": TUNE_SCOPE_CLOSED_LOOP_VALIDATED,
+        "recommended_usage": recommended_usage,
+        "sensor_noise_locked_from_profile": True,
+        "process_only_tune": True,
+        "sensor_noise_profile": sensor_noise_profile,
+        "noise_signature": noise_sig,
+        "representative_sensor_noise_config": dict(representative_sensor_noise_config),
+        "vehicle_behavior_profile": vehicle_behavior_profile,
+        "vehicle_behavior_signature": config_signature(vehicle_behavior_config),
+        "vehicle_behavior_config": dict(vehicle_behavior_config),
+        "actuator_realism_enabled": bool(actuator_realism_enabled),
+        "actuator_realism_profile": actuator_realism_profile,
+        "actuator_realism_signature": config_signature(actuator_realism_config),
+        "actuator_realism_config": dict(actuator_realism_config),
+        "validation_route_name": validation_route_name,
+        "validation_route_map": validation_route_map,
+        "validation_route_id": validation_route_id,
+        "validation_route_signature": config_signature(
+            {
+                "name": validation_route_name,
+                "map": validation_route_map,
+                "id": validation_route_id,
+            }
+        ),
+        "selected_offline_logs": selected_logs,
+        "selected_logs": selected_logs,
+        "candidate_generation_strategy": candidate_generation_strategy,
+        "optuna_available": bool(optuna_available),
+        "optuna_study_path": optuna_study_path,
+        "finalist_count": int(finalist_count),
+        "offline_candidate_results": offline_candidate_results,
+        "closed_loop_validation_results": closed_loop_validation_results,
+        "validated_in_closed_loop": True,
+        "score": score,
+        "best_metrics": dict(best_metrics),
+        "best_tune": dict(best_tune),
+        "base_tune": dict(base_tune),
+        "locked_sensor_noise_values": dict(locked_sensor_noise_values),
+        "project_commit": project_commit_hash(),
+        "output_folder": str(output_folder),
+    }
+    if extra:
+        data.update(extra)
+    return data
+
+
 def config_signature(config: object) -> str:
     if isinstance(config, dict):
         data = config
