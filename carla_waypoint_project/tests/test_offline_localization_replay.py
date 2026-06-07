@@ -45,6 +45,7 @@ from src.evaluation.benchmark_config import (  # noqa: E402
     validate_benchmark_config,
 )
 from src.evaluation.closed_loop_auto_tune import (  # noqa: E402
+    ClosedLoopAutoTuneRequest,
     ClosedLoopFinalist,
     ClosedLoopValidationRequest,
     ClosedLoopValidationRoute,
@@ -79,7 +80,7 @@ from src.visualization.startup_map_selector import (  # noqa: E402
     TOP_LEVEL_TABS,
     StartupMapSelector,
 )
-from src.core.app import AppClosedLoopValidationRunner  # noqa: E402
+from src.core.app import AppClosedLoopValidationRunner, SimulationApp  # noqa: E402
 
 
 def test_offline_replay_runs_on_short_saved_route_log(tmp_path: Path) -> None:
@@ -1013,6 +1014,82 @@ def test_pending_closed_loop_auto_tune_session_saves_explicit_handoff(tmp_path: 
         raise AssertionError("pending closed-loop auto tune handoff did not serialize required fields")
     if len(payload.get("offline_log_paths") or []) != 2:
         raise AssertionError("pending closed-loop auto tune handoff did not preserve offline log paths")
+
+
+def test_closed_loop_route_data_survives_pending_session_and_app_reconstruction(tmp_path: Path) -> None:
+    route = _short_saved_route()
+    route_data = route.to_dict()
+    session = PendingClosedLoopAutoTuneSession(
+        selected_filter="ca_kf",
+        tracking_mode=TRACKING_ACTIVE,
+        offline_log_paths=("log_a.csv",),
+        noise_signature="noise_sig",
+        validation_route_name=route.name,
+        validation_route_map=route.map_name or "",
+        validation_route_id="route_identity",
+        sensor_config={"preset_name": "Synthetic"},
+        vehicle_behavior_config={"preset_name": "Balanced"},
+        actuator_realism_config={"enabled": True},
+        trial_count=5,
+        finalist_count=1,
+        strategy="optuna_tpe",
+        output_root=str(tmp_path),
+        validation_route_data=route_data,
+    )
+    request = ClosedLoopAutoTuneRequest.from_pending_session(
+        session,
+        auto_tune_profile={"enabled": True, "primary": [{"key": "process_jerk_stddev_mps3", "min": 0.5, "max": 2.0}]},
+    )
+    validation_route = request.validation_routes[0]
+    if validation_route.route_data != route_data:
+        raise AssertionError("validation route data was not preserved from pending session")
+    if request.to_dict()["validation_routes"][0]["route_data"] != route_data:
+        raise AssertionError("validation route data was not preserved in request serialization")
+
+    from_dict_route = ClosedLoopValidationRoute.from_object({"route_data": route_data, "name": route.name, "map_name": route.map_name})
+    if from_dict_route.route_data != route_data:
+        raise AssertionError("ClosedLoopValidationRoute.from_object did not preserve route_data")
+
+    app = SimulationApp.__new__(SimulationApp)
+    app._test_route_store = None
+    finalist = ClosedLoopFinalist(
+        rank=1,
+        candidate_tune={},
+        offline_score=1.0,
+        offline_metrics={},
+        trial_index=1,
+        source_output_folder=None,
+    )
+    validation_request = ClosedLoopValidationRequest(
+        filter_id="ca_kf",
+        tracking_mode=TRACKING_ACTIVE,
+        finalist=finalist,
+        validation_route=validation_route,
+        sensor_noise_config={},
+        vehicle_behavior_config={},
+        actuator_realism_config={},
+        output_folder=tmp_path,
+    )
+    reconstructed = app._saved_route_from_validation_request(validation_request)
+    if reconstructed is None or reconstructed.to_dict() != route_data:
+        raise AssertionError("app-side validation route reconstruction did not use preserved route_data")
+
+
+def test_route_tab_lines_do_not_require_metrics() -> None:
+    app = SimulationApp.__new__(SimulationApp)
+    app._test_route_store = None
+    app._map_selector = None
+    app.route_planner = None
+    app._active_map_name = "Town01"
+    app._drive_mode = SimpleNamespace(value="MANUAL")
+    app._map_selection_active = False
+    app._test_route_authoring_active = False
+    app._route_activation_state = SimpleNamespace(value="IDLE")
+    app._planner_status = "Planner idle"
+    app._control_status_text = "Control idle"
+    lines = app._route_tab_lines()
+    if not lines or lines[0] != "Route:":
+        raise AssertionError("route tab lines did not render basic route state")
 
 
 def test_closed_loop_auto_tune_builder_requires_one_validation_route(tmp_path: Path) -> None:

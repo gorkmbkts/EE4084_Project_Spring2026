@@ -1296,11 +1296,6 @@ class SimulationApp:
         other_map_count = store.other_map_route_count() if store is not None else 0
         endpoints_ready = self._map_selector is not None and self._map_selector.endpoints is not None
         route = self.route_planner.get_route() if self.route_planner is not None else []
-        position_nees = metrics.get("mean_position_nees")
-        position_nees_label = "Position NEES"
-        if position_nees is None:
-            position_nees = metrics.get("mean_position_nees_diagonal_approx")
-            position_nees_label = "Position NEES approx"
         lines = [
             "Route:",
             f"Active map: {self._active_map_display_name()}",
