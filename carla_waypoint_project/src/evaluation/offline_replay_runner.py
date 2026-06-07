@@ -8,6 +8,7 @@ from datetime import datetime
 import inspect
 import json
 import math
+import os
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -85,6 +86,9 @@ ESTIMATE_FIELDNAMES = [
     "nees",
 ]
 
+AUTO_TUNE_REPLAY_CONTEXT = "auto_tune_trial"
+WINDOWS_PATH_LENGTH_GUARD = 240
+
 
 @dataclass(frozen=True)
 class OfflineReplayRequest:
@@ -159,6 +163,7 @@ class OfflineReplayRunner:
             run_folder = Path(request.run_folder_override)
         else:
             run_folder = unique_folder(evaluations_root(request.output_root), timestamp_id())
+        _validate_windows_path_length(run_folder, "Offline replay output folder")
         run_folder.mkdir(parents=True, exist_ok=False)
         metadata = {
             "mode": OFFLINE_MODE_NAME,
@@ -278,13 +283,21 @@ class OfflineReplayRunner:
 
         source_metadata = _source_metadata(log_path)
         route_name = _route_name(source_metadata, log_path)
-        route_folder = run_folder / f"route_{route_index:03d}_{slugify(route_name, 'route')}"
-        result_dir = route_folder / "replay_results"
-        metrics_dir = route_folder / "metrics"
-        plots_dir = route_folder / "plots"
+        compact = replay_context == AUTO_TUNE_REPLAY_CONTEXT
+        route_folder_name = f"r{route_index:03d}" if compact else f"route_{route_index:03d}_{slugify(route_name, 'route')}"
+        result_dir_name = "res" if compact else "replay_results"
+        metrics_dir_name = "met" if compact else "metrics"
+        plots_dir_name = "plt" if compact else "plots"
+        route_folder = run_folder / route_folder_name
+        result_dir = route_folder / result_dir_name
+        metrics_dir = route_folder / metrics_dir_name
+        plots_dir = route_folder / plots_dir_name
+        _validate_windows_path_length(route_folder, "Offline replay route output folder")
+        _validate_windows_path_length(metrics_dir / "summary_metrics.json", "Offline replay metrics file")
         result_dir.mkdir(parents=True, exist_ok=True)
         metrics_dir.mkdir(parents=True, exist_ok=True)
-        plots_dir.mkdir(parents=True, exist_ok=True)
+        if generate_plots:
+            plots_dir.mkdir(parents=True, exist_ok=True)
 
         raw_estimates = _raw_gnss_estimates(rows)
         raw_metrics = compute_localization_metrics(
@@ -305,7 +318,14 @@ class OfflineReplayRunner:
             "replay_context": replay_context,
             "sensor_log_path": str(log_path),
             "route_name": route_name,
+            "route_folder_name": route_folder.name,
             "map_name": source_metadata.get("map_name"),
+            "artifact_layout": {
+                "compact": compact,
+                "result_dir": result_dir.name,
+                "metrics_dir": metrics_dir.name,
+                "plots_dir": plots_dir.name if generate_plots else None,
+            },
             "selected_filters": filter_ids,
             "filter_tunes": {
                 filter_id: dict(filter_tunes.get(filter_id, {}))
@@ -940,6 +960,19 @@ def _optional_float(value: object) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _validate_windows_path_length(path: Path, label: str) -> None:
+    if os.name != "nt":
+        return
+    absolute = str(Path(path).resolve())
+    if len(absolute) < WINDOWS_PATH_LENGTH_GUARD:
+        return
+    raise ValueError(
+        f"{label} is likely too long for Windows ({len(absolute)} characters): {absolute}. "
+        "Auto-tune trials should use compact output paths; if this still occurs, move the project "
+        "or benchmark output root to a shorter directory."
+    )
 
 
 def _first_float(*values: object) -> Optional[float]:

@@ -30,6 +30,7 @@ from src.evaluation.offline_replay_runner import (  # noqa: E402
     _annotate_metric_ground_truth,
     _raw_gnss_estimates,
 )
+import src.evaluation.offline_replay_runner as offline_replay_runner_module  # noqa: E402
 from src.evaluation.filter_auto_tuner import AutoTuneRequest, FilterAutoTuner  # noqa: E402
 from src.evaluation.sensor_log_recorder import SENSOR_LOG_FIELDNAMES  # noqa: E402
 from src.evaluation.test_route_store import TestRouteStore  # noqa: E402
@@ -215,6 +216,78 @@ def test_old_logs_without_valid_for_metrics_use_timestamp_fallback(tmp_path: Pat
         raise AssertionError("old log did not use timestamp fallback")
     if not policy.get("warnings"):
         raise AssertionError("old log fallback warning missing")
+
+
+def test_auto_tune_replay_context_uses_compact_route_artifacts(tmp_path: Path) -> None:
+    output_root = tmp_path / "benchmark_results"
+    long_route_name = "very_long_recorded_route_name_" + "segment_" * 12
+    route_folder = output_root / "offline_localization" / "recordings" / "run_001" / "route_001_long"
+    route_folder.mkdir(parents=True)
+    log_path = route_folder / "sensor_log.csv"
+    _write_synthetic_log(log_path, long_route_name, "Carla/Maps/Town01_Opt")
+    write_json(
+        route_folder / "route_metadata.json",
+        {
+            "route": {"name": long_route_name, "map_name": "Carla/Maps/Town01_Opt"},
+            "map_name": "Carla/Maps/Town01_Opt",
+            "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+            "sensor_noise_config": {"preset_name": "Synthetic"},
+            "vehicle_behavior_config": {"preset_name": "Synthetic"},
+        },
+    )
+    write_json(
+        route_folder / "recording_summary.json",
+        {
+            "route_name": long_route_name,
+            "map_name": "Carla/Maps/Town01_Opt",
+            "sample_count": 24,
+            "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+        },
+    )
+    run_folder = output_root / "offline_localization" / "auto_tune" / "ca_kf" / "a_test" / "t001"
+    result = OfflineReplayRunner().run(
+        OfflineReplayRequest(
+            sensor_log_paths=(log_path,),
+            selected_filter_ids=("ca_kf",),
+            output_root=str(output_root),
+            run_folder_override=run_folder,
+            generate_plots=False,
+            replay_context="auto_tune_trial",
+        )
+    )
+    if result.output_folder != run_folder:
+        raise AssertionError("auto-tune replay did not use requested compact output folder")
+    route_output = run_folder / "r001"
+    if not (route_output / "res" / "raw_gnss_estimates.csv").exists():
+        raise AssertionError("auto-tune replay did not write compact result directory")
+    if not (route_output / "met" / "summary_metrics.json").exists():
+        raise AssertionError("auto-tune replay did not write compact metrics directory")
+    for forbidden in ("replay_results", "metrics", "plots"):
+        if (route_output / forbidden).exists():
+            raise AssertionError(f"auto-tune replay should not create verbose {forbidden} directory")
+    if any(path.name.startswith("route_001_") for path in run_folder.iterdir() if path.is_dir()):
+        raise AssertionError("auto-tune replay used descriptive route folder name")
+    metadata = json.loads((route_output / "metadata.json").read_text(encoding="utf-8"))
+    if metadata.get("route_name") != long_route_name:
+        raise AssertionError("compact auto-tune route metadata lost the descriptive route name")
+    if metadata.get("artifact_layout", {}).get("compact") is not True:
+        raise AssertionError("compact auto-tune route metadata did not describe compact artifact layout")
+
+
+def test_windows_path_length_guard_has_clear_error(tmp_path: Path) -> None:
+    original_os_name = offline_replay_runner_module.os.name
+    offline_replay_runner_module.os.name = "nt"
+    try:
+        try:
+            offline_replay_runner_module._validate_windows_path_length(tmp_path / ("x" * 260), "Synthetic output")
+        except ValueError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("Windows path length guard did not raise for a long path")
+    finally:
+        offline_replay_runner_module.os.name = original_os_name
+    if "likely too long for Windows" not in message or "shorter directory" not in message:
+        raise AssertionError(f"Windows path length guard message is not clear: {message}")
 
 
 def test_offline_recording_does_not_feed_filter_control() -> None:
@@ -421,8 +494,11 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
         if call.generate_plots:
             raise AssertionError("auto-tune trials should disable replay plots by default")
         path_text = str(call.run_folder_override).replace("\\", "/")
-        if "/offline_localization/auto_tune/ca_kf/" not in path_text or "/trial_outputs/trial_" not in path_text:
+        if "/offline_localization/auto_tune/ca_kf/" not in path_text or not path_text.rsplit("/", 1)[-1].startswith("t"):
             raise AssertionError(f"auto-tune trial output override used wrong location: {call.run_folder_override}")
+        run_id = Path(call.run_folder_override).parent.name
+        if not run_id.startswith("a") or len(run_id) > 16:
+            raise AssertionError(f"auto-tune run id is not compact: {run_id}")
     evaluations = output_root / "offline_localization" / "evaluations"
     if evaluations.exists() and any(evaluations.iterdir()):
         raise AssertionError("auto tuner polluted normal offline evaluations output")
@@ -434,7 +510,7 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
     if len(config.get("selected_logs") or []) != 2:
         raise AssertionError("saved best tune config did not preserve selected logs")
     best_output = str((config.get("best_metrics") or {}).get("output_folder") or "").replace("\\", "/")
-    if "/offline_localization/auto_tune/ca_kf/" not in best_output or "/trial_outputs/trial_" not in best_output:
+    if "/offline_localization/auto_tune/ca_kf/" not in best_output or not best_output.rsplit("/", 1)[-1].startswith("t"):
         raise AssertionError("best tune metadata did not reference auto_tune trial output")
     for key in ("objective_name", "score_formula", "score_notes", "nis_nees_policy", "unavailable_metrics_policy"):
         if not config.get(key):
@@ -689,6 +765,10 @@ def run_all() -> None:
     test_offline_replay_errors_use_sensor_timestamp_ground_truth()
     with tempfile.TemporaryDirectory() as directory:
         test_old_logs_without_valid_for_metrics_use_timestamp_fallback(Path(directory))
+    with tempfile.TemporaryDirectory() as directory:
+        test_auto_tune_replay_context_uses_compact_route_artifacts(Path(directory))
+    with tempfile.TemporaryDirectory() as directory:
+        test_windows_path_length_guard_has_clear_error(Path(directory))
     test_offline_recording_does_not_feed_filter_control()
     test_offline_recording_warmup_does_not_trigger_route_failure()
     test_startup_gui_uses_mode_based_tabs()

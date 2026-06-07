@@ -15,10 +15,10 @@ import matplotlib.pyplot as plt
 def generate_offline_route_plots(route_folder: Path) -> list[Path]:
     """Create required plots for one offline replay route folder."""
     route_folder = Path(route_folder)
-    plots_dir = route_folder / "plots"
+    plots_dir = route_folder / ("plt" if (route_folder / "res").exists() or (route_folder / "met").exists() else "plots")
     plots_dir.mkdir(parents=True, exist_ok=True)
-    result_dir = route_folder / "replay_results"
-    metrics_dir = route_folder / "metrics"
+    result_dir = route_folder / ("res" if (route_folder / "res").exists() else "replay_results")
+    metrics_dir = route_folder / ("met" if (route_folder / "met").exists() else "metrics")
     estimate_files = sorted(result_dir.glob("*_estimates.csv"))
     outputs = [
         _plot_trajectory(plots_dir / "trajectory_comparison.png", estimate_files),

@@ -20,7 +20,6 @@ from src.evaluation.evaluation_artifacts import (
     offline_root,
     read_json,
     slugify,
-    timestamp_id,
     unique_folder,
     write_json,
 )
@@ -186,7 +185,7 @@ class FilterAutoTuner:
                 "log_count": len(request.sensor_log_paths),
             },
         )
-        replay_folder = run_folder / "trial_outputs" / f"trial_{trial_index:03d}" / "replay_output"
+        replay_folder = run_folder / f"t{trial_index:03d}"
         try:
             result = self._runner_factory().run(
                 OfflineReplayRequest(
@@ -540,9 +539,7 @@ def _update_saved_config_index(output_root: str, filter_id: str, config_path: Pa
 
 
 def _run_folder_name(filter_id: str, sensor_log_paths: tuple[Path, ...], output_root: str) -> str:
-    logs = [_log_metadata(path, output_root) for path in sensor_log_paths]
-    noise = noise_profile_summary(logs)
-    return f"{timestamp_id()}_{slugify(filter_id, 'filter')}_{slugify(noise['label'], 'noise')}"
+    return "a" + datetime.now().strftime("%y%m%d_%H%M%S")
 
 
 def _log_metadata(path: Path, output_root: str) -> dict[str, object]:
@@ -653,7 +650,9 @@ def _unavailable_metrics_policy() -> str:
 
 def _trial_output_policy(request: AutoTuneRequest) -> dict[str, object]:
     return {
-        "trial_outputs_root": "trial_outputs",
+        "trial_outputs_root": ".",
+        "trial_output_folder_pattern": "t###",
+        "compact_trial_paths": True,
         "keep_trial_outputs": bool(request.keep_trial_outputs),
         "keep_only_best_trial_output": bool(request.keep_only_best_trial_output),
         "generate_trial_plots": bool(request.generate_trial_plots),
