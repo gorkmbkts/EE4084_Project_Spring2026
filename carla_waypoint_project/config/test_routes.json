@@ -1,21 +1,7 @@
 {
   "map_name": "Carla/Maps/Town01_Opt",
   "routes": [
-    {
-      "name": "mahalle_arasi",
-      "start": {
-        "x": 200.0160675048828,
-        "y": -312.7500305175781,
-        "z": 0.033660888671875
-      },
-      "goal": {
-        "x": 361.1760559082031,
-        "y": -68.50228118896484,
-        "z": 0.0043487548828125
-      },
-      "created_from": "2d_map",
-      "map_name": "Carla/Maps/Town04_Opt"
-    },
+
     {
       "name": "sadece_viraj",
       "start": {
@@ -90,6 +76,21 @@
       },
       "created_from": "2d_map",
       "map_name": "Carla/Maps/Town03_Opt"
+    },
+    {
+      "name": "mahalle",
+      "start": {
+        "x": 202.39710998535156,
+        "y": -335.58074951171875,
+        "z": 0.01959228515625
+      },
+      "goal": {
+        "x": 353.556396484375,
+        "y": -68.38951873779297,
+        "z": 0.0043487548828125
+      },
+      "created_from": "2d_map",
+      "map_name": "Carla/Maps/Town04_Opt"
     }
   ]
 }
