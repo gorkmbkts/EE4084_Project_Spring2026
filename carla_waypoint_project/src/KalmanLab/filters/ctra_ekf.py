@@ -61,6 +61,12 @@ TUNE = {
     "imu_yaw_stddev_deg": 5.0,
     "imu_yaw_rate_stddev_radps": 0.08,
     "imu_accel_stddev_mps2": 0.8,
+    "gnss_R_multiplier": 1.0,
+    "imu_yaw_R_multiplier": 1.0,
+    "imu_yaw_rate_R_multiplier": 1.0,
+    "imu_accel_R_multiplier": 1.0,
+    "process_noise_multiplier": 1.0,
+    "covariance_inflation": 1.0,
     "imu_accel_bias_mps2": 0.0,
     "initial_position_stddev_m": 4.0,
     "initial_yaw_stddev_deg": 25.0,
@@ -95,6 +101,12 @@ TUNE_SPECS = (
     ParameterSpec("imu_yaw_stddev_deg", "IMU yaw", 0.5, 45.0, "deg", 1, "Noise"),
     ParameterSpec("imu_yaw_rate_stddev_radps", "IMU yaw rate", 0.005, 1.0, "rad/s", 3, "Noise"),
     ParameterSpec("imu_accel_stddev_mps2", "IMU accel", 0.02, 5.0, "m/s2", 2, "Noise"),
+    ParameterSpec("gnss_R_multiplier", "Effective GNSS R", 0.10, 25.0, "x", 2, "Effective uncertainty"),
+    ParameterSpec("imu_yaw_R_multiplier", "Effective yaw R", 0.10, 25.0, "x", 2, "Effective uncertainty"),
+    ParameterSpec("imu_yaw_rate_R_multiplier", "Effective yaw-rate R", 0.10, 25.0, "x", 2, "Effective uncertainty"),
+    ParameterSpec("imu_accel_R_multiplier", "Effective accel R", 0.10, 25.0, "x", 2, "Effective uncertainty"),
+    ParameterSpec("process_noise_multiplier", "Process Q inflation", 0.10, 25.0, "x", 2, "Effective uncertainty"),
+    ParameterSpec("covariance_inflation", "Covariance inflation", 1.0, 5.0, "x", 2, "Effective uncertainty"),
     ParameterSpec("imu_accel_bias_mps2", "IMU accel bias", -5.0, 5.0, "m/s2", 2, "IMU convention"),
     ParameterSpec("initial_position_stddev_m", "Initial pos", 0.25, 25.0, "m", 2, "Initialization"),
     ParameterSpec("initial_yaw_stddev_deg", "Initial yaw", 1.0, 90.0, "deg", 1, "Initialization"),
@@ -129,10 +141,16 @@ AUTO_TUNE_PROFILE = {
         {"key": "process_yaw_accel_stddev_radps2", "scale": "log", "min": 0.05, "max": 2.5},
         {"key": "gnss_position_stddev_m", "scale": "log", "min": 0.40, "max": 6.0},
         {"key": "imu_yaw_rate_stddev_radps", "scale": "log", "min": 0.01, "max": 0.5},
+        {"key": "gnss_R_multiplier", "scale": "log", "min": 0.25, "max": 16.0},
+        {"key": "imu_yaw_rate_R_multiplier", "scale": "log", "min": 0.25, "max": 16.0},
+        {"key": "imu_accel_R_multiplier", "scale": "log", "min": 0.25, "max": 16.0},
+        {"key": "process_noise_multiplier", "scale": "log", "min": 0.25, "max": 12.0},
     ],
     "secondary": [
         {"key": "imu_accel_stddev_mps2", "scale": "log", "min": 0.05, "max": 3.0},
         {"key": "imu_yaw_stddev_deg", "scale": "log", "min": 1.0, "max": 20.0},
+        {"key": "imu_yaw_R_multiplier", "scale": "log", "min": 0.25, "max": 16.0},
+        {"key": "covariance_inflation", "scale": "log", "min": 1.0, "max": 3.0},
     ],
     "search": {
         "default_trials": 30,
@@ -265,12 +283,14 @@ class _CtraEkfCore:
     """EKF core for [px, py, yaw, speed, acceleration, yaw_rate]^T."""
 
     def __init__(self, tune: dict[str, float]) -> None:
-        self._jerk_var = float(tune["process_jerk_stddev_mps3"]) ** 2
-        self._yaw_accel_var = float(tune["process_yaw_accel_stddev_radps2"]) ** 2
-        self._position_var = float(tune["gnss_position_stddev_m"]) ** 2
-        self._yaw_var = math.radians(float(tune["imu_yaw_stddev_deg"])) ** 2
-        self._yaw_rate_var = float(tune["imu_yaw_rate_stddev_radps"]) ** 2
-        self._accel_var = float(tune["imu_accel_stddev_mps2"]) ** 2
+        process_multiplier = max(1.0e-6, float(tune.get("process_noise_multiplier", 1.0)))
+        self._jerk_var = float(tune["process_jerk_stddev_mps3"]) ** 2 * process_multiplier
+        self._yaw_accel_var = float(tune["process_yaw_accel_stddev_radps2"]) ** 2 * process_multiplier
+        self._position_var = float(tune["gnss_position_stddev_m"]) ** 2 * max(1.0e-6, float(tune.get("gnss_R_multiplier", 1.0)))
+        self._yaw_var = math.radians(float(tune["imu_yaw_stddev_deg"])) ** 2 * max(1.0e-6, float(tune.get("imu_yaw_R_multiplier", 1.0)))
+        self._yaw_rate_var = float(tune["imu_yaw_rate_stddev_radps"]) ** 2 * max(1.0e-6, float(tune.get("imu_yaw_rate_R_multiplier", 1.0)))
+        self._accel_var = float(tune["imu_accel_stddev_mps2"]) ** 2 * max(1.0e-6, float(tune.get("imu_accel_R_multiplier", 1.0)))
+        self._covariance_inflation = max(1.0, float(tune.get("covariance_inflation", 1.0)))
         self._initial_position_var = float(tune["initial_position_stddev_m"]) ** 2
         self._initial_yaw_var = math.radians(float(tune["initial_yaw_stddev_deg"])) ** 2
         self._initial_speed_var = float(tune["initial_speed_stddev_mps"]) ** 2
@@ -375,6 +395,8 @@ class _CtraEkfCore:
         f = numerical_jacobian(transition, flat_state)
         q = self._process_noise(float(self._x[2, 0]), dt)
         p = f @ self._p @ f.T + q
+        if self._covariance_inflation > 1.0:
+            p *= self._covariance_inflation
 
         if not self._set_state_and_covariance(predicted, p, "predict"):
             return
@@ -774,6 +796,14 @@ class Filter:
                 "imu_yaw": 1,
                 "imu_yaw_rate": 1,
                 "imu_longitudinal_accel": 1,
+            },
+            "effective_uncertainty_multipliers": {
+                "gnss_R_multiplier": float(self._tune.get("gnss_R_multiplier", 1.0)),
+                "imu_yaw_R_multiplier": float(self._tune.get("imu_yaw_R_multiplier", 1.0)),
+                "imu_yaw_rate_R_multiplier": float(self._tune.get("imu_yaw_rate_R_multiplier", 1.0)),
+                "imu_accel_R_multiplier": float(self._tune.get("imu_accel_R_multiplier", 1.0)),
+                "process_noise_multiplier": float(self._tune.get("process_noise_multiplier", 1.0)),
+                "covariance_inflation": float(self._tune.get("covariance_inflation", 1.0)),
             },
             "last_update_type": self._filter.last_update_type,
             "latest_predicted_state": self._filter.latest_predicted_state,

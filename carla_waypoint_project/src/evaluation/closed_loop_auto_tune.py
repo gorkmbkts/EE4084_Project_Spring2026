@@ -642,11 +642,19 @@ def _validation_result_from_runner(result: object, request: ClosedLoopValidation
 
 
 def _select_finalists(offline_result: AutoTuneResult, finalist_count: int) -> list[ClosedLoopFinalist]:
-    successful = [
+    successful_all = [
         trial
         for trial in offline_result.trial_results
         if not trial.failed and trial.score is not None and math.isfinite(float(trial.score))
     ]
+    non_baseline = [
+        trial
+        for trial in successful_all
+        if getattr(trial, "candidate_type", "") not in {"default_base", "current_ui"}
+    ]
+    verified = [trial for trial in non_baseline if getattr(trial, "stage", "") == "verification"]
+    search = [trial for trial in non_baseline if getattr(trial, "stage", "search") == "search"]
+    successful = verified or search or non_baseline or successful_all
     ordered = sorted(successful, key=lambda trial: float(trial.score))
     finalists: list[ClosedLoopFinalist] = []
     for rank, trial in enumerate(ordered[: max(1, int(finalist_count))], start=1):

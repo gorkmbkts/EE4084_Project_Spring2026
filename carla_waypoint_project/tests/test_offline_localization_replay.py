@@ -32,7 +32,7 @@ from src.evaluation.offline_replay_runner import (  # noqa: E402
     _raw_gnss_estimates,
 )
 import src.evaluation.offline_replay_runner as offline_replay_runner_module  # noqa: E402
-from src.evaluation.filter_auto_tuner import AutoTuneRequest, FilterAutoTuner  # noqa: E402
+from src.evaluation.filter_auto_tuner import AutoTuneRequest, FilterAutoTuner, objective_score  # noqa: E402
 import src.evaluation.filter_auto_tuner as filter_auto_tuner_module  # noqa: E402
 from src.evaluation.sensor_log_recorder import SENSOR_LOG_FIELDNAMES  # noqa: E402
 from src.evaluation.test_route_store import TestRouteStore  # noqa: E402
@@ -51,7 +51,7 @@ from src.evaluation.closed_loop_auto_tune import (  # noqa: E402
     ClosedLoopValidationRoute,
     PendingClosedLoopAutoTuneSession,
 )
-from src.evaluation.consistency_metrics import position_nees, summarize_nis_by_type  # noqa: E402
+from src.evaluation.consistency_metrics import consistency_report_from_summaries, position_nees, summarize_nis_by_type  # noqa: E402
 from src.evaluation.sensor_noise_tune_mapper import (  # noqa: E402
     SensorNoiseTuneMapper,
     noise_signature,
@@ -440,6 +440,43 @@ def test_type_aware_nis_and_position_nees_helpers() -> None:
     if approx["position_nees"] is not None or approx["position_nees_source"] != "diagonal_approx":
         raise AssertionError("diagonal fallback was not clearly labeled as approximate")
 
+    report = consistency_report_from_summaries(
+        nis_by_type_summary={
+            "gnss_position": {"mean": 2.0, "sample_count": 5, "expected_dimension": 2},
+            "imu_yaw_rate": {"mean": 8.0, "sample_count": 5, "expected_dimension": 1},
+        },
+        mean_position_nees=0.2,
+        position_nees_source="full_2x2",
+    )
+    if report["nis_by_type"]["gnss_position"]["status"] != "good":
+        raise AssertionError("GNSS NIS status should be good near its expected dimension")
+    if report["nis_by_type"]["imu_yaw_rate"]["status"] != "severe":
+        raise AssertionError("IMU yaw-rate NIS status should flag severe overconfidence")
+    if report["position_nees"]["behavior"] != "underconfident":
+        raise AssertionError("low position NEES should explain underconfidence")
+
+
+def test_auto_tune_objective_modes_apply_consistency_dimension_penalties() -> None:
+    good_metrics = {
+        "mean_eval_position_rmse_m": 1.0,
+        "mean_yaw_rmse_deg": 0.0,
+        "divergence_event_count": 0,
+        "nis_by_type_summary": {"gnss_position": {"mean": 2.0, "sample_count": 10, "expected_dimension": 2}},
+        "mean_position_nees": 2.0,
+        "position_nees_source": "full_2x2",
+    }
+    severe_metrics = {
+        **good_metrics,
+        "mean_eval_position_rmse_m": 0.9,
+        "nis_by_type_summary": {"imu_yaw_rate": {"mean": 10.0, "sample_count": 10, "expected_dimension": 1}},
+        "mean_position_nees": 12.0,
+    }
+    if objective_score(severe_metrics, "min_eval_rmse") >= objective_score(good_metrics, "min_eval_rmse"):
+        raise AssertionError("pure RMSE objective should prefer the lower-RMSE candidate")
+    for mode in ("min_rmse_with_consistency_guard", "consistency_first", "balanced_score"):
+        if objective_score(severe_metrics, mode) <= objective_score(good_metrics, mode):
+            raise AssertionError(f"{mode} should penalize severe type-aware NIS/NEES inconsistency")
+
 
 def test_localization_metrics_expose_type_aware_nis_and_corrected_nees() -> None:
     metrics = compute_localization_metrics(
@@ -706,6 +743,7 @@ def test_filter_auto_tuner_uses_compact_final_output_under_long_root(tmp_path: P
             calls.append(request)
             folder = Path(request.run_folder_override)
             folder.mkdir(parents=True, exist_ok=True)
+            rmse = float(request.filter_tunes["ca_kf"].get("process_jerk_stddev_mps3", 1.2))
             write_json(
                 folder / "aggregate_summary.json",
                 {
@@ -713,7 +751,7 @@ def test_filter_auto_tuner_uses_compact_final_output_under_long_root(tmp_path: P
                     "aggregate_rows": [
                         {
                             "filter_id": "ca_kf",
-                            "eval_position_rmse_m": 1.0,
+                            "eval_position_rmse_m": rmse,
                             "yaw_rmse_deg": 0.0,
                             "divergence_event_count": 0,
                         }
@@ -760,6 +798,154 @@ def test_filter_auto_tuner_uses_compact_final_output_under_long_root(tmp_path: P
     )
     if not any(str(item.get("path")) == str(result.saved_config_path) for item in listed):
         raise AssertionError("saved tune browser did not find compact offline config under long output root")
+
+
+def test_filter_auto_tuner_reports_no_improvement_and_does_not_save_when_candidates_are_worse(tmp_path: Path) -> None:
+    output_root = tmp_path / "benchmark_results"
+    route_folder = output_root / "offline_localization" / "recordings" / "run_001" / "route_001"
+    route_folder.mkdir(parents=True)
+    log_path = route_folder / "sensor_log.csv"
+    log_path.write_text("timestamp\n0.0\n", encoding="utf-8")
+    write_json(
+        route_folder / "route_metadata.json",
+        {
+            "route": {"name": "route_1", "map_name": "Town01"},
+            "map_name": "Town01",
+            "sensor_noise_config": {"preset_name": "Synthetic", "gnss_position_stddev_m": 1.25},
+            "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+        },
+    )
+    write_json(route_folder / "recording_summary.json", {"route_name": "route_1", "map_name": "Town01", "sample_count": 1})
+
+    class FakeRunner:
+        def run(self, request: OfflineReplayRequest) -> SimpleNamespace:
+            folder = Path(request.run_folder_override)
+            folder.mkdir(parents=True)
+            process_noise = float(request.filter_tunes["ca_kf"].get("process_jerk_stddev_mps3", 1.2))
+            rmse = 1.0 if math.isclose(process_noise, 1.2, rel_tol=1.0e-12, abs_tol=1.0e-12) else 1.3
+            write_json(
+                folder / "aggregate_summary.json",
+                {
+                    "route_count": 1,
+                    "aggregate_rows": [
+                        {
+                            "filter_id": "ca_kf",
+                            "route_name": "route_1",
+                            "eval_position_rmse_m": rmse,
+                            "yaw_rmse_deg": 0.0,
+                            "divergence_event_count": 0,
+                            "nis_by_type_summary": {
+                                "gnss_position": {"mean": 2.0, "sample_count": 1, "expected_dimension": 2}
+                            },
+                            "mean_position_nees": 2.0,
+                            "position_nees_source": "full_2x2",
+                        }
+                    ],
+                },
+            )
+            return SimpleNamespace(output_folder=folder, failures=())
+
+    result = FilterAutoTuner(runner_factory=FakeRunner).run(
+        AutoTuneRequest(
+            filter_id="ca_kf",
+            sensor_log_paths=(log_path,),
+            base_tune={"gnss_position_stddev_m": 1.25, "process_jerk_stddev_mps3": 1.2},
+            auto_tune_profile={"enabled": True, "primary": [{"key": "process_jerk_stddev_mps3", "min": 0.5, "max": 2.0}]},
+            max_trials=2,
+            output_root=str(output_root),
+        )
+    )
+    if result.saved_config_path is not None or (result.output_folder / "best_tune.json").exists():
+        raise AssertionError("auto tuner saved a best_tune.json even though every generated candidate was worse")
+    if result.best_tune or result.best_score is not None or result.improved_over_baseline:
+        raise AssertionError("auto tuner reported an improvement when baseline won verification")
+    if result.recommendation_status != "no_improved_tune_found":
+        raise AssertionError("auto tuner did not clearly report no improvement")
+    for name in (
+        "auto_tune_summary.json",
+        "candidates.json",
+        "trials.csv",
+        "verification_leaderboard.csv",
+        "per_route_metrics.csv",
+        "consistency_report.json",
+    ):
+        if not (result.output_folder / name).exists():
+            raise AssertionError(f"auto tuner did not write transparent artifact: {name}")
+    summary = json.loads((result.output_folder / "auto_tune_summary.json").read_text(encoding="utf-8"))
+    if summary.get("improved_over_baseline") is not False or summary.get("message") != "No improved tune found.":
+        raise AssertionError("auto-tune summary did not record the no-improvement result")
+    winner = summary.get("verification_winner") or {}
+    if winner.get("candidate_type") not in {"default_base", "current_ui"}:
+        raise AssertionError("verification should have selected the baseline when candidates were worse")
+
+
+def test_filter_auto_tuner_rejects_candidate_that_fails_verification(tmp_path: Path) -> None:
+    output_root = tmp_path / "benchmark_results"
+    route_folder = output_root / "offline_localization" / "recordings" / "run_001" / "route_001"
+    route_folder.mkdir(parents=True)
+    log_path = route_folder / "sensor_log.csv"
+    log_path.write_text("timestamp\n0.0\n", encoding="utf-8")
+    write_json(
+        route_folder / "route_metadata.json",
+        {
+            "route": {"name": "route_1", "map_name": "Town01"},
+            "map_name": "Town01",
+            "sensor_noise_config": {"preset_name": "Synthetic", "gnss_position_stddev_m": 1.25},
+            "recording_driver": RECORDING_DRIVER_GROUND_TRUTH_CONTROLLER,
+        },
+    )
+    write_json(route_folder / "recording_summary.json", {"route_name": "route_1", "map_name": "Town01", "sample_count": 1})
+    evaluations_by_process_noise: dict[float, int] = {}
+
+    class FakeRunner:
+        def run(self, request: OfflineReplayRequest) -> SimpleNamespace:
+            folder = Path(request.run_folder_override)
+            folder.mkdir(parents=True)
+            process_noise = round(float(request.filter_tunes["ca_kf"].get("process_jerk_stddev_mps3", 1.2)), 12)
+            evaluations_by_process_noise[process_noise] = evaluations_by_process_noise.get(process_noise, 0) + 1
+            if math.isclose(process_noise, 1.2, rel_tol=1.0e-12, abs_tol=1.0e-12):
+                rmse = 1.0
+            elif evaluations_by_process_noise[process_noise] == 1:
+                rmse = 0.5
+            else:
+                rmse = 1.4
+            write_json(
+                folder / "aggregate_summary.json",
+                {
+                    "route_count": 1,
+                    "aggregate_rows": [
+                        {
+                            "filter_id": "ca_kf",
+                            "route_name": "route_1",
+                            "eval_position_rmse_m": rmse,
+                            "yaw_rmse_deg": 0.0,
+                            "divergence_event_count": 0,
+                        }
+                    ],
+                },
+            )
+            return SimpleNamespace(output_folder=folder, failures=())
+
+    result = FilterAutoTuner(runner_factory=FakeRunner).run(
+        AutoTuneRequest(
+            filter_id="ca_kf",
+            sensor_log_paths=(log_path,),
+            base_tune={"gnss_position_stddev_m": 1.25, "process_jerk_stddev_mps3": 1.2},
+            auto_tune_profile={"enabled": True, "primary": [{"key": "process_jerk_stddev_mps3", "min": 0.5, "max": 2.0}]},
+            max_trials=1,
+            output_root=str(output_root),
+        )
+    )
+    search_results = [trial for trial in result.trial_results if trial.stage == "search"]
+    verification_results = [trial for trial in result.verification_results if trial.candidate_type.startswith("generated")]
+    if not search_results or not verification_results:
+        raise AssertionError("test did not exercise both search and verification candidates")
+    if float(search_results[0].score) >= 1.0:
+        raise AssertionError("test setup expected the generated candidate to look better during search")
+    if float(verification_results[0].score) <= 1.0:
+        raise AssertionError("test setup expected the generated candidate to fail verification")
+    if result.saved_config_path is not None or result.best_tune or result.improved_over_baseline:
+        raise AssertionError("auto tuner recommended a tune that verification proved worse than baseline")
 
 
 def test_filter_auto_tuner_rejects_mixed_noise_signatures_by_default(tmp_path: Path) -> None:

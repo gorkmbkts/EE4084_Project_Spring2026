@@ -7,6 +7,7 @@ from typing import Iterable, Optional
 
 from config.settings import BENCHMARK
 from src.evaluation.consistency_metrics import (
+    consistency_report_from_summaries,
     position_nees,
     summarize_nis_by_type,
     summarize_position_nees,
@@ -88,6 +89,12 @@ def compute_localization_metrics(
         "position_nees_available": bool(eval_metrics["eval_position_nees_available"]),
         "position_nees_diagonal_approx_available": bool(eval_metrics["eval_position_nees_diagonal_approx_available"]),
     }
+    metrics["consistency_report"] = consistency_report_from_summaries(
+        nis_by_type_summary=metrics["nis_by_type_summary"],
+        mean_position_nees=metrics["mean_position_nees"],
+        mean_position_nees_diagonal_approx=metrics["mean_position_nees_diagonal_approx"],
+        position_nees_source=metrics["position_nees_source"],
+    )
     return metrics
 
 

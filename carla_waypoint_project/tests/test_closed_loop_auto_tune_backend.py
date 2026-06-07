@@ -175,15 +175,16 @@ def test_closed_loop_autotuner_candidate_generation_uses_compact_replay_staging(
         validation_runner=runner,
     ).run(request)
 
-    if len(replay_calls) != 1:
-        raise AssertionError("closed-loop candidate generation did not run one offline replay trial")
-    replay_path = Path(replay_calls[0].run_folder_override)
-    path_text = str(replay_path).replace("\\", "/")
-    if "/_tmp/at/" not in path_text:
-        raise AssertionError(f"closed-loop candidate replay did not use compact staging: {replay_path}")
-    metrics_path = replay_path / "r001" / "met" / "summary_metrics.json"
-    if len(str(metrics_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
-        raise AssertionError(f"closed-loop candidate replay metrics path is too long: {metrics_path}")
+    if len(replay_calls) < 3:
+        raise AssertionError("closed-loop candidate generation did not run baseline/search/verification offline replays")
+    for replay_call in replay_calls:
+        replay_path = Path(replay_call.run_folder_override)
+        path_text = str(replay_path).replace("\\", "/")
+        if "/_tmp/at/" not in path_text:
+            raise AssertionError(f"closed-loop candidate replay did not use compact staging: {replay_path}")
+        metrics_path = replay_path / "r001" / "met" / "summary_metrics.json"
+        if len(str(metrics_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
+            raise AssertionError(f"closed-loop candidate replay metrics path is too long: {metrics_path}")
 
     config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
     final_summary_path = result.output_folder / "closed_loop_auto_tune_summary.json"

@@ -17,6 +17,11 @@ NIS_EXPECTED_DIMENSIONS: dict[str, int] = {
 }
 
 
+POSITION_NEES_EXPECTED_DIMENSION = 2
+
+_SEVERITY_RANK = {"unavailable": 0, "good": 1, "warning": 2, "severe": 3}
+
+
 MEASUREMENT_NOISE_TUNE_KEYS = frozenset(
     {
         "gnss_position_stddev_m",
@@ -120,6 +125,73 @@ def summarize_nis_by_type(rows: Iterable[dict[str, object]], field: str = "nis_b
     }
 
 
+def consistency_report_from_summaries(
+    *,
+    nis_by_type_summary: object,
+    mean_position_nees: object = None,
+    mean_position_nees_diagonal_approx: object = None,
+    position_nees_source: object = None,
+) -> dict[str, object]:
+    """Classify NIS/NEES means against their expected dimensions."""
+    nis_report: dict[str, object] = {}
+    worst = "unavailable"
+    consistency_error = 0.0
+    nis_summary = _dict_value(nis_by_type_summary)
+    for update_type, raw_stats in sorted(nis_summary.items()):
+        if not isinstance(raw_stats, dict):
+            continue
+        expected = optional_float(raw_stats.get("expected_dimension"))
+        if expected is None:
+            expected = optional_float(NIS_EXPECTED_DIMENSIONS.get(str(update_type)))
+        mean_value = optional_float(raw_stats.get("mean"))
+        item = _classify_mean_against_dimension(mean_value, expected, sample_count=raw_stats.get("sample_count"))
+        item.update(
+            {
+                "mean": mean_value,
+                "expected_dimension": int(expected) if expected is not None and expected.is_integer() else expected,
+                "sample_count": raw_stats.get("sample_count"),
+                "p95": raw_stats.get("p95"),
+                "p99": raw_stats.get("p99"),
+            }
+        )
+        nis_report[str(update_type)] = item
+        worst = _max_severity(worst, str(item.get("status") or "unavailable"))
+        consistency_error += float(item.get("consistency_error") or 0.0)
+
+    nees_value = optional_float(mean_position_nees)
+    nees_source = str(position_nees_source or "unavailable")
+    if nees_value is None:
+        nees_value = optional_float(mean_position_nees_diagonal_approx)
+        if nees_value is not None and nees_source == "unavailable":
+            nees_source = "diagonal_approx"
+    nees_report = _classify_mean_against_dimension(nees_value, float(POSITION_NEES_EXPECTED_DIMENSION), sample_count=None)
+    nees_report.update(
+        {
+            "mean": nees_value,
+            "expected_dimension": POSITION_NEES_EXPECTED_DIMENSION,
+            "source": nees_source,
+        }
+    )
+    worst = _max_severity(worst, str(nees_report.get("status") or "unavailable"))
+    consistency_error += float(nees_report.get("consistency_error") or 0.0)
+
+    return {
+        "overall_status": worst,
+        "consistency_error": consistency_error,
+        "nis_by_type": nis_report,
+        "position_nees": nees_report,
+        "interpretation": (
+            "For NIS and NEES, the expected mean is the measurement/state dimension. "
+            "Means far above dimension indicate overconfident covariance/noise assumptions; "
+            "means far below dimension indicate underconfident assumptions."
+        ),
+    }
+
+
+def severity_rank(status: object) -> int:
+    return _SEVERITY_RANK.get(str(status or "unavailable"), 0)
+
+
 def summarize_position_nees(rows: Iterable[dict[str, object]]) -> dict[str, object]:
     row_list = list(rows)
     full = summarize_values(row.get("position_nees") for row in row_list)
@@ -142,6 +214,54 @@ def summarize_position_nees(rows: Iterable[dict[str, object]]) -> dict[str, obje
         "position_nees_available": bool(full["sample_count"]),
         "position_nees_diagonal_approx_available": bool(approx["sample_count"]),
     }
+
+
+def _classify_mean_against_dimension(
+    mean_value: Optional[float],
+    expected_dimension: Optional[float],
+    sample_count: object,
+) -> dict[str, object]:
+    if mean_value is None or expected_dimension is None or expected_dimension <= 0.0:
+        return {
+            "status": "unavailable",
+            "behavior": "unavailable",
+            "ratio_to_expected": None,
+            "consistency_error": 0.0,
+            "explanation": "Metric is unavailable or has no expected dimension.",
+        }
+    ratio = mean_value / expected_dimension
+    behavior = "overconfident" if ratio > 1.0 else "underconfident" if ratio < 1.0 else "well_matched"
+    if 0.5 <= ratio <= 2.0:
+        status = "good"
+    elif 0.25 <= ratio <= 4.0:
+        status = "warning"
+    else:
+        status = "severe"
+    samples = optional_float(sample_count)
+    sample_note = f" over {int(samples)} samples" if samples is not None and samples > 0 else ""
+    if behavior == "overconfident":
+        explanation = (
+            f"Mean {mean_value:.3g} is {ratio:.3g}x the expected dimension {expected_dimension:g}{sample_note}; "
+            "the filter is overconfident, so R/Q/P are likely too small for this update type."
+        )
+    elif behavior == "underconfident":
+        explanation = (
+            f"Mean {mean_value:.3g} is {ratio:.3g}x the expected dimension {expected_dimension:g}{sample_note}; "
+            "the filter is underconfident, so R/Q/P are likely too large for this update type."
+        )
+    else:
+        explanation = f"Mean {mean_value:.3g} matches the expected dimension {expected_dimension:g}{sample_note}."
+    return {
+        "status": status,
+        "behavior": behavior,
+        "ratio_to_expected": ratio,
+        "consistency_error": abs(math.log(max(ratio, 1.0e-12))),
+        "explanation": explanation,
+    }
+
+
+def _max_severity(left: str, right: str) -> str:
+    return left if severity_rank(left) >= severity_rank(right) else right
 
 
 def optional_float(value: object) -> Optional[float]:

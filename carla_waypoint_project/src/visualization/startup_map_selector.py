@@ -76,6 +76,26 @@ TOP_LEVEL_TABS = (
     "Closed Loop Benchmark",
     "Offline Localization Benchmark",
 )
+
+AUTO_TUNE_OBJECTIVE_MODES = (
+    "min_eval_rmse",
+    "min_rmse_with_consistency_guard",
+    "consistency_first",
+    "balanced_score",
+)
+
+
+def _auto_tune_objective_mode(value: object) -> str:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "rmse_consistency": "balanced_score",
+        "balanced": "balanced_score",
+        "rmse": "min_eval_rmse",
+        "min_rmse": "min_eval_rmse",
+        "consistency_guard": "min_rmse_with_consistency_guard",
+    }
+    text = aliases.get(text, text)
+    return text if text in AUTO_TUNE_OBJECTIVE_MODES else "balanced_score"
 CLOSED_LOOP_SUBTABS = (
     "Filters",
     "Sensor Noise",
@@ -201,6 +221,7 @@ class StartupMapSelector:
         self._auto_tune_log_scroll = 0
         self._auto_tune_log_rects: dict[int, pygame.Rect] = {}
         self._auto_tune_trials = 0
+        self._auto_tune_objective_mode = "balanced_score"
         self._auto_tune_running = False
         self._auto_tune_stop_requested = False
         self._auto_tune_status_lines: list[str] = []
@@ -213,6 +234,7 @@ class StartupMapSelector:
         self._auto_tune_refresh_logs_rect = pygame.Rect(0, 0, 1, 1)
         self._auto_tune_select_all_noise_rect = pygame.Rect(0, 0, 1, 1)
         self._auto_tune_clear_logs_rect = pygame.Rect(0, 0, 1, 1)
+        self._auto_tune_objective_rect = pygame.Rect(0, 0, 1, 1)
         self._closed_loop_auto_tune_modal_open = False
         self._closed_loop_auto_tune_filter_id = ""
         self._closed_loop_auto_tune_selected_log_indices: set[int] = set()
@@ -2213,6 +2235,7 @@ class StartupMapSelector:
         self._auto_tune_filter_id = filter_id
         search = record.auto_tune_profile.get("search") if isinstance(record.auto_tune_profile.get("search"), dict) else {}
         self._auto_tune_trials = int(search.get("default_trials") or 30)
+        self._auto_tune_objective_mode = _auto_tune_objective_mode(record.auto_tune_profile.get("objective"))
         self._auto_tune_selected_log_indices = set()
         self._auto_tune_log_scroll = 0
         self._auto_tune_stop_requested = False
@@ -2253,6 +2276,10 @@ class StartupMapSelector:
         if self._auto_tune_select_all_noise_rect.collidepoint(position):
             self._select_all_auto_tune_matching_noise()
             return _NoSelection
+        if self._auto_tune_objective_rect.collidepoint(position):
+            if not self._auto_tune_running:
+                self._cycle_auto_tune_objective()
+            return _NoSelection
         for index, rect in self._auto_tune_log_rects.items():
             if rect.collidepoint(position):
                 if index in self._auto_tune_selected_log_indices:
@@ -2270,11 +2297,15 @@ class StartupMapSelector:
                 self._append_auto_tune_status("Stop requested. Auto tune will stop after the current trial.")
             return _NoSelection
         if self._auto_tune_save_rect.collidepoint(position):
-            if self._auto_tune_result is not None and self._auto_tune_result.saved_config_path is not None:
-                self._append_auto_tune_status(f"Best tune saved at: {self._auto_tune_result.saved_config_path}")
+            if (
+                self._auto_tune_result is not None
+                and self._auto_tune_result.improved_over_baseline
+                and self._auto_tune_result.saved_config_path is not None
+            ):
+                self._append_auto_tune_status(f"Verified tune saved at: {self._auto_tune_result.saved_config_path}")
             return _NoSelection
         if self._auto_tune_apply_rect.collidepoint(position):
-            if self._auto_tune_result is not None and self._auto_tune_result.best_tune:
+            if self._auto_tune_result is not None and self._auto_tune_result.improved_over_baseline and self._auto_tune_result.best_tune:
                 self._apply_tune_to_filter(self._auto_tune_result.filter_id, self._auto_tune_result.best_tune)
                 self._offline_saved_tune_status = f"Applied auto-tuned values to {self._auto_tune_result.filter_id}."
                 self._append_auto_tune_status(self._offline_saved_tune_status)
@@ -2311,7 +2342,7 @@ class StartupMapSelector:
             base_tune=self._current_filter_tune_values(record.filter_id),
             auto_tune_profile=dict(record.auto_tune_profile),
             max_trials=max(1, int(self._auto_tune_trials or 30)),
-            objective_name=str(record.auto_tune_profile.get("objective") or "rmse_consistency"),
+            objective_name=self._auto_tune_objective_mode,
             keep_trial_outputs=bool(search.get("keep_trial_outputs", True)),
             keep_only_best_trial_output=bool(search.get("keep_only_best_trial_output", False)),
             generate_trial_plots=bool(search.get("generate_trial_plots", False)),
@@ -2333,14 +2364,29 @@ class StartupMapSelector:
         def number_text(value: object, suffix: str = "") -> str:
             return f"{float(value):.3f}{suffix}" if isinstance(value, (int, float)) else "n/a"
 
-        if event_name == "trial_started":
+        if event_name == "baseline_started":
+            self._append_auto_tune_status(f"Baseline phase started | candidates {payload.get('candidate_count') or 0}", redraw=False)
+        elif event_name == "baseline_finished":
+            self._append_auto_tune_status(
+                f"Baseline score: {number_text(payload.get('baseline_score'))} | candidate {payload.get('baseline_candidate_id') or 'n/a'}",
+                redraw=False,
+            )
+        elif event_name == "search_started":
+            self._append_auto_tune_status(
+                f"Search phase started | candidates {payload.get('candidate_count') or 0} | {payload.get('strategy') or 'strategy'}",
+                redraw=False,
+            )
+        elif event_name == "verification_started":
+            self._append_auto_tune_status(f"Verification phase started | reruns {payload.get('candidate_count') or 0}", redraw=False)
+        elif event_name == "trial_started":
             trial = payload.get("trial_index")
             total = payload.get("trial_total") or self._auto_tune_trials
+            stage = payload.get("stage") or "trial"
             log_count = payload.get("log_count")
             tune = payload.get("candidate_tune") if isinstance(payload.get("candidate_tune"), dict) else {}
             shown = ", ".join(f"{key}={float(value):.3g}" for key, value in list(tune.items())[:4] if isinstance(value, (int, float)))
             self._append_auto_tune_status(
-                f"Trial {trial}/{total} started | {self._auto_tune_filter_id} | logs {log_count or 0} | {shown or 'base tune'}",
+                f"{stage.title()} {trial}/{total} started | {payload.get('candidate_type') or 'candidate'} | logs {log_count or 0} | {shown or 'base tune'}",
                 redraw=False,
             )
         elif event_name == "trial_finished":
@@ -2350,7 +2396,7 @@ class StartupMapSelector:
             metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
             if failed:
                 self._append_auto_tune_status(
-                    f"Trial {payload.get('trial_index')}/{payload.get('trial_total') or self._auto_tune_trials} failed | reason: {payload.get('failure_reason')}",
+                    f"{str(payload.get('stage') or 'Trial').title()} {payload.get('trial_index')}/{payload.get('trial_total') or self._auto_tune_trials} failed | reason: {payload.get('failure_reason')}",
                     redraw=False,
                 )
             else:
@@ -2359,23 +2405,31 @@ class StartupMapSelector:
                 best_text = number_text(best_score)
                 failure_count = metrics.get("failure_count")
                 self._append_auto_tune_status(
-                    f"Trial {payload.get('trial_index')}/{payload.get('trial_total') or self._auto_tune_trials} finished | "
+                    f"{str(payload.get('stage') or 'Trial').title()} {payload.get('trial_index')}/{payload.get('trial_total') or self._auto_tune_trials} finished | "
                     f"mean RMSE {rmse_text} | score {score_text} | best {best_text} | failures {failure_count or 0}",
                     redraw=False,
                 )
-        elif event_name == "new_best":
+        elif event_name == "new_search_best":
             score = payload.get("score")
             metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
             self._append_auto_tune_status(
-                f"New best tune found | score {number_text(score)} | mean RMSE {number_text(metrics.get('mean_eval_position_rmse_m'), ' m')}",
+                f"Search leader | score {number_text(score)} | mean RMSE {number_text(metrics.get('mean_eval_position_rmse_m'), ' m')}",
                 redraw=False,
             )
         elif event_name == "completed":
             metrics = payload.get("best_metrics") if isinstance(payload.get("best_metrics"), dict) else {}
-            self._append_auto_tune_status("Auto tune complete.", redraw=False)
-            self._append_auto_tune_status(f"Best score: {number_text(payload.get('best_score'))}", redraw=False)
-            self._append_auto_tune_status(f"Mean eval RMSE: {number_text(metrics.get('mean_eval_position_rmse_m'), ' m')}", redraw=False)
-            self._append_auto_tune_status(f"Best tune saved: {payload.get('saved_config_path')}", redraw=False)
+            improved = bool(payload.get("improved_over_baseline"))
+            self._append_auto_tune_status("Auto tune verification complete.", redraw=False)
+            self._append_auto_tune_status(
+                f"Improved: {'yes' if improved else 'no'} | baseline {number_text(payload.get('baseline_score'))} | final {number_text(payload.get('final_score'))}",
+                redraw=False,
+            )
+            if improved:
+                self._append_auto_tune_status(f"Verified score: {number_text(payload.get('best_score'))}", redraw=False)
+                self._append_auto_tune_status(f"Mean eval RMSE: {number_text(metrics.get('mean_eval_position_rmse_m'), ' m')}", redraw=False)
+                self._append_auto_tune_status(f"Verified tune saved: {payload.get('saved_config_path')}", redraw=False)
+            else:
+                self._append_auto_tune_status("No improved tune found. No best_tune.json was saved.", redraw=False)
         self._redraw_auto_tune_modal_frame()
         self._pump_auto_tune_cancel_events()
 
@@ -2420,6 +2474,14 @@ class StartupMapSelector:
             if info.sensor_noise_preset == reference
         }
         self._append_auto_tune_status(f"Selected {len(self._auto_tune_selected_log_indices)} log(s) matching noise: {reference or 'n/a'}")
+
+    def _cycle_auto_tune_objective(self) -> None:
+        try:
+            index = AUTO_TUNE_OBJECTIVE_MODES.index(self._auto_tune_objective_mode)
+        except ValueError:
+            index = len(AUTO_TUNE_OBJECTIVE_MODES) - 1
+        self._auto_tune_objective_mode = AUTO_TUNE_OBJECTIVE_MODES[(index + 1) % len(AUTO_TUNE_OBJECTIVE_MODES)]
+        self._append_auto_tune_status(f"Objective mode: {self._auto_tune_objective_mode}")
 
     def _draw_auto_tune_modal(self) -> None:
         width, height = self._surface.get_size()
@@ -2519,14 +2581,17 @@ class StartupMapSelector:
         record = self._filter_record(self._auto_tune_filter_id)
         profile = record.auto_tune_profile if record is not None and isinstance(record.auto_tune_profile, dict) else {}
         search = profile.get("search") if isinstance(profile.get("search"), dict) else {}
-        objective = str(profile.get("objective") or "rmse_consistency")
+        objective = self._auto_tune_objective_mode
         lines = [
             f"Trials: {self._auto_tune_trials or search.get('default_trials') or 30}",
             "Strategy: optuna_tpe when available; fallback random_plus_coordinate_refinement",
-            f"Objective: {objective} | Trial plots: {'ON' if bool(search.get('generate_trial_plots', False)) else 'OFF'}",
+            f"Objective: {objective}",
+            f"Trial plots: {'ON' if bool(search.get('generate_trial_plots', False)) else 'OFF'} | Verification: ON",
             "Process-only: ON | Sensor noise locked from selected log signature",
         ]
         self._draw_text("Auto Tune Settings", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+        self._auto_tune_objective_rect = pygame.Rect(content.right - 116, content.top, 116, 24)
+        self._draw_button(self._auto_tune_objective_rect, "Change Objective", muted=self._auto_tune_running)
         y = content.top + 28
         for line in lines:
             self._draw_text(line, (content.left, y), self._small_font, DASHBOARD.text_color, content.width)
@@ -2549,10 +2614,16 @@ class StartupMapSelector:
         self._auto_tune_cancel_rect = pygame.Rect(self._auto_tune_start_rect.right + 8, rect.top + 4, 96, 30)
         self._auto_tune_save_rect = pygame.Rect(self._auto_tune_cancel_rect.right + 8, rect.top + 4, 118, 30)
         self._auto_tune_apply_rect = pygame.Rect(self._auto_tune_save_rect.right + 8, rect.top + 4, 126, 30)
+        has_verified_recommendation = bool(
+            self._auto_tune_result is not None
+            and self._auto_tune_result.improved_over_baseline
+            and self._auto_tune_result.saved_config_path is not None
+            and self._auto_tune_result.best_tune
+        )
         self._draw_button(self._auto_tune_start_rect, "Start", muted=self._auto_tune_running, primary=True)
         self._draw_button(self._auto_tune_cancel_rect, "Cancel / Stop", muted=not self._auto_tune_running)
-        self._draw_button(self._auto_tune_save_rect, "Show Saved Path", muted=self._auto_tune_result is None)
-        self._draw_button(self._auto_tune_apply_rect, "Apply Best Tune", muted=self._auto_tune_result is None)
+        self._draw_button(self._auto_tune_save_rect, "Show Saved Path", muted=not has_verified_recommendation)
+        self._draw_button(self._auto_tune_apply_rect, "Apply Verified Tune", muted=not has_verified_recommendation)
         selected_paths = [info.sensor_log_path for index, info in enumerate(self._recorded_logs) if index in self._auto_tune_selected_log_indices]
         logs = [
             {

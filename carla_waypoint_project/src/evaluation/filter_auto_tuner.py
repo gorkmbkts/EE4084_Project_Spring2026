@@ -19,7 +19,11 @@ except ImportError:  # pragma: no cover - depends on optional environment packag
 
 from src.KalmanLab.registry import discover_filters
 from src.evaluation.benchmark_config import project_commit_hash
-from src.evaluation.consistency_metrics import MEASUREMENT_NOISE_TUNE_KEYS
+from src.evaluation.consistency_metrics import (
+    MEASUREMENT_NOISE_TUNE_KEYS,
+    consistency_report_from_summaries,
+    severity_rank,
+)
 from src.evaluation.evaluation_artifacts import (
     RecordedLogInfo,
     benchmark_root,
@@ -79,6 +83,9 @@ class AutoTuneTrialResult:
     output_folder: Optional[Path]
     failed: bool
     failure_reason: str = ""
+    candidate_id: str = ""
+    candidate_type: str = "generated"
+    stage: str = "search"
 
 
 @dataclass(frozen=True)
@@ -93,6 +100,22 @@ class AutoTuneResult:
     trial_results: tuple[AutoTuneTrialResult, ...]
     output_folder: Path
     saved_config_path: Optional[Path] = None
+    baseline_score: Optional[float] = None
+    final_score: Optional[float] = None
+    improved_over_baseline: bool = False
+    recommendation_status: str = "not_run"
+    verification_results: tuple[AutoTuneTrialResult, ...] = ()
+
+
+@dataclass(frozen=True)
+class AutoTuneCandidate:
+    """A named tune candidate evaluated by the offline tuner."""
+
+    candidate_id: str
+    candidate_type: str
+    tune: dict[str, object]
+    source: str
+    parent_candidate_id: str = ""
 
 
 ProgressCallback = Callable[[str, dict[str, object]], None]
@@ -120,6 +143,9 @@ class FilterAutoTuner:
             raise ValueError(f"Filter is not available: {request.filter_id}")
         if not record.auto_tune_enabled or not request.auto_tune_profile.get("primary"):
             raise ValueError(f"No auto-tune profile for filter: {request.filter_id}")
+        objective_name = _normalize_objective_name(
+            request.objective_name or request.auto_tune_profile.get("objective") or "balanced_score"
+        )
 
         selected_logs_metadata = [_log_metadata(path, request.output_root) for path in request.sensor_log_paths]
         noise = noise_profile_summary(selected_logs_metadata)
@@ -136,24 +162,34 @@ class FilterAutoTuner:
             noise.get("representative_config") or {},
             tuple(record.tune_specs),
         )
-        base_tune = dict(request.base_tune)
-        base_tune.update(locked.values)
+        default_tune = dict(record.tune)
+        default_tune.update(locked.values)
+        current_tune = dict(record.tune)
+        current_tune.update(dict(request.base_tune))
+        current_tune.update(locked.values)
         effective_metadata = dict(request.metadata)
         effective_metadata.update(
             {
                 "selected_log_noise_summary": noise,
                 "sensor_noise_locked_from_profile": True,
                 "process_only_tune": True,
+                "effective_uncertainty_multiplier_policy": (
+                    "Physical sensor noise stddev values are locked from the selected recorded-log profile. "
+                    "Effective *_R_multiplier/process/covariance inflation tune keys may adjust filter uncertainty without "
+                    "changing the recorded sensor-noise profile."
+                ),
                 "locked_sensor_noise_values": dict(locked.values),
                 "locked_sensor_noise_sources": dict(locked.sources),
                 "noise_signature": locked.signature,
                 "representative_sensor_noise_config": dict(locked.representative_config),
+                "objective_mode": objective_name,
             }
         )
         request = replace(
             request,
-            base_tune=base_tune,
+            base_tune=current_tune,
             auto_tune_profile=process_only_profile,
+            objective_name=objective_name,
             metadata=effective_metadata,
         )
         max_trials = max(1, int(request.max_trials or 1))
@@ -181,10 +217,6 @@ class FilterAutoTuner:
                 "logical_index_path": str(_saved_config_index_path(request.output_root, request.filter_id)),
             },
         )
-        trial_results: list[AutoTuneTrialResult] = []
-        best_tune: dict[str, object] = dict(request.base_tune)
-        best_score: Optional[float] = None
-        best_metrics: dict[str, object] = {}
         strategy = _resolve_candidate_generation_strategy(request)
 
         self._emit(
@@ -193,76 +225,177 @@ class FilterAutoTuner:
             {
                 "output_folder": str(run_folder),
                 "trials": max_trials,
+                "objective_mode": objective_name,
                 "candidate_generation_strategy": strategy,
                 "optuna_available": optuna is not None,
             },
         )
-        trial_index = 1
-        if strategy == "optuna_tpe":
-            study = optuna.create_study(  # type: ignore[union-attr]
-                direction="minimize",
-                sampler=optuna.samplers.TPESampler(seed=int(request.metadata.get("random_seed", 4084))),  # type: ignore[union-attr]
+        evaluation_index = 1
+        all_results: list[AutoTuneTrialResult] = []
+        candidate_catalog: list[AutoTuneCandidate] = []
+
+        baseline_candidates = self._baseline_candidates(
+            request=request,
+            record_default_tune=default_tune,
+            current_tune=current_tune,
+        )
+        previous_candidates = self._previous_best_candidates(request, record.display_name)
+        baseline_and_reference_candidates = _dedupe_candidates([*baseline_candidates, *previous_candidates])
+        candidate_catalog.extend(baseline_and_reference_candidates)
+
+        self._emit(progress_callback, "baseline_started", {"candidate_count": len(baseline_and_reference_candidates)})
+        for candidate in baseline_and_reference_candidates:
+            if stop_requested is not None and stop_requested():
+                self._emit(progress_callback, "stopped", {"trial_index": evaluation_index})
+                break
+            result = self._run_trial(
+                request,
+                run_folder,
+                evaluation_index,
+                len(baseline_and_reference_candidates),
+                candidate,
+                progress_callback,
+                stage="baseline",
             )
-            for _ in range(max_trials):
-                if stop_requested is not None and stop_requested():
-                    self._emit(progress_callback, "stopped", {"trial_index": trial_index})
-                    break
-                optuna_trial = study.ask()
-                candidate = self._optuna_candidate(request, optuna_trial)
-                result = self._run_trial(request, run_folder, trial_index, max_trials, candidate, progress_callback)
-                trial_results.append(result)
-                study.tell(optuna_trial, float(result.score) if result.score is not None else 1.0e9)
-                if not result.failed and result.score is not None and (best_score is None or result.score < best_score):
-                    best_score = result.score
-                    best_tune = dict(result.candidate_tune)
-                    best_metrics = dict(result.metrics)
-                    self._emit(progress_callback, "new_best", {"trial_index": trial_index, "score": best_score, "metrics": best_metrics})
-                self._emit_trial_finished(progress_callback, request, result, max_trials, best_score)
-                trial_index += 1
-            request.metadata["optuna_study_trial_count"] = len(study.trials)
-        else:
-            candidates = self._random_candidates(request, max_trials=max_trials)
-            for candidate in candidates:
-                if stop_requested is not None and stop_requested():
-                    self._emit(progress_callback, "stopped", {"trial_index": trial_index})
-                    break
-                result = self._run_trial(request, run_folder, trial_index, max_trials, candidate, progress_callback)
-                trial_results.append(result)
-                if not result.failed and result.score is not None and (best_score is None or result.score < best_score):
-                    best_score = result.score
-                    best_tune = dict(result.candidate_tune)
-                    best_metrics = dict(result.metrics)
-                    self._emit(progress_callback, "new_best", {"trial_index": trial_index, "score": best_score, "metrics": best_metrics})
-                self._emit_trial_finished(progress_callback, request, result, max_trials, best_score)
-                trial_index += 1
+            all_results.append(result)
+            self._emit_trial_finished(progress_callback, request, result, len(baseline_and_reference_candidates), None)
+            evaluation_index += 1
+        baseline_reference = _best_result(
+            result
+            for result in all_results
+            if result.stage == "baseline" and result.candidate_type in {"default_base", "current_ui"}
+        )
+        self._emit(
+            progress_callback,
+            "baseline_finished",
+            {
+                "baseline_score": baseline_reference.score if baseline_reference is not None else None,
+                "baseline_candidate_id": baseline_reference.candidate_id if baseline_reference is not None else "",
+            },
+        )
 
-            for candidate in self._coordinate_candidates(request, best_tune, remaining=max_trials - len(trial_results)):
-                if stop_requested is not None and stop_requested():
-                    self._emit(progress_callback, "stopped", {"trial_index": trial_index})
-                    break
-                result = self._run_trial(request, run_folder, trial_index, max_trials, candidate, progress_callback)
-                trial_results.append(result)
-                if not result.failed and result.score is not None and (best_score is None or result.score < best_score):
-                    best_score = result.score
-                    best_tune = dict(result.candidate_tune)
-                    best_metrics = dict(result.metrics)
-                    self._emit(progress_callback, "new_best", {"trial_index": trial_index, "score": best_score, "metrics": best_metrics})
-                self._emit_trial_finished(progress_callback, request, result, max_trials, best_score)
-                trial_index += 1
+        generated_candidates = self._generated_candidates(request, max_trials=max_trials, strategy=strategy)
+        candidate_catalog.extend(generated_candidates)
+        search_best: Optional[AutoTuneTrialResult] = None
+        self._emit(progress_callback, "search_started", {"candidate_count": len(generated_candidates), "strategy": strategy})
+        for search_offset, candidate in enumerate(generated_candidates, start=1):
+            if stop_requested is not None and stop_requested():
+                self._emit(progress_callback, "stopped", {"trial_index": evaluation_index})
+                break
+            result = self._run_trial(
+                request,
+                run_folder,
+                evaluation_index,
+                len(generated_candidates),
+                candidate,
+                progress_callback,
+                stage="search",
+            )
+            all_results.append(result)
+            if not result.failed and result.score is not None and (search_best is None or float(result.score) < float(search_best.score)):
+                search_best = result
+                self._emit(
+                    progress_callback,
+                    "new_search_best",
+                    {
+                        "trial_index": search_offset,
+                        "score": result.score,
+                        "metrics": dict(result.metrics),
+                        "candidate_id": result.candidate_id,
+                        "candidate_type": result.candidate_type,
+                    },
+                )
+            self._emit_trial_finished(
+                progress_callback,
+                request,
+                result,
+                len(generated_candidates),
+                search_best.score if search_best is not None else None,
+            )
+            evaluation_index += 1
 
-        self._write_trials_csv(run_folder / "trials.csv", trial_results)
-        summary = self._summary_dict(request, record.display_name, run_folder, best_tune, best_score, best_metrics, trial_results)
+        verification_candidates = self._verification_candidates(
+            baseline_and_reference_candidates,
+            generated_candidates,
+            all_results,
+            max_candidates=int(request.metadata.get("verification_candidate_count") or 5),
+        )
+        self._emit(progress_callback, "verification_started", {"candidate_count": len(verification_candidates)})
+        verification_results: list[AutoTuneTrialResult] = []
+        for candidate in verification_candidates:
+            if stop_requested is not None and stop_requested():
+                self._emit(progress_callback, "stopped", {"trial_index": evaluation_index})
+                break
+            result = self._run_trial(
+                request,
+                run_folder,
+                evaluation_index,
+                len(verification_candidates),
+                candidate,
+                progress_callback,
+                stage="verification",
+            )
+            verification_results.append(result)
+            all_results.append(result)
+            self._emit_trial_finished(progress_callback, request, result, len(verification_candidates), None)
+            evaluation_index += 1
+
+        baseline_verification = _best_result(
+            result
+            for result in verification_results
+            if result.candidate_type in {"default_base", "current_ui"}
+        )
+        verification_winner = _best_result(verification_results)
+        baseline_score = baseline_verification.score if baseline_verification is not None else (
+            baseline_reference.score if baseline_reference is not None else None
+        )
+        final_score = verification_winner.score if verification_winner is not None else None
+        improved = _verified_improvement(verification_winner, baseline_verification or baseline_reference)
+        recommendation_status = "improved" if improved else "no_improved_tune_found"
+        best_tune: dict[str, object] = dict(verification_winner.candidate_tune) if improved and verification_winner is not None else {}
+        best_score: Optional[float] = float(verification_winner.score) if improved and verification_winner is not None and verification_winner.score is not None else None
+        best_metrics: dict[str, object] = dict(verification_winner.metrics) if improved and verification_winner is not None else {}
+
+        self._write_candidates_json(run_folder / "candidates.json", candidate_catalog, all_results, verification_winner, baseline_verification)
+        self._write_trials_csv(run_folder / "trials.csv", all_results)
+        self._write_verification_leaderboard(run_folder / "verification_leaderboard.csv", verification_results, baseline_verification)
+        self._write_per_route_metrics_csv(run_folder / "per_route_metrics.csv", all_results)
+        consistency_report = _combined_consistency_report(verification_results, verification_winner, baseline_verification)
+        write_json(run_folder / "consistency_report.json", consistency_report)
+
+        summary = self._summary_dict(
+            request,
+            record.display_name,
+            run_folder,
+            best_tune,
+            best_score,
+            best_metrics,
+            all_results,
+            baseline_score=baseline_score,
+            final_score=final_score,
+            verification_winner=verification_winner,
+            baseline_result=baseline_verification or baseline_reference,
+            improved=improved,
+            recommendation_status=recommendation_status,
+            consistency_report=consistency_report,
+        )
         write_json(run_folder / "auto_tune_summary.json", summary)
         saved_config_path = None
-        if best_score is not None:
-            saved_config_path = self.save_best_tune(request, record.display_name, run_folder, best_tune, best_score, best_metrics, trial_results)
-        self._apply_retention_policy(request, trial_results, best_score)
+        if improved and best_score is not None:
+            saved_config_path = self.save_best_tune(request, record.display_name, run_folder, best_tune, best_score, best_metrics, all_results)
+        self._apply_retention_policy(request, all_results, verification_winner if improved else None)
         self._emit(
             progress_callback,
             "completed",
             {
                 "best_score": best_score,
                 "best_metrics": best_metrics,
+                "baseline_score": baseline_score,
+                "final_score": final_score,
+                "improved_over_baseline": improved,
+                "recommendation_status": recommendation_status,
+                "message": "Verified improved tune found." if improved else "No improved tune found.",
+                "verification_winner": _trial_to_dict(verification_winner) if verification_winner is not None else {},
                 "saved_config_path": str(saved_config_path) if saved_config_path else "",
             },
         )
@@ -272,9 +405,14 @@ class FilterAutoTuner:
             best_score=best_score,
             best_metrics=best_metrics,
             selected_logs=tuple(Path(path) for path in request.sensor_log_paths),
-            trial_results=tuple(trial_results),
+            trial_results=tuple(all_results),
             output_folder=run_folder,
             saved_config_path=saved_config_path,
+            baseline_score=float(baseline_score) if baseline_score is not None else None,
+            final_score=float(final_score) if final_score is not None else None,
+            improved_over_baseline=improved,
+            recommendation_status=recommendation_status,
+            verification_results=tuple(verification_results),
         )
 
     def _run_trial(
@@ -283,8 +421,9 @@ class FilterAutoTuner:
         run_folder: Path,
         trial_index: int,
         trial_total: int,
-        candidate_tune: dict[str, object],
+        candidate: AutoTuneCandidate,
         progress_callback: Optional[ProgressCallback],
+        stage: str = "search",
     ) -> AutoTuneTrialResult:
         self._emit(
             progress_callback,
@@ -292,8 +431,11 @@ class FilterAutoTuner:
             {
                 "trial_index": trial_index,
                 "trial_total": trial_total,
+                "stage": stage,
+                "candidate_id": candidate.candidate_id,
+                "candidate_type": candidate.candidate_type,
                 "filter_id": request.filter_id,
-                "candidate_tune": dict(candidate_tune),
+                "candidate_tune": dict(candidate.tune),
                 "log_count": len(request.sensor_log_paths),
             },
         )
@@ -304,7 +446,7 @@ class FilterAutoTuner:
                 OfflineReplayRequest(
                     sensor_log_paths=tuple(Path(path) for path in request.sensor_log_paths),
                     selected_filter_ids=(request.filter_id,),
-                    filter_tunes={request.filter_id: dict(candidate_tune)},
+                    filter_tunes={request.filter_id: dict(candidate.tune)},
                     output_root=request.output_root,
                     include_raw_gnss_baseline=True,
                     run_folder_override=replay_folder,
@@ -319,22 +461,28 @@ class FilterAutoTuner:
             failure_reason = "" if not failed else "Objective score was not finite."
             trial_result = AutoTuneTrialResult(
                 trial_index=trial_index,
-                candidate_tune=dict(candidate_tune),
+                candidate_tune=dict(candidate.tune),
                 score=score,
                 metrics=metrics,
                 output_folder=result.output_folder,
                 failed=failed,
                 failure_reason=failure_reason,
+                candidate_id=candidate.candidate_id,
+                candidate_type=candidate.candidate_type,
+                stage=stage,
             )
         except Exception as exc:
             trial_result = AutoTuneTrialResult(
                 trial_index=trial_index,
-                candidate_tune=dict(candidate_tune),
+                candidate_tune=dict(candidate.tune),
                 score=None,
                 metrics={},
                 output_folder=None,
                 failed=True,
                 failure_reason=str(exc),
+                candidate_id=candidate.candidate_id,
+                candidate_type=candidate.candidate_type,
+                stage=stage,
             )
         write_json(run_folder / f"trial_{trial_index:03d}.json", _trial_to_dict(trial_result))
         return trial_result
@@ -356,54 +504,167 @@ class FilterAutoTuner:
             best_tune=best_tune,
             best_score=best_score,
             best_metrics=best_metrics,
-            trial_count=len(trial_results),
+            trial_results=trial_results,
         )
         config_path = run_folder / "best_tune.json"
         write_json(config_path, config)
         _update_saved_config_index(request.output_root, request.filter_id, config_path, config)
         return config_path
 
-    def _random_candidates(self, request: AutoTuneRequest, max_trials: int) -> list[dict[str, object]]:
-        primary = list(request.auto_tune_profile.get("primary") or [])
-        random_budget = max(1, max_trials - len(primary) * 5)
-        rng = random.Random(int(request.metadata.get("random_seed", 4084)))
-        candidates = [dict(request.base_tune)]
-        while len(candidates) < random_budget:
-            candidate = dict(request.base_tune)
-            for param in primary:
-                key = str(param.get("key") or "")
-                if not key or key in MEASUREMENT_NOISE_TUNE_KEYS:
-                    continue
-                candidate[key] = _sample_param(rng, param, request.base_tune.get(key))
-            candidates.append(candidate)
-        return candidates[:max_trials]
-
-    def _coordinate_candidates(
+    def _baseline_candidates(
         self,
         request: AutoTuneRequest,
-        best_tune: dict[str, object],
-        remaining: int,
-    ) -> list[dict[str, object]]:
-        if remaining <= 0:
-            return []
-        candidates: list[dict[str, object]] = []
-        for param in list(request.auto_tune_profile.get("primary") or []):
-            key = str(param.get("key") or "")
-            base_value = _optional_float(best_tune.get(key))
-            if not key or key in MEASUREMENT_NOISE_TUNE_KEYS or base_value is None:
-                continue
-            for multiplier in (0.5, 0.75, 1.25, 1.5, 2.0):
-                candidate = dict(best_tune)
-                candidate[key] = _clamp_value(base_value * multiplier, param)
-                candidates.append(candidate)
-                if len(candidates) >= remaining:
-                    return candidates
+        record_default_tune: dict[str, object],
+        current_tune: dict[str, object],
+    ) -> list[AutoTuneCandidate]:
+        candidates = [
+            AutoTuneCandidate(
+                candidate_id="base_default",
+                candidate_type="default_base",
+                tune=dict(record_default_tune),
+                source="filter_default_with_recorded_sensor_noise_lock",
+            )
+        ]
+        if not _tunes_equivalent(record_default_tune, current_tune):
+            candidates.append(
+                AutoTuneCandidate(
+                    candidate_id="current_ui",
+                    candidate_type="current_ui",
+                    tune=dict(current_tune),
+                    source="current_ui_tune_with_recorded_sensor_noise_lock",
+                )
+            )
         return candidates
 
-    def _optuna_candidate(self, request: AutoTuneRequest, trial: object) -> dict[str, object]:
+    def _previous_best_candidates(self, request: AutoTuneRequest, filter_display_name: str) -> list[AutoTuneCandidate]:
+        representative = request.metadata.get("representative_sensor_noise_config") or {}
+        context = offline_tune_context(request.filter_id, sensor_noise_config=representative)
+        candidates: list[AutoTuneCandidate] = []
+        for index, item in enumerate(list_saved_tune_configs(request.filter_id, output_root=request.output_root, context=context), start=1):
+            path = Path(str(item.get("path") or ""))
+            config = load_saved_tune_config(path)
+            best_tune = config.get("best_tune")
+            if not isinstance(best_tune, dict) or not best_tune:
+                continue
+            tune = dict(best_tune)
+            tune.update(dict(request.metadata.get("locked_sensor_noise_values") or {}))
+            candidates.append(
+                AutoTuneCandidate(
+                    candidate_id=f"previous_best_{index:02d}",
+                    candidate_type="previous_compatible_best",
+                    tune=tune,
+                    source=str(path),
+                )
+            )
+            if len(candidates) >= int(request.metadata.get("previous_best_candidate_count") or 1):
+                break
+        return candidates
+
+    def _generated_candidates(self, request: AutoTuneRequest, max_trials: int, strategy: str) -> list[AutoTuneCandidate]:
+        params = _search_params(request)
+        if not params:
+            return [
+                AutoTuneCandidate(
+                    candidate_id="generated_001",
+                    candidate_type="generated",
+                    tune=dict(request.base_tune),
+                    source="base_fallback_no_search_params",
+                )
+            ][:max_trials]
+        candidates: list[AutoTuneCandidate] = []
+        for tune, source in self._designed_candidate_tunes(request, params):
+            candidates.append(
+                AutoTuneCandidate(
+                    candidate_id=f"generated_{len(candidates) + 1:03d}",
+                    candidate_type="generated_designed",
+                    tune=tune,
+                    source=source,
+                )
+            )
+            if len(candidates) >= max_trials:
+                return _dedupe_candidates(candidates)[:max_trials]
+
+        remaining = max(0, max_trials - len(_dedupe_candidates(candidates)))
+        if remaining <= 0:
+            return _dedupe_candidates(candidates)[:max_trials]
+
+        if strategy == "optuna_tpe" and optuna is not None:
+            study = optuna.create_study(  # type: ignore[union-attr]
+                direction="minimize",
+                sampler=optuna.samplers.TPESampler(seed=int(request.metadata.get("random_seed", 4084))),  # type: ignore[union-attr]
+            )
+            for _ in range(remaining):
+                trial = study.ask()
+                tune = self._optuna_candidate(request, trial, params)
+                study.tell(trial, 1.0)
+                candidates.append(
+                    AutoTuneCandidate(
+                        candidate_id=f"generated_{len(candidates) + 1:03d}",
+                        candidate_type="generated_optuna",
+                        tune=tune,
+                        source="optuna_tpe_broad_range_sample",
+                    )
+                )
+        else:
+            rng = random.Random(int(request.metadata.get("random_seed", 4084)))
+            while len(_dedupe_candidates(candidates)) < max_trials:
+                candidates.append(
+                    AutoTuneCandidate(
+                        candidate_id=f"generated_{len(candidates) + 1:03d}",
+                        candidate_type="generated_random",
+                        tune=self._random_candidate_tune(request, params, rng),
+                        source="random_broad_range_sample",
+                    )
+                )
+                if len(candidates) >= max_trials * 4:
+                    break
+        return _renumber_candidates(_dedupe_candidates(candidates)[:max_trials])
+
+    def _designed_candidate_tunes(
+        self,
+        request: AutoTuneRequest,
+        params: list[dict[str, object]],
+    ) -> list[tuple[dict[str, object], str]]:
+        designed: list[tuple[dict[str, object], str]] = []
+        for label, selector in (
+            ("all_min", lambda param: _param_bound_or_sample_base(param, request.base_tune, "min")),
+            ("all_mid", lambda param: _param_midpoint(param, request.base_tune)),
+            ("all_max", lambda param: _param_bound_or_sample_base(param, request.base_tune, "max")),
+        ):
+            tune = dict(request.base_tune)
+            for param in params:
+                key = str(param.get("key") or "")
+                tune[key] = selector(param)
+            designed.append((tune, f"designed_{label}_full_range"))
+        for param in params:
+            key = str(param.get("key") or "")
+            if not key:
+                continue
+            for bound_name in ("min", "max"):
+                value = _param_bound_or_sample_base(param, request.base_tune, bound_name)
+                tune = dict(request.base_tune)
+                tune[key] = value
+                designed.append((tune, f"designed_{key}_{bound_name}"))
+        return designed
+
+    def _random_candidate_tune(
+        self,
+        request: AutoTuneRequest,
+        params: list[dict[str, object]],
+        rng: random.Random,
+    ) -> dict[str, object]:
+        candidate = dict(request.base_tune)
+        for param in params:
+            key = str(param.get("key") or "")
+            if not key:
+                continue
+            candidate[key] = _sample_param(rng, param, request.base_tune.get(key))
+        return candidate
+
+    def _optuna_candidate(self, request: AutoTuneRequest, trial: object, params: list[dict[str, object]]) -> dict[str, object]:
         candidate = dict(request.base_tune)
         suggest_float = getattr(trial, "suggest_float")
-        for param in list(request.auto_tune_profile.get("primary") or []):
+        for param in params:
             if not isinstance(param, dict):
                 continue
             key = str(param.get("key") or "")
@@ -420,6 +681,27 @@ class FilterAutoTuner:
             candidate[key] = suggest_float(key, low, high, log=log)
         return candidate
 
+    def _verification_candidates(
+        self,
+        baseline_candidates: list[AutoTuneCandidate],
+        generated_candidates: list[AutoTuneCandidate],
+        all_results: list[AutoTuneTrialResult],
+        max_candidates: int,
+    ) -> list[AutoTuneCandidate]:
+        by_id = {candidate.candidate_id: candidate for candidate in [*baseline_candidates, *generated_candidates]}
+        search_results = [
+            result
+            for result in all_results
+            if result.stage == "search" and not result.failed and result.score is not None and math.isfinite(float(result.score))
+        ]
+        ordered_search = sorted(search_results, key=lambda result: float(result.score))
+        selected = list(baseline_candidates)
+        for result in ordered_search[: max(1, max_candidates)]:
+            candidate = by_id.get(result.candidate_id)
+            if candidate is not None:
+                selected.append(candidate)
+        return _dedupe_candidates(selected)
+
     @staticmethod
     def _trial_metrics(output_folder: Path, filter_id: str) -> dict[str, object]:
         aggregate = read_json(Path(output_folder) / "aggregate_summary.json")
@@ -432,6 +714,16 @@ class FilterAutoTuner:
         nees_values = [_optional_float(row.get("mean_nees")) for row in filter_rows]
         position_nees_values = [_optional_float(row.get("mean_position_nees")) for row in filter_rows]
         position_nees_approx_values = [_optional_float(row.get("mean_position_nees_diagonal_approx")) for row in filter_rows]
+        nis_by_type_summary = _aggregate_nis_by_type_summary(filter_rows)
+        mean_position_nees = _mean([value for value in position_nees_values if value is not None])
+        mean_position_nees_approx = _mean([value for value in position_nees_approx_values if value is not None])
+        position_nees_source = _aggregate_position_nees_source(filter_rows)
+        consistency_report = consistency_report_from_summaries(
+            nis_by_type_summary=nis_by_type_summary,
+            mean_position_nees=mean_position_nees,
+            mean_position_nees_diagonal_approx=mean_position_nees_approx,
+            position_nees_source=position_nees_source,
+        )
         return {
             "route_count": aggregate.get("route_count"),
             "mean_eval_position_rmse_m": _mean([value for value in eval_rmses if value is not None]),
@@ -440,10 +732,12 @@ class FilterAutoTuner:
             "mean_nis": _mean([value for value in nis_values if value is not None]),
             "mean_nees": _mean([value for value in nees_values if value is not None]),
             "legacy_mean_nis_mixed": _mean([value for value in nis_values if value is not None]),
-            "mean_position_nees": _mean([value for value in position_nees_values if value is not None]),
-            "mean_position_nees_diagonal_approx": _mean([value for value in position_nees_approx_values if value is not None]),
-            "position_nees_source": _aggregate_position_nees_source(filter_rows),
-            "nis_by_type_summary": _aggregate_nis_by_type_summary(filter_rows),
+            "mean_position_nees": mean_position_nees,
+            "mean_position_nees_diagonal_approx": mean_position_nees_approx,
+            "position_nees_source": position_nees_source,
+            "nis_by_type_summary": nis_by_type_summary,
+            "consistency_report": consistency_report,
+            "per_route_metrics": [_compact_route_metric(row) for row in filter_rows],
             "best_filter_id": aggregate.get("best_filter_id"),
             "raw_gnss_rmse_m": aggregate.get("raw_gnss_rmse_m"),
             "aggregate_summary_path": str(Path(output_folder) / "aggregate_summary.json"),
@@ -459,7 +753,17 @@ class FilterAutoTuner:
         best_score: Optional[float],
         best_metrics: dict[str, object],
         trial_results: list[AutoTuneTrialResult],
+        *,
+        baseline_score: Optional[float],
+        final_score: Optional[float],
+        verification_winner: Optional[AutoTuneTrialResult],
+        baseline_result: Optional[AutoTuneTrialResult],
+        improved: bool,
+        recommendation_status: str,
+        consistency_report: dict[str, object],
     ) -> dict[str, object]:
+        improvement_percent = _improvement_percent(baseline_score, best_score if improved else final_score)
+        winner_metrics = dict(verification_winner.metrics) if verification_winner is not None else {}
         return {
             "schema_version": SCHEMA_VERSION,
             "filter_id": request.filter_id,
@@ -475,6 +779,7 @@ class FilterAutoTuner:
             "optuna_available": optuna is not None,
             "objective": request.objective_name,
             "objective_name": request.objective_name,
+            "objective_mode": request.objective_name,
             "score_formula": _score_formula_description(),
             "score_notes": _score_notes(),
             "nis_nees_policy": _nis_nees_policy(),
@@ -482,6 +787,27 @@ class FilterAutoTuner:
             "best_score": best_score,
             "best_metrics": best_metrics,
             "best_tune": dict(best_tune),
+            "baseline_score": baseline_score,
+            "baseline_metrics": dict(baseline_result.metrics) if baseline_result is not None else {},
+            "baseline_candidate_id": baseline_result.candidate_id if baseline_result is not None else "",
+            "final_score": final_score,
+            "final_metrics": winner_metrics,
+            "final_tune": dict(verification_winner.candidate_tune) if verification_winner is not None else {},
+            "improvement_percent": improvement_percent,
+            "improved_over_baseline": bool(improved),
+            "recommendation_status": recommendation_status,
+            "message": "Verified improved tune found." if improved else "No improved tune found.",
+            "verification_winner": _trial_to_dict(verification_winner) if verification_winner is not None else {},
+            "verification_winner_candidate_type": verification_winner.candidate_type if verification_winner is not None else "",
+            "verification_winner_rmse_m": winner_metrics.get("mean_eval_position_rmse_m"),
+            "verification_winner_nis_by_type": winner_metrics.get("nis_by_type_summary"),
+            "verification_winner_position_nees": {
+                "mean_position_nees": winner_metrics.get("mean_position_nees"),
+                "mean_position_nees_diagonal_approx": winner_metrics.get("mean_position_nees_diagonal_approx"),
+                "position_nees_source": winner_metrics.get("position_nees_source"),
+            },
+            "consistency_report": consistency_report,
+            "per_route_metrics": _all_per_route_metrics(trial_results),
             "base_tune": dict(request.base_tune),
             "locked_sensor_noise_values": dict(request.metadata.get("locked_sensor_noise_values") or {}),
             "auto_tune_profile": dict(request.auto_tune_profile),
@@ -501,12 +827,28 @@ class FilterAutoTuner:
         best_tune: dict[str, object],
         best_score: float,
         best_metrics: dict[str, object],
-        trial_count: int,
+        trial_results: list[AutoTuneTrialResult],
     ) -> dict[str, object]:
         logs = [_log_metadata(path, request.output_root) for path in request.sensor_log_paths]
         noise = noise_profile_summary(logs)
+        verified_result = next(
+            (
+                result
+                for result in trial_results
+                if result.stage == "verification"
+                and not result.failed
+                and result.score is not None
+                and math.isclose(float(result.score), float(best_score), rel_tol=1.0e-12, abs_tol=1.0e-12)
+                and _tunes_equivalent(result.candidate_tune, best_tune)
+            ),
+            None,
+        )
         extra = {
             "source": "offline_auto_tune",
+            "verified_recommendation": True,
+            "recommendation_status": "improved",
+            "verification_winner_candidate_id": verified_result.candidate_id if verified_result is not None else "",
+            "verification_winner_candidate_type": verified_result.candidate_type if verified_result is not None else "",
             "noise_profile_label": noise["label"],
             "sensor_noise_config": noise.get("representative_config") or {},
             "physical_output_folder": str(run_folder),
@@ -521,7 +863,7 @@ class FilterAutoTuner:
             "unavailable_metrics_policy": _unavailable_metrics_policy(),
             "auto_tune_profile": dict(request.auto_tune_profile),
             "trial_output_policy": _trial_output_policy(request),
-            "trial_count": trial_count,
+            "trial_count": len(trial_results),
         }
         return build_offline_schema_v2_config(
             filter_id=request.filter_id,
@@ -548,13 +890,27 @@ class FilterAutoTuner:
         with path.open("w", newline="", encoding="utf-8") as csv_file:
             writer = csv.DictWriter(
                 csv_file,
-                fieldnames=("trial_index", "score", "failed", "failure_reason", "candidate_tune", "metrics", "output_folder"),
+                fieldnames=(
+                    "trial_index",
+                    "stage",
+                    "candidate_id",
+                    "candidate_type",
+                    "score",
+                    "failed",
+                    "failure_reason",
+                    "candidate_tune",
+                    "metrics",
+                    "output_folder",
+                ),
             )
             writer.writeheader()
             for result in trial_results:
                 writer.writerow(
                     {
                         "trial_index": result.trial_index,
+                        "stage": result.stage,
+                        "candidate_id": result.candidate_id,
+                        "candidate_type": result.candidate_type,
                         "score": result.score,
                         "failed": result.failed,
                         "failure_reason": result.failure_reason,
@@ -563,6 +919,115 @@ class FilterAutoTuner:
                         "output_folder": str(result.output_folder) if result.output_folder else "",
                     }
                 )
+
+    @staticmethod
+    def _write_candidates_json(
+        path: Path,
+        candidates: list[AutoTuneCandidate],
+        results: list[AutoTuneTrialResult],
+        verification_winner: Optional[AutoTuneTrialResult],
+        baseline_result: Optional[AutoTuneTrialResult],
+    ) -> None:
+        result_groups: dict[str, list[dict[str, object]]] = {}
+        for result in results:
+            result_groups.setdefault(result.candidate_id, []).append(_trial_to_dict(result))
+        data = {
+            "candidate_count": len(candidates),
+            "verification_winner_candidate_id": verification_winner.candidate_id if verification_winner is not None else "",
+            "baseline_candidate_id": baseline_result.candidate_id if baseline_result is not None else "",
+            "candidates": [
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_type": candidate.candidate_type,
+                    "source": candidate.source,
+                    "parent_candidate_id": candidate.parent_candidate_id,
+                    "candidate_tune": dict(candidate.tune),
+                    "evaluations": result_groups.get(candidate.candidate_id, []),
+                }
+                for candidate in candidates
+            ],
+        }
+        write_json(path, data)
+
+    @staticmethod
+    def _write_verification_leaderboard(
+        path: Path,
+        verification_results: list[AutoTuneTrialResult],
+        baseline_result: Optional[AutoTuneTrialResult],
+    ) -> None:
+        rows = sorted(
+            [result for result in verification_results if not result.failed and result.score is not None],
+            key=lambda result: float(result.score),
+        )
+        baseline_score = baseline_result.score if baseline_result is not None else None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=(
+                    "rank",
+                    "candidate_id",
+                    "candidate_type",
+                    "score",
+                    "improvement_percent_vs_baseline",
+                    "mean_eval_position_rmse_m",
+                    "mean_yaw_rmse_deg",
+                    "consistency_status",
+                    "position_nees_source",
+                    "mean_position_nees",
+                    "mean_position_nees_diagonal_approx",
+                    "output_folder",
+                    "candidate_tune",
+                ),
+            )
+            writer.writeheader()
+            for rank, result in enumerate(rows, start=1):
+                metrics = result.metrics
+                consistency = metrics.get("consistency_report") if isinstance(metrics.get("consistency_report"), dict) else {}
+                writer.writerow(
+                    {
+                        "rank": rank,
+                        "candidate_id": result.candidate_id,
+                        "candidate_type": result.candidate_type,
+                        "score": result.score,
+                        "improvement_percent_vs_baseline": _improvement_percent(baseline_score, result.score),
+                        "mean_eval_position_rmse_m": metrics.get("mean_eval_position_rmse_m"),
+                        "mean_yaw_rmse_deg": metrics.get("mean_yaw_rmse_deg"),
+                        "consistency_status": consistency.get("overall_status"),
+                        "position_nees_source": metrics.get("position_nees_source"),
+                        "mean_position_nees": metrics.get("mean_position_nees"),
+                        "mean_position_nees_diagonal_approx": metrics.get("mean_position_nees_diagonal_approx"),
+                        "output_folder": str(result.output_folder) if result.output_folder else "",
+                        "candidate_tune": json.dumps(result.candidate_tune, sort_keys=True),
+                    }
+                )
+
+    @staticmethod
+    def _write_per_route_metrics_csv(path: Path, results: list[AutoTuneTrialResult]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = (
+            "stage",
+            "candidate_id",
+            "candidate_type",
+            "trial_index",
+            "route_index",
+            "route_name",
+            "filter_id",
+            "sensor_log_path",
+            "eval_position_rmse_m",
+            "yaw_rmse_deg",
+            "divergence_event_count",
+            "mean_nis",
+            "mean_position_nees",
+            "mean_position_nees_diagonal_approx",
+            "position_nees_source",
+        )
+        with path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+            for result in results:
+                for route_metric in _per_route_metrics(result):
+                    writer.writerow({key: _csv_value(route_metric.get(key)) for key in fieldnames})
 
     @staticmethod
     def _emit(callback: Optional[ProgressCallback], event: str, payload: dict[str, object]) -> None:
@@ -583,6 +1048,9 @@ class FilterAutoTuner:
             {
                 "trial_index": result.trial_index,
                 "trial_total": trial_total,
+                "stage": result.stage,
+                "candidate_id": result.candidate_id,
+                "candidate_type": result.candidate_type,
                 "score": result.score,
                 "best_score": best_score,
                 "failed": result.failed,
@@ -596,21 +1064,16 @@ class FilterAutoTuner:
     def _apply_retention_policy(
         request: AutoTuneRequest,
         trial_results: list[AutoTuneTrialResult],
-        best_score: Optional[float],
+        keep_result: Optional[AutoTuneTrialResult],
     ) -> None:
         if request.keep_trial_outputs and not request.keep_only_best_trial_output:
             return
-        best_trial_index: Optional[int] = None
-        if request.keep_only_best_trial_output and best_score is not None:
-            for result in trial_results:
-                if result.score == best_score and not result.failed:
-                    best_trial_index = result.trial_index
-                    break
+        keep_trial_index = keep_result.trial_index if request.keep_only_best_trial_output and keep_result is not None else None
         for result in trial_results:
             output_folder = result.output_folder
             if output_folder is None:
                 continue
-            if request.keep_only_best_trial_output and result.trial_index == best_trial_index:
+            if request.keep_only_best_trial_output and result.trial_index == keep_trial_index:
                 continue
             shutil.rmtree(output_folder, ignore_errors=True)
             parent = output_folder.parent
@@ -624,24 +1087,31 @@ class OfflineBenchmarkAutoTuner(FilterAutoTuner):
     """Mode-explicit name for the offline replay auto tuner."""
 
 
-def objective_score(metrics: dict[str, object], objective_name: str = "rmse_consistency", failure_count: int = 0) -> float:
-    """Compute a simple explainable score where lower is better."""
+def objective_score(metrics: dict[str, object], objective_name: str = "balanced_score", failure_count: int = 0) -> float:
+    """Compute an explainable score where lower is better."""
+    objective = _normalize_objective_name(objective_name)
     rmse = _optional_float(metrics.get("mean_eval_position_rmse_m"))
     if rmse is None:
         return 1.0e9
     yaw = _optional_float(metrics.get("mean_yaw_rmse_deg")) or 0.0
     divergence = _optional_float(metrics.get("divergence_event_count")) or 0.0
-    nis_penalty_source = _max_nis_type_mean(metrics.get("nis_by_type_summary"))
-    nis = nis_penalty_source if nis_penalty_source is not None else _optional_float(metrics.get("legacy_mean_nis_mixed"))
-    nees = _optional_float(metrics.get("mean_position_nees"))
-    if nees is None:
-        nees = _optional_float(metrics.get("mean_position_nees_diagonal_approx"))
-    consistency_penalty = 0.0
-    if nis is not None and nis > 9.0:
-        consistency_penalty += 0.05 * (nis - 9.0)
-    if nees is not None and nees > 12.0:
-        consistency_penalty += 0.05 * (nees - 12.0)
-    return rmse + 0.01 * yaw + 10.0 * divergence + 100.0 * max(0, failure_count) + consistency_penalty
+    consistency = _consistency_report(metrics)
+    consistency_error = _optional_float(consistency.get("consistency_error")) or 0.0
+    consistency_status = str(consistency.get("overall_status") or "unavailable")
+    failure_penalty = 100.0 * max(0, failure_count) + 10.0 * divergence
+
+    if objective == "min_eval_rmse":
+        return rmse + failure_penalty
+    if objective == "min_rmse_with_consistency_guard":
+        guard_penalty = 0.0
+        if consistency_status == "warning":
+            guard_penalty = max(1.0, 0.25 * rmse + consistency_error)
+        elif consistency_status == "severe":
+            guard_penalty = max(1000.0, 10.0 * rmse + 100.0 * consistency_error)
+        return rmse + failure_penalty + guard_penalty
+    if objective == "consistency_first":
+        return 100.0 * severity_rank(consistency_status) + 25.0 * consistency_error + 0.1 * rmse + failure_penalty
+    return rmse + 0.01 * yaw + failure_penalty + 2.0 * consistency_error + 5.0 * max(0, severity_rank(consistency_status) - 1)
 
 
 def list_saved_tune_configs(
@@ -899,6 +1369,9 @@ def _recorded_info_by_path(output_root: str) -> dict[str, RecordedLogInfo]:
 def _trial_to_dict(result: AutoTuneTrialResult) -> dict[str, object]:
     return {
         "trial_index": result.trial_index,
+        "stage": result.stage,
+        "candidate_id": result.candidate_id,
+        "candidate_type": result.candidate_type,
         "candidate_tune": dict(result.candidate_tune),
         "score": result.score,
         "metrics": dict(result.metrics),
@@ -975,6 +1448,227 @@ def _max_nis_type_mean(summary: object) -> Optional[float]:
     return max(values) if values else None
 
 
+def _search_params(request: AutoTuneRequest) -> list[dict[str, object]]:
+    params: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for group in ("primary", "secondary"):
+        for param in list(request.auto_tune_profile.get(group) or []):
+            if not isinstance(param, dict):
+                continue
+            key = str(param.get("key") or "")
+            if not key or key in seen or key in MEASUREMENT_NOISE_TUNE_KEYS:
+                continue
+            low = _optional_float(param.get("min"))
+            high = _optional_float(param.get("max"))
+            if low is None and high is None:
+                continue
+            if low is not None and high is not None and high <= low:
+                continue
+            seen.add(key)
+            params.append(dict(param))
+    return params
+
+
+def _dedupe_candidates(candidates: list[AutoTuneCandidate]) -> list[AutoTuneCandidate]:
+    result: list[AutoTuneCandidate] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        signature = _tune_signature(candidate.tune)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        result.append(candidate)
+    return result
+
+
+def _renumber_candidates(candidates: list[AutoTuneCandidate]) -> list[AutoTuneCandidate]:
+    result: list[AutoTuneCandidate] = []
+    for index, candidate in enumerate(candidates, start=1):
+        if not candidate.candidate_id.startswith("generated_"):
+            result.append(candidate)
+            continue
+        result.append(
+            AutoTuneCandidate(
+                candidate_id=f"generated_{index:03d}",
+                candidate_type=candidate.candidate_type,
+                tune=dict(candidate.tune),
+                source=candidate.source,
+                parent_candidate_id=candidate.parent_candidate_id,
+            )
+        )
+    return result
+
+
+def _tunes_equivalent(left: dict[str, object], right: dict[str, object]) -> bool:
+    return _tune_signature(left) == _tune_signature(right)
+
+
+def _tune_signature(tune: dict[str, object]) -> str:
+    normalized: dict[str, object] = {}
+    for key, value in sorted(tune.items()):
+        number = _optional_float(value)
+        normalized[str(key)] = round(number, 12) if number is not None else value
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+
+
+def _best_result(results: object) -> Optional[AutoTuneTrialResult]:
+    successful = [
+        result
+        for result in list(results)
+        if isinstance(result, AutoTuneTrialResult)
+        and not result.failed
+        and result.score is not None
+        and math.isfinite(float(result.score))
+    ]
+    if not successful:
+        return None
+    return min(successful, key=lambda result: float(result.score))
+
+
+def _verified_improvement(
+    winner: Optional[AutoTuneTrialResult],
+    baseline: Optional[AutoTuneTrialResult],
+) -> bool:
+    if winner is None or baseline is None or winner.score is None or baseline.score is None:
+        return False
+    if winner.candidate_type in {"default_base", "current_ui"}:
+        return False
+    baseline_score = float(baseline.score)
+    winner_score = float(winner.score)
+    min_delta = max(1.0e-9, abs(baseline_score) * 0.001)
+    return winner_score < baseline_score - min_delta
+
+
+def _improvement_percent(baseline_score: object, final_score: object) -> Optional[float]:
+    baseline = _optional_float(baseline_score)
+    final = _optional_float(final_score)
+    if baseline is None or final is None or abs(baseline) <= 1.0e-12:
+        return None
+    return 100.0 * (baseline - final) / abs(baseline)
+
+
+def _param_bound_or_sample_base(param: dict[str, object], base_tune: dict[str, object], bound_name: str) -> float:
+    bound = _optional_float(param.get(bound_name))
+    if bound is not None:
+        return bound
+    return _param_midpoint(param, base_tune)
+
+
+def _param_midpoint(param: dict[str, object], base_tune: dict[str, object]) -> float:
+    low = _optional_float(param.get("min"))
+    high = _optional_float(param.get("max"))
+    base = _optional_float(base_tune.get(str(param.get("key") or "")))
+    if low is None:
+        low = max(1.0e-9, (base or 1.0) * 0.25)
+    if high is None:
+        high = max(low, (base or low) * 4.0)
+    if str(param.get("scale") or "").lower() == "log" and low > 0.0 and high > low:
+        return math.exp((math.log(low) + math.log(high)) / 2.0)
+    return 0.5 * (low + high)
+
+
+def _compact_route_metric(row: dict[str, object]) -> dict[str, object]:
+    return {
+        "route_index": row.get("route_index"),
+        "route_name": row.get("route_name"),
+        "filter_id": row.get("filter_id"),
+        "sensor_log_path": row.get("sensor_log_path"),
+        "eval_position_rmse_m": row.get("eval_position_rmse_m") or row.get("position_rmse_m"),
+        "yaw_rmse_deg": row.get("yaw_rmse_deg"),
+        "divergence_event_count": row.get("divergence_event_count"),
+        "mean_nis": row.get("mean_nis"),
+        "legacy_mean_nis_mixed": row.get("legacy_mean_nis_mixed"),
+        "mean_position_nees": row.get("mean_position_nees"),
+        "mean_position_nees_diagonal_approx": row.get("mean_position_nees_diagonal_approx"),
+        "position_nees_source": row.get("position_nees_source"),
+        "nis_by_type_summary": row.get("nis_by_type_summary"),
+    }
+
+
+def _per_route_metrics(result: AutoTuneTrialResult) -> list[dict[str, object]]:
+    metrics = result.metrics.get("per_route_metrics") if isinstance(result.metrics, dict) else None
+    if not isinstance(metrics, list):
+        return []
+    rows: list[dict[str, object]] = []
+    for row in metrics:
+        if not isinstance(row, dict):
+            continue
+        rows.append(
+            {
+                "stage": result.stage,
+                "candidate_id": result.candidate_id,
+                "candidate_type": result.candidate_type,
+                "trial_index": result.trial_index,
+                **dict(row),
+            }
+        )
+    return rows
+
+
+def _all_per_route_metrics(results: list[AutoTuneTrialResult]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for result in results:
+        rows.extend(_per_route_metrics(result))
+    return rows
+
+
+def _combined_consistency_report(
+    verification_results: list[AutoTuneTrialResult],
+    verification_winner: Optional[AutoTuneTrialResult],
+    baseline_result: Optional[AutoTuneTrialResult],
+) -> dict[str, object]:
+    return {
+        "winner_candidate_id": verification_winner.candidate_id if verification_winner is not None else "",
+        "winner_candidate_type": verification_winner.candidate_type if verification_winner is not None else "",
+        "winner": _consistency_report(verification_winner.metrics) if verification_winner is not None else {},
+        "baseline_candidate_id": baseline_result.candidate_id if baseline_result is not None else "",
+        "baseline": _consistency_report(baseline_result.metrics) if baseline_result is not None else {},
+        "by_candidate": {
+            result.candidate_id: {
+                "candidate_type": result.candidate_type,
+                "score": result.score,
+                "consistency_report": _consistency_report(result.metrics),
+            }
+            for result in verification_results
+        },
+    }
+
+
+def _consistency_report(metrics: dict[str, object]) -> dict[str, object]:
+    existing = metrics.get("consistency_report") if isinstance(metrics, dict) else None
+    if isinstance(existing, dict):
+        return existing
+    return consistency_report_from_summaries(
+        nis_by_type_summary=metrics.get("nis_by_type_summary") if isinstance(metrics, dict) else {},
+        mean_position_nees=metrics.get("mean_position_nees") if isinstance(metrics, dict) else None,
+        mean_position_nees_diagonal_approx=metrics.get("mean_position_nees_diagonal_approx") if isinstance(metrics, dict) else None,
+        position_nees_source=metrics.get("position_nees_source") if isinstance(metrics, dict) else None,
+    )
+
+
+def _normalize_objective_name(value: object) -> str:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "rmse_consistency": "balanced_score",
+        "balanced": "balanced_score",
+        "rmse": "min_eval_rmse",
+        "min_rmse": "min_eval_rmse",
+        "consistency_guard": "min_rmse_with_consistency_guard",
+    }
+    text = aliases.get(text, text)
+    if text in {"min_eval_rmse", "min_rmse_with_consistency_guard", "consistency_first", "balanced_score"}:
+        return text
+    return "balanced_score"
+
+
+def _csv_value(value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, sort_keys=True)
+    return value
+
+
 def _sample_param(rng: random.Random, param: dict[str, object], fallback: object) -> float:
     low = _optional_float(param.get("min"))
     high = _optional_float(param.get("max"))
@@ -1000,23 +1694,24 @@ def _clamp_value(value: float, param: dict[str, object]) -> float:
 
 def _score_formula_description() -> str:
     return (
-        "score = mean_eval_position_rmse_m + 0.01 * mean_yaw_rmse_deg + "
-        "10 * divergence_event_count + 100 * failures + consistency_penalty; "
-        "NIS/NEES penalties are skipped when unavailable."
+        "Objective modes: min_eval_rmse uses eval RMSE plus failure/divergence penalties; "
+        "min_rmse_with_consistency_guard adds large penalties for warning/severe NIS/NEES; "
+        "consistency_first ranks consistency severity/error ahead of RMSE; "
+        "balanced_score blends RMSE, yaw, divergence/failures, and type-aware NIS/NEES consistency."
     )
 
 
 def _score_notes() -> str:
     return (
-        "rmse_consistency is a heuristic score. RMSE is the dominant term. "
-        "Yaw, divergence, failures, and large NIS/NEES values are penalized when available."
+        "Lower score is better. The final recommendation is chosen from the verification leaderboard, "
+        "not from raw search trials. The legacy rmse_consistency objective name maps to balanced_score."
     )
 
 
 def _nis_nees_policy() -> str:
     return (
-        "NIS/NEES thresholds are fixed heuristic thresholds used for ranking only, "
-        "not formal chi-square acceptance bounds."
+        "NIS/NEES are classified by expected dimension: GNSS position NIS dim=2, IMU yaw/yaw-rate/accel NIS dim=1, "
+        "and position NEES dim=2. Means above dimension indicate overconfidence; means below dimension indicate underconfidence."
     )
 
 

@@ -57,6 +57,10 @@ TUNE = {
     "process_jerk_stddev_mps3": 1.2,
     "gnss_position_stddev_m": 1.25,
     "imu_accel_stddev_mps2": 0.45,
+    "gnss_R_multiplier": 1.0,
+    "imu_accel_R_multiplier": 1.0,
+    "process_noise_multiplier": 1.0,
+    "covariance_inflation": 1.0,
     "initial_position_stddev_m": 4.0,
     "initial_velocity_stddev_mps": 3.0,
     "initial_accel_stddev_mps2": 1.5,
@@ -79,6 +83,10 @@ TUNE_SPECS = (
     ParameterSpec("process_jerk_stddev_mps3", "Process jerk", 0.05, 8.0, "m/s3", 2, "Noise"),
     ParameterSpec("gnss_position_stddev_m", "GNSS position", 0.10, 12.0, "m", 2, "Noise"),
     ParameterSpec("imu_accel_stddev_mps2", "IMU accel", 0.02, 5.0, "m/s2", 2, "Noise"),
+    ParameterSpec("gnss_R_multiplier", "Effective GNSS R", 0.10, 25.0, "x", 2, "Effective uncertainty"),
+    ParameterSpec("imu_accel_R_multiplier", "Effective IMU accel R", 0.10, 25.0, "x", 2, "Effective uncertainty"),
+    ParameterSpec("process_noise_multiplier", "Process Q inflation", 0.10, 25.0, "x", 2, "Effective uncertainty"),
+    ParameterSpec("covariance_inflation", "Covariance inflation", 1.0, 5.0, "x", 2, "Effective uncertainty"),
     ParameterSpec("initial_position_stddev_m", "Initial pos", 0.25, 25.0, "m", 2, "Initialization"),
     ParameterSpec("initial_velocity_stddev_mps", "Initial speed", 0.10, 15.0, "m/s", 2, "Initialization"),
     ParameterSpec("initial_accel_stddev_mps2", "Initial accel", 0.05, 8.0, "m/s2", 2, "Initialization"),
@@ -102,9 +110,13 @@ AUTO_TUNE_PROFILE = {
         {"key": "process_jerk_stddev_mps3", "scale": "log", "min": 0.10, "max": 5.0},
         {"key": "gnss_position_stddev_m", "scale": "log", "min": 0.40, "max": 6.0},
         {"key": "imu_accel_stddev_mps2", "scale": "log", "min": 0.05, "max": 3.0},
+        {"key": "gnss_R_multiplier", "scale": "log", "min": 0.25, "max": 16.0},
+        {"key": "imu_accel_R_multiplier", "scale": "log", "min": 0.25, "max": 16.0},
+        {"key": "process_noise_multiplier", "scale": "log", "min": 0.25, "max": 12.0},
     ],
     "secondary": [
         {"key": "initial_velocity_stddev_mps", "scale": "log", "min": 0.5, "max": 8.0},
+        {"key": "covariance_inflation", "scale": "log", "min": 1.0, "max": 3.0},
     ],
     "search": {
         "default_trials": 30,
@@ -129,9 +141,11 @@ class _CAFilterCore:
     """Linear 2D constant-acceleration Kalman filter."""
 
     def __init__(self, tune: dict[str, float]) -> None:
-        self._process_jerk_var = float(tune["process_jerk_stddev_mps3"]) ** 2
-        self._position_var = float(tune["gnss_position_stddev_m"]) ** 2
-        self._accel_var = float(tune["imu_accel_stddev_mps2"]) ** 2
+        process_multiplier = max(1.0e-6, float(tune.get("process_noise_multiplier", 1.0)))
+        self._process_jerk_var = float(tune["process_jerk_stddev_mps3"]) ** 2 * process_multiplier
+        self._position_var = float(tune["gnss_position_stddev_m"]) ** 2 * max(1.0e-6, float(tune.get("gnss_R_multiplier", 1.0)))
+        self._accel_var = float(tune["imu_accel_stddev_mps2"]) ** 2 * max(1.0e-6, float(tune.get("imu_accel_R_multiplier", 1.0)))
+        self._covariance_inflation = max(1.0, float(tune.get("covariance_inflation", 1.0)))
         self._initial_position_var = float(tune["initial_position_stddev_m"]) ** 2
         self._initial_velocity_var = float(tune["initial_velocity_stddev_mps"]) ** 2
         self._initial_accel_var = float(tune["initial_accel_stddev_mps2"]) ** 2
@@ -143,6 +157,8 @@ class _CAFilterCore:
         self.last_update_type: Optional[str] = None
         self.last_innovation: Optional[list[float]] = None
         self.last_nis: Optional[float] = None
+        self.nis_by_type: dict[str, float] = {}
+        self.nis_update_counts_by_type: dict[str, int] = {}
 
     @property
     def timestamp(self) -> Optional[float]:
@@ -164,6 +180,8 @@ class _CAFilterCore:
         self.last_update_type = None
         self.last_innovation = None
         self.last_nis = None
+        self.nis_by_type.clear()
+        self.nis_update_counts_by_type.clear()
 
     def initialize(
         self,
@@ -210,6 +228,8 @@ class _CAFilterCore:
         q = self._process_noise(dt)
         self._x = f @ self._x
         self._p = f @ self._p @ f.T + q
+        if self._covariance_inflation > 1.0:
+            self._p *= self._covariance_inflation
         self._p = self._symmetrize(self._p)
         if timestamp is not None:
             self._timestamp = float(timestamp)
@@ -271,7 +291,10 @@ class _CAFilterCore:
 
         self.last_update_type = update_type
         self.last_innovation = [float(value) for value in innovation.reshape(-1)]
-        self.last_nis = float((innovation.T @ innovation_cov_inv @ innovation)[0, 0])
+        nis = float((innovation.T @ innovation_cov_inv @ innovation)[0, 0])
+        self.last_nis = nis
+        self.nis_by_type[update_type] = nis
+        self.nis_update_counts_by_type[update_type] = self.nis_update_counts_by_type.get(update_type, 0) + 1
 
     @staticmethod
     def _transition_matrix(dt: float) -> np.ndarray:
@@ -459,6 +482,19 @@ class Filter:
             "last_update_type": self._filter.last_update_type,
             "innovation": self._filter.last_innovation,
             "nis": self._filter.last_nis,
+            "nis_by_type": dict(self._filter.nis_by_type),
+            "nis_update_counts_by_type": dict(self._filter.nis_update_counts_by_type),
+            "nis_expected_dimensions_by_type": {
+                "gnss_position": 2,
+                "imu_acceleration": 2,
+                "command_acceleration": 2,
+            },
+            "effective_uncertainty_multipliers": {
+                "gnss_R_multiplier": float(self._tune.get("gnss_R_multiplier", 1.0)),
+                "imu_accel_R_multiplier": float(self._tune.get("imu_accel_R_multiplier", 1.0)),
+                "process_noise_multiplier": float(self._tune.get("process_noise_multiplier", 1.0)),
+                "covariance_inflation": float(self._tune.get("covariance_inflation", 1.0)),
+            },
             "pending_acceleration_xy": self._pending_acceleration_xy,
             "latest_imu_yaw_deg": self._latest_imu_yaw_deg,
             "tracking_mode": self._tracking_mode,
