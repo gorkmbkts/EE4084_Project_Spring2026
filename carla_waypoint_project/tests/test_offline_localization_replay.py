@@ -615,6 +615,12 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
         raise AssertionError("auto tuner polluted normal offline evaluations output")
     if result.saved_config_path is None or not result.saved_config_path.exists():
         raise AssertionError("best tune config was not saved")
+    run_path_text = str(result.output_folder).replace("\\", "/")
+    if "/_at/o/ca_kf/" not in run_path_text:
+        raise AssertionError(f"offline auto-tune final output did not use compact physical folder: {result.output_folder}")
+    summary_path = result.output_folder / "auto_tune_summary.json"
+    if len(str(summary_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
+        raise AssertionError(f"offline auto-tune summary path is too long: {summary_path}")
     config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
     if config.get("filter_id") != "ca_kf" or "best_tune" not in config:
         raise AssertionError("saved best tune config is incomplete")
@@ -636,6 +642,17 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
         raise AssertionError("best tune metadata did not reference auto_tune trial output")
     if not str(config.get("noise_signature") or ""):
         raise AssertionError("saved config did not preserve full noise_signature")
+    if config.get("output_folder") != str(result.output_folder) or config.get("physical_output_folder") != str(result.output_folder):
+        raise AssertionError("saved config did not record compact physical output folder")
+    if "offline_localization/auto_tune/offline_passive/ca_kf/" not in str(config.get("logical_output_group") or ""):
+        raise AssertionError("saved config did not record logical offline output group")
+    listed = filter_auto_tuner_module.list_saved_tune_configs(
+        "ca_kf",
+        output_root=str(output_root),
+        context=offline_tune_context("ca_kf", sensor_noise_config=config.get("representative_sensor_noise_config")),
+    )
+    if not any(str(item.get("path")) == str(result.saved_config_path) for item in listed):
+        raise AssertionError(f"saved tune browser did not find compact offline config: {listed}")
     for key in ("objective_name", "score_formula", "score_notes", "nis_nees_policy", "unavailable_metrics_policy"):
         if not config.get(key):
             raise AssertionError(f"saved best tune config missing objective metadata: {key}")
@@ -650,6 +667,99 @@ def test_filter_auto_tuner_passes_candidate_tunes_and_saves_best_config(tmp_path
         raise AssertionError(f"keep_only_best_trial_output should keep exactly one replay output, got {kept_outputs}")
     if str(kept_outputs[0]).replace("\\", "/") != best_output:
         raise AssertionError("retention did not keep the best trial output")
+
+
+def test_filter_auto_tuner_uses_compact_final_output_under_long_root(tmp_path: Path) -> None:
+    output_root = tmp_path / "benchmark_results"
+    old_run_name = "a260607_120000"
+    noise_slug = "n_1234567890"
+    while True:
+        old_summary_path = (
+            output_root
+            / "offline_localization"
+            / "auto_tune"
+            / "offline_passive"
+            / "ca_kf"
+            / noise_slug
+            / old_run_name
+            / "auto_tune_summary.json"
+        )
+        compact_summary_path = output_root / "_at" / "o" / "ca_kf" / old_run_name / "auto_tune_summary.json"
+        if len(str(old_summary_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
+            break
+        output_root = output_root.parent / "long_project_segment" / "benchmark_results"
+    if len(str(compact_summary_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
+        pytest.skip("temporary directory root is too long to test compact auto-tune outputs")
+
+    route_folder = tmp_path / "logs" / "run_001" / "route_001"
+    route_folder.mkdir(parents=True)
+    log_path = route_folder / "sensor_log.csv"
+    log_path.write_text("timestamp\n0.0\n", encoding="utf-8")
+    sensor = {"preset_name": "Synthetic", "gnss_position_stddev_m": 1.25, "imu_accel_stddev_mps2": 0.45}
+    write_json(route_folder / "route_metadata.json", {"map_name": "Town01", "sensor_noise_config": sensor})
+    write_json(route_folder / "recording_summary.json", {"route_name": "route_001", "map_name": "Town01", "sample_count": 1})
+
+    calls: list[OfflineReplayRequest] = []
+
+    class FakeRunner:
+        def run(self, request: OfflineReplayRequest) -> SimpleNamespace:
+            calls.append(request)
+            folder = Path(request.run_folder_override)
+            folder.mkdir(parents=True, exist_ok=True)
+            write_json(
+                folder / "aggregate_summary.json",
+                {
+                    "route_count": 1,
+                    "aggregate_rows": [
+                        {
+                            "filter_id": "ca_kf",
+                            "eval_position_rmse_m": 1.0,
+                            "yaw_rmse_deg": 0.0,
+                            "divergence_event_count": 0,
+                        }
+                    ],
+                },
+            )
+            return SimpleNamespace(output_folder=folder, failures=())
+
+    request = AutoTuneRequest(
+        filter_id="ca_kf",
+        sensor_log_paths=(log_path,),
+        base_tune={"gnss_position_stddev_m": 1.25, "process_jerk_stddev_mps3": 1.2},
+        auto_tune_profile={
+            "enabled": True,
+            "primary": [{"key": "process_jerk_stddev_mps3", "scale": "log", "min": 0.5, "max": 2.0}],
+        },
+        max_trials=1,
+        output_root=str(output_root),
+        generate_trial_plots=False,
+        metadata={"candidate_generation_strategy": "random_plus_coordinate_refinement"},
+    )
+    result = FilterAutoTuner(runner_factory=FakeRunner).run(request)
+    summary_path = result.output_folder / "auto_tune_summary.json"
+    if "/_at/o/ca_kf/" not in str(summary_path).replace("\\", "/"):
+        raise AssertionError(f"auto-tune summary was not written under compact output root: {summary_path}")
+    if len(str(summary_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
+        raise AssertionError(f"compact auto-tune summary path is too long: {summary_path}")
+    trial_metrics_path = Path(calls[0].run_folder_override) / "r001" / "met" / "summary_metrics.json"
+    if len(str(trial_metrics_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
+        raise AssertionError(f"compact trial staging path is too long: {trial_metrics_path}")
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    if config.get("benchmark_mode") != BENCHMARK_MODE_OFFLINE or config.get("tracking_mode") != TRACKING_PASSIVE:
+        raise AssertionError("compact offline output did not preserve offline passive metadata")
+    if config.get("noise_signature") != noise_signature(sensor):
+        raise AssertionError("compact offline output did not preserve full noise signature")
+    if config.get("representative_sensor_noise_config") != sensor:
+        raise AssertionError("compact offline output did not preserve representative sensor config")
+    if "offline_localization/auto_tune/offline_passive/ca_kf/" not in str(config.get("logical_output_group") or ""):
+        raise AssertionError("compact offline output did not record logical output group")
+    listed = filter_auto_tuner_module.list_saved_tune_configs(
+        "ca_kf",
+        output_root=str(output_root),
+        context=offline_tune_context("ca_kf", sensor_noise_config=sensor),
+    )
+    if not any(str(item.get("path")) == str(result.saved_config_path) for item in listed):
+        raise AssertionError("saved tune browser did not find compact offline config under long output root")
 
 
 def test_filter_auto_tuner_rejects_mixed_noise_signatures_by_default(tmp_path: Path) -> None:

@@ -110,8 +110,23 @@ def test_closed_loop_autotuner_selects_top_finalists_and_validates_only_them(tmp
     if config.get("tune_scope") != TUNE_SCOPE_CLOSED_LOOP_VALIDATED or not config.get("validated_in_closed_loop"):
         raise AssertionError("closed-loop backend did not mark validated tune scope")
     path_text = str(result.saved_config_path).replace("\\", "/")
-    if "/closed_loop/auto_tune/passive/ca_kf/" not in path_text:
+    if "/_at/cl/p/ca_kf/" not in path_text:
         raise AssertionError(f"passive closed-loop tune was saved to the wrong folder: {path_text}")
+    if "closed_loop/auto_tune/passive/ca_kf/" not in str(config.get("logical_output_group") or ""):
+        raise AssertionError("passive closed-loop tune did not preserve logical output group")
+    listed = filter_auto_tuner_module.list_saved_tune_configs(
+        "ca_kf",
+        output_root=request.output_root,
+        context=closed_loop_tune_context(
+            "ca_kf",
+            TRACKING_PASSIVE,
+            sensor_noise_config=request.sensor_noise_config,
+            vehicle_behavior_config=request.vehicle_behavior_config,
+            actuator_realism_config=request.actuator_realism_config,
+        ),
+    )
+    if not any(str(item.get("path")) == str(result.saved_config_path) for item in listed):
+        raise AssertionError(f"saved tune browser did not find compact closed-loop config: {listed}")
     if len(config.get("closed_loop_validation_results") or []) != 2:
         raise AssertionError("saved config did not preserve finalist validation results")
 
@@ -171,11 +186,13 @@ def test_closed_loop_autotuner_candidate_generation_uses_compact_replay_staging(
         raise AssertionError(f"closed-loop candidate replay metrics path is too long: {metrics_path}")
 
     config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
-    path_parts = [part for part in result.saved_config_path.parts]
-    if "closed_loop" not in path_parts or "auto_tune" not in path_parts:
-        raise AssertionError(f"closed-loop final output folder moved unexpectedly: {result.saved_config_path}")
-    if not any(part.startswith("n_") and len(part) <= 12 for part in path_parts):
-        raise AssertionError(f"closed-loop final output did not use short noise slug: {result.saved_config_path}")
+    final_summary_path = result.output_folder / "closed_loop_auto_tune_summary.json"
+    if "/_at/cl/p/ca_kf/" not in str(final_summary_path).replace("\\", "/"):
+        raise AssertionError(f"closed-loop final output did not use compact physical folder: {result.saved_config_path}")
+    if len(str(final_summary_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
+        raise AssertionError(f"closed-loop final summary path is too long: {final_summary_path}")
+    if "closed_loop/auto_tune/passive/ca_kf/" not in str(config.get("logical_output_group") or ""):
+        raise AssertionError("closed-loop saved config did not preserve logical output group")
     if config.get("noise_signature") != noise_signature(sensor):
         raise AssertionError("closed-loop saved config did not preserve full noise_signature")
     if "/_tmp/at/" not in str(config.get("offline_candidate_staging_folder") or "").replace("\\", "/"):
@@ -194,8 +211,10 @@ def test_closed_loop_autotuner_saves_active_config_separately(tmp_path: Path) ->
     if "passive sensor-log replay" not in str(config.get("active_control_parameter_policy") or ""):
         raise AssertionError("active config did not document passive offline candidate-generation limitation")
     path_text = str(result.saved_config_path).replace("\\", "/")
-    if "/closed_loop/auto_tune/active/ca_kf/" not in path_text:
+    if "/_at/cl/a/ca_kf/" not in path_text:
         raise AssertionError(f"active closed-loop tune was saved to the wrong folder: {path_text}")
+    if "closed_loop/auto_tune/active/ca_kf/" not in str(config.get("logical_output_group") or ""):
+        raise AssertionError("active config did not preserve active logical output group")
 
 
 def test_backend_created_configs_cannot_mix_contexts(tmp_path: Path) -> None:

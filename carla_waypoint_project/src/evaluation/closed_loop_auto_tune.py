@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 from src.KalmanLab.registry import discover_filters
 from src.evaluation import filter_auto_tuner as offline_auto_tuner_module
-from src.evaluation.evaluation_artifacts import read_json, slugify, unique_folder, write_json
+from src.evaluation.evaluation_artifacts import benchmark_root, read_json, slugify, unique_folder, write_json
 from src.evaluation.filter_auto_tuner import (
     AutoTuneRequest,
     AutoTuneResult,
@@ -354,7 +354,7 @@ class ClosedLoopBenchmarkAutoTuner:
         base_tune.update(locked.values)
 
         run_folder = unique_folder(
-            _closed_loop_noise_root(request.output_root, request.filter_id, request.tracking_mode, locked.signature),
+            _closed_loop_physical_root(request.output_root, request.filter_id, request.tracking_mode),
             _run_folder_name(),
         )
         _validate_windows_path_length(
@@ -458,7 +458,7 @@ class ClosedLoopBenchmarkAutoTuner:
             base_tune=base_tune,
             locked_sensor_noise_values=dict(locked.values),
             output_folder=run_folder,
-            extra=_closed_loop_extra_metadata(request, offline_result, locked.sources),
+            extra=_closed_loop_extra_metadata(request, offline_result, locked.signature, run_folder, locked.sources),
         )
         _ensure_backend_config_compatible(config, request)
         saved_config_path = save_closed_loop_best_tune(request.output_root, request.filter_id, request.tracking_mode, run_folder, config)
@@ -666,12 +666,18 @@ def _select_finalists(offline_result: AutoTuneResult, finalist_count: int) -> li
 def _closed_loop_extra_metadata(
     request: ClosedLoopAutoTuneRequest,
     offline_result: AutoTuneResult,
+    noise_sig: str,
+    run_folder: Path,
     locked_sensor_noise_sources: dict[str, str],
 ) -> dict[str, object]:
     offline_summary = read_json(Path(offline_result.output_folder) / "auto_tune_summary.json")
     offline_metadata = offline_summary.get("metadata") if isinstance(offline_summary.get("metadata"), dict) else {}
     return {
         "source": "closed_loop_auto_tune",
+        "physical_output_folder": str(run_folder),
+        "logical_output_group": _closed_loop_logical_group(request.filter_id, request.tracking_mode, noise_sig),
+        "logical_output_root": str(_closed_loop_noise_root(request.output_root, request.filter_id, request.tracking_mode, noise_sig)),
+        "logical_index_path": str(_closed_loop_index_path(request.output_root, request.filter_id, request.tracking_mode)),
         "candidate_generation_stage": "offline_replay_process_only",
         "closed_loop_validation_stage": "finalists_only",
         "offline_auto_tune_output_folder": str(offline_result.output_folder),
@@ -721,18 +727,36 @@ def _offline_log_metadata(path: Path) -> dict[str, object]:
 
 
 def _closed_loop_filter_root(output_root: str, filter_id: str, tracking_mode: str) -> Path:
-    root = Path(output_root)
-    if not root.is_absolute():
-        root = Path(__file__).resolve().parents[2] / root
-    return root / "closed_loop" / "auto_tune" / str(tracking_mode or TRACKING_PASSIVE) / slugify(filter_id, "filter")
+    return benchmark_root(output_root) / "closed_loop" / "auto_tune" / str(tracking_mode or TRACKING_PASSIVE) / slugify(filter_id, "filter")
 
 
 def _closed_loop_noise_root(output_root: str, filter_id: str, tracking_mode: str, noise_sig: str) -> Path:
     return _closed_loop_filter_root(output_root, filter_id, tracking_mode) / noise_signature_slug(noise_sig)
 
 
+def _closed_loop_physical_root(output_root: str, filter_id: str, tracking_mode: str) -> Path:
+    tracking = "a" if str(tracking_mode or TRACKING_PASSIVE) == TRACKING_ACTIVE else "p"
+    return benchmark_root(output_root) / "_at" / "cl" / tracking / _short_filter_slug(filter_id)
+
+
+def _closed_loop_logical_group(filter_id: str, tracking_mode: str, noise_sig: str) -> str:
+    return "/".join(
+        (
+            "closed_loop",
+            "auto_tune",
+            str(tracking_mode or TRACKING_PASSIVE),
+            slugify(filter_id, "filter"),
+            noise_signature_slug(noise_sig),
+        )
+    )
+
+
 def _closed_loop_index_path(output_root: str, filter_id: str, tracking_mode: str) -> Path:
     return _closed_loop_filter_root(output_root, filter_id, tracking_mode) / "saved_tune_configs.json"
+
+
+def _short_filter_slug(filter_id: str) -> str:
+    return slugify(filter_id, "f")[:18]
 
 
 def _update_closed_loop_saved_config_index(

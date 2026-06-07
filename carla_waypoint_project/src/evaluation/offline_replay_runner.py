@@ -1050,8 +1050,8 @@ def _validate_windows_path_length(path: Path, label: str) -> None:
         return
     raise ValueError(
         f"{label} is likely too long for Windows ({len(absolute)} characters): {absolute}. "
-        "Auto-tune trials should use compact output paths; if this still occurs, move the project "
-        "or benchmark output root to a shorter directory."
+        "Move the project closer to C:\\ or set the benchmark output root to a shorter directory such as C:\\carla_results. "
+        "Auto-tune uses compact output paths by default, so this usually means the project/output root itself is too deep."
     )
 
 

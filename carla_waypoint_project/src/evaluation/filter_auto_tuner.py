@@ -22,6 +22,7 @@ from src.evaluation.benchmark_config import project_commit_hash
 from src.evaluation.consistency_metrics import MEASUREMENT_NOISE_TUNE_KEYS
 from src.evaluation.evaluation_artifacts import (
     RecordedLogInfo,
+    benchmark_root,
     list_recorded_logs,
     offline_root,
     read_json,
@@ -157,7 +158,7 @@ class FilterAutoTuner:
         )
         max_trials = max(1, int(request.max_trials or 1))
         run_folder = unique_folder(
-            _offline_auto_tune_noise_root(request.output_root, request.filter_id, locked.signature),
+            _offline_auto_tune_physical_root(request.output_root, request.filter_id),
             _run_folder_name(request.filter_id, request.sensor_log_paths, request.output_root),
         )
         _validate_windows_path_length(run_folder / "auto_tune_summary.json", "Auto-tune summary file")
@@ -174,6 +175,10 @@ class FilterAutoTuner:
                 **dict(request.metadata),
                 "offline_candidate_staging_folder": str(trial_staging_folder),
                 "auto_tune_final_output_folder": str(run_folder),
+                "auto_tune_physical_output_folder": str(run_folder),
+                "logical_output_group": _offline_auto_tune_logical_group(request.filter_id, locked.signature),
+                "logical_output_root": str(_offline_auto_tune_noise_root(request.output_root, request.filter_id, locked.signature)),
+                "logical_index_path": str(_saved_config_index_path(request.output_root, request.filter_id)),
             },
         )
         trial_results: list[AutoTuneTrialResult] = []
@@ -504,6 +509,10 @@ class FilterAutoTuner:
             "source": "offline_auto_tune",
             "noise_profile_label": noise["label"],
             "sensor_noise_config": noise.get("representative_config") or {},
+            "physical_output_folder": str(run_folder),
+            "logical_output_group": str(request.metadata.get("logical_output_group") or ""),
+            "logical_output_root": str(request.metadata.get("logical_output_root") or ""),
+            "logical_index_path": str(request.metadata.get("logical_index_path") or ""),
             "objective": request.objective_name,
             "objective_name": request.objective_name,
             "score_formula": _score_formula_description(),
@@ -751,11 +760,24 @@ def _offline_auto_tune_noise_root(output_root: str, filter_id: str, noise_signat
     return _offline_auto_tune_filter_root(output_root, filter_id) / noise_signature_slug(noise_signature)
 
 
+def _offline_auto_tune_physical_root(output_root: str, filter_id: str) -> Path:
+    return benchmark_root(output_root) / "_at" / "o" / _short_filter_slug(filter_id)
+
+
+def _offline_auto_tune_logical_group(filter_id: str, noise_signature: str) -> str:
+    return "/".join(
+        (
+            "offline_localization",
+            "auto_tune",
+            "offline_passive",
+            slugify(filter_id, "filter"),
+            noise_signature_slug(noise_signature),
+        )
+    )
+
+
 def _auto_tune_trial_staging_root(output_root: str) -> Path:
-    root = Path(output_root)
-    if not root.is_absolute():
-        root = Path(__file__).resolve().parents[2] / root
-    return root / "_tmp" / "at"
+    return benchmark_root(output_root) / "_tmp" / "at"
 
 
 def _auto_tune_trial_staging_folder(request: AutoTuneRequest, run_folder: Path) -> Path:
@@ -768,10 +790,11 @@ def _auto_tune_trial_staging_folder(request: AutoTuneRequest, run_folder: Path) 
 
 
 def _closed_loop_auto_tune_filter_root(output_root: str, filter_id: str, tracking_mode: str) -> Path:
-    root = Path(output_root)
-    if not root.is_absolute():
-        root = Path(__file__).resolve().parents[2] / root
-    return root / "closed_loop" / "auto_tune" / str(tracking_mode or TRACKING_PASSIVE) / slugify(filter_id, "filter")
+    return benchmark_root(output_root) / "closed_loop" / "auto_tune" / str(tracking_mode or TRACKING_PASSIVE) / slugify(filter_id, "filter")
+
+
+def _short_filter_slug(filter_id: str) -> str:
+    return slugify(filter_id, "f")[:18]
 
 
 def _saved_config_index_path(output_root: str, filter_id: str) -> Path:
