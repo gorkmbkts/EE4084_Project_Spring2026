@@ -250,7 +250,7 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_log_rects: dict[int, pygame.Rect] = {}
         self._closed_loop_auto_tune_route_rects: dict[int, pygame.Rect] = {}
         self._closed_loop_auto_tune_trials = 30
-        self._closed_loop_auto_tune_finalists = 3
+        self._closed_loop_auto_tune_finalists = 1
         self._closed_loop_auto_tune_status_lines: list[str] = []
         self._closed_loop_auto_tune_start_rect = pygame.Rect(0, 0, 1, 1)
         self._closed_loop_auto_tune_cancel_rect = pygame.Rect(0, 0, 1, 1)
@@ -1858,7 +1858,7 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_filter_id = filter_id
         search = record.auto_tune_profile.get("search") if isinstance(record.auto_tune_profile.get("search"), dict) else {}
         self._closed_loop_auto_tune_trials = int(search.get("default_trials") or 30)
-        self._closed_loop_auto_tune_finalists = min(5, max(1, int(search.get("default_finalists") or 3)))
+        self._closed_loop_auto_tune_finalists = 1
         self._closed_loop_auto_tune_selected_log_indices = set()
         self._closed_loop_auto_tune_validation_route_index = (
             next(iter(self._selected_route_indices)) if len(self._selected_route_indices) == 1 else None
@@ -1866,9 +1866,9 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_log_scroll = 0
         self._closed_loop_auto_tune_route_scroll = 0
         self._closed_loop_auto_tune_status_lines = [
-            "Closed-loop auto tune runs real CARLA route trials directly.",
-            "Each trial applies one tune and scores closed-loop route performance.",
-            "Sensor noise is locked from selected matching logs; actuator model is kept separate.",
+            "Direct mode runs every search trial as a real CARLA route trial with no rendering.",
+            "Offline logs are used only to lock and verify the sensor-noise context.",
+            "There is no offline finalist stage in this mode.",
         ]
 
     def _handle_closed_loop_auto_tune_modal_event(self, event: pygame.event.Event, client: object) -> object:
@@ -1904,12 +1904,6 @@ class StartupMapSelector:
             return _NoSelection
         if self._closed_loop_auto_tune_trials_plus_rect.collidepoint(position):
             self._closed_loop_auto_tune_trials = min(500, self._closed_loop_auto_tune_trials + 5)
-            return _NoSelection
-        if self._closed_loop_auto_tune_finalists_minus_rect.collidepoint(position):
-            self._closed_loop_auto_tune_finalists = max(1, self._closed_loop_auto_tune_finalists - 1)
-            return _NoSelection
-        if self._closed_loop_auto_tune_finalists_plus_rect.collidepoint(position):
-            self._closed_loop_auto_tune_finalists = min(10, self._closed_loop_auto_tune_finalists + 1)
             return _NoSelection
         for index, rect in self._closed_loop_auto_tune_log_rects.items():
             if rect.collidepoint(position):
@@ -1958,7 +1952,7 @@ class StartupMapSelector:
             if index in self._closed_loop_auto_tune_selected_log_indices
         ]
         if not selected_logs:
-            raise ValueError("Select at least one recorded offline sensor log for candidate generation.")
+            raise ValueError("Select at least one recorded offline sensor log to lock the sensor-noise context.")
         log_metadata = [self._recorded_log_noise_metadata(info) for info in selected_logs]
         log_noise = noise_profile_summary(log_metadata)
         if log_noise.get("mixed"):
@@ -1971,10 +1965,10 @@ class StartupMapSelector:
             raise ValueError("Selected offline logs do not match the current sensor noise profile/signature.")
 
         if self._closed_loop_auto_tune_validation_route_index is None:
-            raise ValueError("Select exactly one validation route for closed-loop finalist validation.")
+            raise ValueError("Select exactly one validation route for direct closed-loop trial scoring.")
         route_items = [item for item in self._route_items if item.index == self._closed_loop_auto_tune_validation_route_index]
         if len(route_items) != 1:
-            raise ValueError("Select exactly one validation route for closed-loop finalist validation.")
+            raise ValueError("Select exactly one validation route for direct closed-loop trial scoring.")
         route = route_items[0].route
         if not route.map_name:
             raise ValueError("Validation route is missing map metadata.")
@@ -1995,7 +1989,7 @@ class StartupMapSelector:
             vehicle_behavior_config=dict(behavior_config),
             actuator_realism_config=dict(actuator_config),
             trial_count=max(1, int(self._closed_loop_auto_tune_trials or 30)),
-            finalist_count=max(1, int(self._closed_loop_auto_tune_finalists or 3)),
+            finalist_count=1,
             strategy="optuna_tpe",
             output_root="benchmark_results",
             created_at=datetime.now().isoformat(timespec="seconds"),
@@ -2025,7 +2019,7 @@ class StartupMapSelector:
             actuator_realism_enabled=True,
             actuator_realism_profile=str(actuator_config.get("preset_name") or self._actuator_preset),
             trial_count=max(1, int(self._closed_loop_auto_tune_trials or 30)),
-            finalist_count=max(1, int(self._closed_loop_auto_tune_finalists or 3)),
+            finalist_count=1,
             strategy="optuna_tpe",
             output_root="benchmark_results",
             metadata={
@@ -2087,8 +2081,8 @@ class StartupMapSelector:
         dim = pygame.Surface((width, height), pygame.SRCALPHA)
         dim.fill((0, 0, 0, 150))
         self._surface.blit(dim, (0, 0))
-        modal_w = min(width - 80, 1080)
-        modal_h = min(height - 70, 740)
+        modal_w = min(width - 70, 1160)
+        modal_h = min(height - 70, 730)
         modal = pygame.Rect(0, 0, modal_w, modal_h)
         modal.center = (width // 2, height // 2)
         pygame.draw.rect(self._surface, DASHBOARD.panel_background_color, modal, border_radius=8)
@@ -2117,8 +2111,8 @@ class StartupMapSelector:
 
         footer_h = 44
         body = pygame.Rect(content.left, content.top + 76, content.width, content.height - 76 - footer_h - 10)
-        left = pygame.Rect(body.left, body.top, int(body.width * 0.42), body.height)
-        center = pygame.Rect(left.right + 10, body.top, int(body.width * 0.30), body.height)
+        left = pygame.Rect(body.left, body.top, int(body.width * 0.40), body.height)
+        center = pygame.Rect(left.right + 10, body.top, int(body.width * 0.29), body.height)
         right = pygame.Rect(center.right + 10, body.top, body.right - center.right - 10, body.height)
         self._draw_closed_loop_auto_tune_log_selection(left)
         self._draw_closed_loop_auto_tune_route_selection(center)
@@ -2193,34 +2187,43 @@ class StartupMapSelector:
             self._draw_text(f"{display_map_name(item.route.map_name)} | {length}", (row.left + 8, row.top + 29), self._small_font, DASHBOARD.muted_text_color, row.width - 16)
 
     def _draw_closed_loop_auto_tune_settings_and_console(self, rect: pygame.Rect) -> None:
-        settings_h = 138
+        settings_h = 210
         settings = pygame.Rect(rect.left, rect.top, rect.width, settings_h)
         console = pygame.Rect(rect.left, settings.bottom + 10, rect.width, rect.bottom - settings.bottom - 10)
         pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, settings, border_radius=6)
         pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, settings, width=1, border_radius=6)
         content = settings.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
-        self._draw_text("Settings", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
+        self._draw_text("Direct Trial Settings", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
         y = content.top + 30
-        self._closed_loop_auto_tune_trials_minus_rect = pygame.Rect(content.left + 72, y - 3, 24, 22)
+        self._closed_loop_auto_tune_trials_minus_rect = pygame.Rect(content.left + 82, y - 3, 24, 22)
         self._closed_loop_auto_tune_trials_plus_rect = pygame.Rect(self._closed_loop_auto_tune_trials_minus_rect.right + 42, y - 3, 24, 22)
-        self._draw_text(f"Trials: {self._closed_loop_auto_tune_trials}", (content.left, y), self._small_font, DASHBOARD.text_color, 70)
+        self._draw_text(f"CARLA trials: {self._closed_loop_auto_tune_trials}", (content.left, y), self._small_font, DASHBOARD.text_color, 82)
         self._draw_button(self._closed_loop_auto_tune_trials_minus_rect, "-")
         self._draw_button(self._closed_loop_auto_tune_trials_plus_rect, "+")
-        y += 27
-        self._closed_loop_auto_tune_finalists_minus_rect = pygame.Rect(content.left + 82, y - 3, 24, 22)
-        self._closed_loop_auto_tune_finalists_plus_rect = pygame.Rect(self._closed_loop_auto_tune_finalists_minus_rect.right + 42, y - 3, 24, 22)
-        self._draw_text(f"Finalists: {self._closed_loop_auto_tune_finalists}", (content.left, y), self._small_font, DASHBOARD.text_color, 82)
-        self._draw_button(self._closed_loop_auto_tune_finalists_minus_rect, "-")
-        self._draw_button(self._closed_loop_auto_tune_finalists_plus_rect, "+")
-        y += 27
-        self._draw_text("Strategy: direct optuna_tpe ask/tell; fallback random search", (content.left, y), self._small_font, DASHBOARD.text_color, content.width)
-        y += 18
-        self._draw_text(f"Actuator: {self._actuator_preset} | Tracking-specific search space", (content.left, y), self._small_font, DASHBOARD.warning_color, content.width)
+        y += 29
+        active_policy = (
+            "Active-control params may be tuned."
+            if self._tracking_mode == TRACKING_MODE_ACTIVE
+            else "Passive tracking: active-control params are not tuned."
+        )
+        detail_lines = [
+            "Mode: every search trial drives the selected route in CARLA no-render.",
+            "Offline logs: sensor-noise context only; no candidate generation.",
+            "Strategy: direct optuna_tpe ask/tell; fallback direct random search.",
+            f"Tracking: {self._tracking_mode}. {active_policy}",
+            f"Sensor noise: {self._sensor_preset}",
+            f"Behavior: {self._behavior_preset}",
+            f"Actuator: {self._actuator_preset} (applied during every trial)",
+        ]
+        for line in detail_lines:
+            color = DASHBOARD.warning_color if line.startswith("Actuator:") or line.startswith("Tracking:") else DASHBOARD.text_color
+            self._draw_text(line, (content.left, y), self._small_font, color, content.width)
+            y += 18
 
         pygame.draw.rect(self._surface, (14, 18, 24), console, border_radius=6)
         pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, console, width=1, border_radius=6)
         body = console.inflate(-12, -10)
-        self._draw_text("Progress", body.topleft, self._subtitle_font, DASHBOARD.title_color, body.width)
+        self._draw_text("Setup Notes", body.topleft, self._subtitle_font, DASHBOARD.title_color, body.width)
         line_y = body.top + 30
         line_h = 17
         max_lines = max(1, (body.bottom - line_y) // line_h)
@@ -2243,8 +2246,12 @@ class StartupMapSelector:
                 route_name = f"{route_item.route.name} ({display_map_name(route_item.route.map_name)})"
         summary = (
             f"Logs: {len(selected_logs)} | Noise: {noise.get('label') or 'n/a'} | "
-            f"Route: {route_name} | Actuator: {self._actuator_preset}"
+            f"Route: {route_name} | Tracking: {self._tracking_mode} | Actuator: {self._actuator_preset}"
         )
+        if self._tracking_mode == TRACKING_MODE_PASSIVE:
+            summary += " | active-control params off"
+        else:
+            summary += " | active-control params may tune"
         if noise.get("mixed"):
             summary += " | mixed noise selected"
         self._draw_text(summary, (rect.left, rect.top + 13), self._small_font, DASHBOARD.warning_color if noise.get("mixed") else DASHBOARD.muted_text_color, self._closed_loop_auto_tune_start_rect.left - rect.left - 10)

@@ -90,6 +90,7 @@ BENCHMARK_PROGRESS_DISTANCE_M = 0.8
 BENCHMARK_GOAL_DISTANCE_PROGRESS_M = 1.0
 BENCHMARK_LATERAL_DEVIATION_M = 15.0
 BENCHMARK_LATERAL_DEVIATION_SECONDS = 3.0
+CLOSED_LOOP_AUTOTUNE_PROGRESS_REFRESH_S = 0.5
 
 
 class DriveMode(Enum):
@@ -229,6 +230,17 @@ class SimulationApp:
         self._closed_loop_auto_tune_cancel_requested = False
         self._closed_loop_auto_tune_status_lines: list[str] = []
         self._closed_loop_auto_tune_live_line = ""
+        self._closed_loop_auto_tune_context: dict[str, object] = {}
+        self._closed_loop_auto_tune_live_metrics: dict[str, object] = {}
+        self._closed_loop_auto_tune_trial_rows: list[dict[str, object]] = []
+        self._closed_loop_auto_tune_current_trial = 0
+        self._closed_loop_auto_tune_total_trials = 0
+        self._closed_loop_auto_tune_current_status = "idle"
+        self._closed_loop_auto_tune_background_surface: Optional[pygame.Surface] = None
+        self._closed_loop_auto_tune_progress_dirty = True
+        self._closed_loop_auto_tune_last_draw_monotonic = 0.0
+        self._closed_loop_auto_tune_last_live_update_monotonic = 0.0
+        self._closed_loop_auto_tune_trial_start_debug: dict[str, object] = {}
         self._closed_loop_auto_tune_best_score: Optional[float] = None
         self._closed_loop_auto_tune_previous_no_rendering: Optional[bool] = None
         self._closed_loop_auto_tune_trial_wall_start: Optional[float] = None
@@ -587,16 +599,38 @@ class SimulationApp:
         self._closed_loop_auto_tune_cancel_requested = False
         self._closed_loop_auto_tune_best_score = None
         self._closed_loop_auto_tune_live_line = ""
+        self._closed_loop_auto_tune_current_trial = 0
+        self._closed_loop_auto_tune_total_trials = max(1, int(request.trial_count or 1))
+        self._closed_loop_auto_tune_current_status = "Starting direct CARLA route trials"
+        self._closed_loop_auto_tune_live_metrics = {}
+        self._closed_loop_auto_tune_trial_rows = []
+        self._closed_loop_auto_tune_trial_start_debug = {}
+        self._closed_loop_auto_tune_context = {
+            "filter": request.filter_id,
+            "tracking_mode": request.tracking_mode,
+            "route": validation_route.name,
+            "map": display_map_name(validation_route.map_name),
+            "sensor_noise": request.sensor_noise_profile or request.sensor_noise_config.get("preset_name") or "Custom",
+            "behavior": request.vehicle_behavior_profile or request.vehicle_behavior_config.get("preset_name") or "Custom",
+            "actuator": request.actuator_realism_profile or request.actuator_realism_config.get("preset_name") or "Custom",
+            "active_control_policy": (
+                "active-control params may be tuned"
+                if request.tracking_mode == TRACKING_MODE_ACTIVE
+                else "active-control params are not tuned"
+            ),
+        }
         self._closed_loop_auto_tune_status_lines = [
-            "Closed-loop auto tune: direct CARLA route trials starting",
-            f"Filter {request.filter_id} | tracking {request.tracking_mode} | actuator {request.actuator_realism_profile}",
+            "Direct mode: every search trial is a no-render CARLA route trial.",
+            "Offline logs are used only to lock/verify the sensor-noise context.",
             "CARLA no-rendering mode enabled; fixed_delta_seconds is unchanged.",
         ]
         self._closed_loop_auto_tune_previous_no_rendering = self._client_manager.no_rendering_mode
         self._client_manager.set_no_rendering_mode(True)
         self._planner_status = "Closed-loop auto tune: direct trial search starting"
         self._control_status_text = self._planner_status
-        self._draw_closed_loop_auto_tune_progress_frame()
+        self._capture_closed_loop_auto_tune_background()
+        self._mark_closed_loop_auto_tune_progress_dirty()
+        self._draw_closed_loop_auto_tune_progress_frame(force=True)
         runner = AppClosedLoopValidationRunner(self)
         try:
             result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(
@@ -608,9 +642,11 @@ class SimulationApp:
             self._planner_status = f"Closed-loop auto tune failed: {exc}"
             self._control_status_text = self._planner_status
             self._closed_loop_auto_tune_status_lines.append(self._planner_status)
+            self._closed_loop_auto_tune_current_status = self._planner_status
             self._drive_mode = DriveMode.MANUAL
             self._restore_closed_loop_auto_tune_rendering()
-            self._draw_closed_loop_auto_tune_progress_frame()
+            self._mark_closed_loop_auto_tune_progress_dirty()
+            self._draw_closed_loop_auto_tune_progress_frame(force=True)
             return
         self._restore_closed_loop_auto_tune_rendering()
         if self._filter_manager is not None and result.best_tune:
@@ -621,8 +657,10 @@ class SimulationApp:
         self._planner_status = f"Closed-loop auto tune complete: {result.saved_config_path}"
         self._control_status_text = self._planner_status
         self._closed_loop_auto_tune_status_lines.append(self._planner_status)
+        self._closed_loop_auto_tune_current_status = "Complete"
         self._drive_mode = DriveMode.MANUAL
-        self._draw_closed_loop_auto_tune_progress_frame()
+        self._mark_closed_loop_auto_tune_progress_dirty()
+        self._draw_closed_loop_auto_tune_progress_frame(force=True)
 
     def _closed_loop_auto_tune_progress_callback(self, event_name: str, payload: dict[str, object]) -> None:
         def number_text(value: object, digits: int = 3) -> str:
@@ -631,11 +669,39 @@ class SimulationApp:
             return "n/a"
 
         if event_name == "search_started":
+            self._closed_loop_auto_tune_total_trials = max(1, int(payload.get("trial_count") or self._closed_loop_auto_tune_total_trials or 1))
+            self._closed_loop_auto_tune_context.update(
+                {
+                    "strategy": payload.get("strategy") or "direct",
+                    "search_param_count": payload.get("search_param_count"),
+                    "actuator_search_policy": payload.get("actuator_search_policy"),
+                }
+            )
+            self._closed_loop_auto_tune_current_status = "Search started"
             text = (
                 f"Direct search started | trials {payload.get('trial_count')} | {payload.get('strategy')} | "
                 f"params {payload.get('search_param_count')} | actuator {payload.get('actuator_realism_profile')}"
             )
         elif event_name == "trial_started":
+            self._closed_loop_auto_tune_current_trial = int(payload.get("trial_index") or 0)
+            self._closed_loop_auto_tune_total_trials = max(
+                self._closed_loop_auto_tune_total_trials,
+                int(payload.get("trial_total") or self._closed_loop_auto_tune_total_trials or 1),
+            )
+            self._closed_loop_auto_tune_current_status = "Trial running"
+            self._upsert_closed_loop_auto_tune_trial_row(
+                {
+                    "trial": self._closed_loop_auto_tune_current_trial,
+                    "status": "running",
+                    "score": None,
+                    "rmse": None,
+                    "mean_cte": None,
+                    "max_cte": None,
+                    "nis": None,
+                    "nees": None,
+                    "reason": "",
+                }
+            )
             text = (
                 f"Trial {payload.get('trial_index')}/{payload.get('trial_total')} started | "
                 f"route {payload.get('route_name')} | best {number_text(payload.get('best_score'))}"
@@ -647,14 +713,40 @@ class SimulationApp:
                 if isinstance(payload.get("best_score"), (int, float)) and math.isfinite(float(payload["best_score"]))
                 else self._closed_loop_auto_tune_best_score
             )
+            mean_cte = metrics.get("driving_mean_cross_track_error_m") or metrics.get("mean_cross_track_error_m")
+            max_cte = metrics.get("driving_max_cross_track_error_m") or metrics.get("max_cross_track_error_m")
+            nis = self._closed_loop_auto_tune_metric(metrics, "driving_legacy_mean_nis_mixed", "eval_legacy_mean_nis_mixed", "legacy_mean_nis_mixed", "mean_nis")
+            nees = self._closed_loop_auto_tune_metric(
+                metrics,
+                "driving_mean_position_nees",
+                "eval_mean_position_nees",
+                "mean_position_nees",
+                "driving_mean_nees",
+                "eval_mean_nees",
+                "mean_nees",
+            )
+            reason = str(payload.get("failure_reason") or "")
+            self._closed_loop_auto_tune_current_status = "Trial failed" if payload.get("failed") else "Trial finished"
+            self._upsert_closed_loop_auto_tune_trial_row(
+                {
+                    "trial": int(payload.get("trial_index") or 0),
+                    "status": "failed" if payload.get("failed") else "ok",
+                    "score": payload.get("score"),
+                    "rmse": metrics.get("eval_filtered_rmse_m") or metrics.get("filtered_rmse_m"),
+                    "mean_cte": mean_cte,
+                    "max_cte": max_cte,
+                    "nis": nis,
+                    "nees": nees,
+                    "reason": reason,
+                }
+            )
             text = (
                 f"Trial {payload.get('trial_index')}/{payload.get('trial_total')} finished | "
                 f"score {number_text(payload.get('score'))} | best {number_text(self._closed_loop_auto_tune_best_score)} | "
                 f"RMSE {number_text(metrics.get('eval_filtered_rmse_m') or metrics.get('filtered_rmse_m'))} m | "
-                f"CTE {number_text(metrics.get('driving_mean_cross_track_error_m') or metrics.get('mean_cross_track_error_m'))} m | "
+                f"CTE {number_text(mean_cte)} m | "
                 f"success {'yes' if payload.get('route_completion_success') else 'no'}"
             )
-            reason = str(payload.get("failure_reason") or "")
             if reason:
                 text += f" | reason {reason}"
         elif event_name == "new_search_best":
@@ -668,6 +760,7 @@ class SimulationApp:
                 f"score {number_text(self._closed_loop_auto_tune_best_score)}"
             )
         elif event_name == "completed":
+            self._closed_loop_auto_tune_current_status = "Complete"
             text = (
                 f"Closed-loop auto tune complete | best {number_text(payload.get('best_score'))} | "
                 f"saved {payload.get('saved_config_path')}"
@@ -677,15 +770,49 @@ class SimulationApp:
         self._planner_status = text
         self._control_status_text = text
         self._closed_loop_auto_tune_status_lines.append(text)
-        self._closed_loop_auto_tune_status_lines = self._closed_loop_auto_tune_status_lines[-80:]
-        self._draw_closed_loop_auto_tune_progress_frame()
+        self._closed_loop_auto_tune_status_lines = self._closed_loop_auto_tune_status_lines[-16:]
+        self._mark_closed_loop_auto_tune_progress_dirty()
+        self._draw_closed_loop_auto_tune_progress_frame(force=True)
         self._pump_closed_loop_auto_tune_events()
+
+    def _upsert_closed_loop_auto_tune_trial_row(self, row: dict[str, object]) -> None:
+        trial = int(row.get("trial") or 0)
+        if trial <= 0:
+            return
+        for index, existing in enumerate(self._closed_loop_auto_tune_trial_rows):
+            if int(existing.get("trial") or 0) == trial:
+                merged = dict(existing)
+                merged.update(row)
+                self._closed_loop_auto_tune_trial_rows[index] = merged
+                return
+        self._closed_loop_auto_tune_trial_rows.append(dict(row))
+        self._closed_loop_auto_tune_trial_rows = self._closed_loop_auto_tune_trial_rows[-12:]
+
+    @staticmethod
+    def _closed_loop_auto_tune_metric(metrics: dict[str, object], *keys: str) -> Optional[float]:
+        for key in keys:
+            value = metrics.get(key)
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                return float(value)
+        return None
 
     def _restore_closed_loop_auto_tune_rendering(self) -> None:
         if self._closed_loop_auto_tune_previous_no_rendering is None:
             return
         self._client_manager.set_no_rendering_mode(self._closed_loop_auto_tune_previous_no_rendering)
         self._closed_loop_auto_tune_previous_no_rendering = None
+
+    def _capture_closed_loop_auto_tune_background(self) -> None:
+        if self._display is None:
+            self._closed_loop_auto_tune_background_surface = None
+            return
+        try:
+            self._closed_loop_auto_tune_background_surface = self._display.surface.copy()
+        except pygame.error:
+            self._closed_loop_auto_tune_background_surface = None
+
+    def _mark_closed_loop_auto_tune_progress_dirty(self) -> None:
+        self._closed_loop_auto_tune_progress_dirty = True
 
     def _pump_closed_loop_auto_tune_events(self) -> None:
         for event in pygame.event.get():
@@ -695,49 +822,133 @@ class SimulationApp:
                 self._closed_loop_auto_tune_cancel_requested = True
         pygame.event.pump()
 
-    def _draw_closed_loop_auto_tune_progress_frame(self) -> None:
+    def _draw_closed_loop_auto_tune_progress_frame(self, force: bool = False) -> None:
         if self._display is None:
             return
+        now = time.monotonic()
+        if (
+            not force
+            and not self._closed_loop_auto_tune_progress_dirty
+            and now - self._closed_loop_auto_tune_last_draw_monotonic < CLOSED_LOOP_AUTOTUNE_PROGRESS_REFRESH_S
+        ):
+            return
         surface = self._display.surface
-        surface.fill((8, 12, 18))
         width, height = surface.get_size()
-        modal_w = min(width - 80, 1120)
-        modal_h = min(height - 70, 520)
+        background = self._closed_loop_auto_tune_background_surface
+        if background is not None and background.get_size() == surface.get_size():
+            surface.blit(background, (0, 0))
+        else:
+            surface.fill((8, 12, 18))
+        dim = pygame.Surface((width, height), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 165))
+        surface.blit(dim, (0, 0))
+
+        modal_w = min(width - 70, 1160)
+        modal_h = min(height - 70, 610)
         modal = pygame.Rect(0, 0, modal_w, modal_h)
         modal.center = (width // 2, height // 2)
         pygame.draw.rect(surface, DASHBOARD.panel_background_color, modal, border_radius=8)
         pygame.draw.rect(surface, DASHBOARD.success_color, modal, width=1, border_radius=8)
-        content = modal.inflate(-28, -24)
-        title = self._filter_overlay_bold_font.render("Closed-loop Auto Tune", True, DASHBOARD.title_color)
-        surface.blit(title, (content.left, content.top))
-        subtitle = self._filter_overlay_small_font.render(
-            "Direct no-render CARLA route trials | ESC or window close requests stop",
-            True,
+        content = modal.inflate(-30, -26)
+        self._draw_overlay_text(surface, "Closed-loop Auto Tune", content.topleft, self._filter_overlay_bold_font, DASHBOARD.title_color, content.width - 120)
+        self._draw_overlay_text(
+            surface,
+            "Direct no-render CARLA route trials. ESC or window close requests safe cancellation.",
+            (content.left, content.top + 25),
+            self._filter_overlay_small_font,
             DASHBOARD.muted_text_color,
+            content.width,
         )
-        surface.blit(subtitle, (content.left, content.top + 26))
-        if self._closed_loop_auto_tune_live_line:
-            live = self._filter_overlay_font.render(
-                self._fit_overlay_text(self._closed_loop_auto_tune_live_line, self._filter_overlay_font, content.width),
-                True,
-                DASHBOARD.success_color,
+
+        context = self._closed_loop_auto_tune_context
+        trial_text = f"{self._closed_loop_auto_tune_current_trial}/{self._closed_loop_auto_tune_total_trials or '?'}"
+        left_x = content.left
+        right_x = content.left + content.width // 2 + 14
+        y = content.top + 58
+        context_lines = [
+            f"Trial: {trial_text}",
+            f"Filter: {context.get('filter', 'n/a')}",
+            f"Tracking: {context.get('tracking_mode', 'n/a')} ({context.get('active_control_policy', 'n/a')})",
+            f"Route: {context.get('route', 'n/a')} | Map: {context.get('map', 'n/a')}",
+        ]
+        context_lines_right = [
+            f"Sensor noise: {context.get('sensor_noise', 'n/a')}",
+            f"Behavior: {context.get('behavior', 'n/a')}",
+            f"Actuator: {context.get('actuator', 'n/a')}",
+            f"Status: {self._closed_loop_auto_tune_current_status}",
+        ]
+        for offset, line in enumerate(context_lines):
+            self._draw_overlay_text(surface, line, (left_x, y + offset * 18), self._filter_overlay_small_font, DASHBOARD.text_color, content.width // 2 - 22)
+        for offset, line in enumerate(context_lines_right):
+            color = DASHBOARD.warning_color if line.startswith("Status:") and any(word in line.lower() for word in ("fail", "cancel", "abort")) else DASHBOARD.text_color
+            self._draw_overlay_text(surface, line, (right_x, y + offset * 18), self._filter_overlay_small_font, color, content.right - right_x)
+
+        metrics_rect = pygame.Rect(content.left, y + 86, content.width, 92)
+        pygame.draw.rect(surface, DASHBOARD.panel_inner_color, metrics_rect, border_radius=6)
+        pygame.draw.rect(surface, DASHBOARD.panel_border_color, metrics_rect, width=1, border_radius=6)
+        metrics = self._closed_loop_auto_tune_live_metrics
+        metric_rows = [
+            ("Sim", self._format_metric_seconds(metrics.get("sim_time_s")), "Wall", self._format_metric_seconds(metrics.get("wall_time_s")), "Speedup", self._format_metric_ratio(metrics.get("speedup"))),
+            ("Ticks/s", self._format_metric_number(metrics.get("ticks_per_second"), 1), "Progress", self._format_progress_percent(self._finite_metric(metrics.get("route_progress_percent"))), "Best", self._format_metric_number(self._closed_loop_auto_tune_best_score, 3)),
+            ("RMSE", self._format_metric_number(metrics.get("rmse_m"), 3), "Mean CTE", self._format_metric_number(metrics.get("mean_cte_m"), 3), "Max CTE", self._format_metric_number(metrics.get("max_cte_m"), 3)),
+            ("NIS", self._format_metric_number(metrics.get("nis"), 3), "NEES", self._format_metric_number(metrics.get("nees"), 3), "Failure", str(metrics.get("failure_reason") or "none")),
+        ]
+        col_w = metrics_rect.width // 3
+        for row_index, row in enumerate(metric_rows):
+            row_y = metrics_rect.top + 10 + row_index * 19
+            for col_index in range(3):
+                label = row[col_index * 2]
+                value = row[col_index * 2 + 1]
+                text = f"{label}: {value}"
+                color = DASHBOARD.warning_color if label == "Failure" and value != "none" else DASHBOARD.text_color
+                self._draw_overlay_text(surface, text, (metrics_rect.left + 12 + col_index * col_w, row_y), self._filter_overlay_small_font, color, col_w - 18)
+
+        table_top = metrics_rect.bottom + 16
+        self._draw_overlay_text(surface, "Trial Results", (content.left, table_top), self._filter_overlay_bold_font, DASHBOARD.title_color, content.width)
+        header_y = table_top + 27
+        headers = ("Trial", "Status", "Score", "RMSE", "Mean CTE", "Max CTE", "NIS", "NEES", "Reason")
+        col_widths = (50, 74, 88, 76, 82, 76, 64, 64, content.width - 574)
+        x = content.left
+        for header, col_width in zip(headers, col_widths):
+            self._draw_overlay_text(surface, header, (x, header_y), self._filter_overlay_small_font, DASHBOARD.muted_text_color, col_width - 6)
+            x += col_width
+        row_y = header_y + 22
+        row_h = 22
+        max_rows = max(1, (content.bottom - row_y - 54) // row_h)
+        rows = self._closed_loop_auto_tune_trial_rows[-max_rows:]
+        for row in rows:
+            status = str(row.get("status") or "")
+            color = DASHBOARD.warning_color if status == "failed" else DASHBOARD.text_color
+            values = (
+                str(row.get("trial") or ""),
+                status,
+                self._format_metric_number(row.get("score"), 3),
+                self._format_metric_number(row.get("rmse"), 3),
+                self._format_metric_number(row.get("mean_cte"), 3),
+                self._format_metric_number(row.get("max_cte"), 3),
+                self._format_metric_number(row.get("nis"), 3),
+                self._format_metric_number(row.get("nees"), 3),
+                str(row.get("reason") or ""),
             )
-            surface.blit(live, (content.left, content.top + 56))
-        y = content.top + 88
-        line_height = 19
-        max_lines = max(1, (content.bottom - y) // line_height)
-        for line in self._closed_loop_auto_tune_status_lines[-max_lines:]:
-            color = DASHBOARD.warning_color if any(word in line.lower() for word in ("failed", "cancel", "reason", "blocked")) else DASHBOARD.text_color
-            rendered = self._filter_overlay_small_font.render(
-                self._fit_overlay_text(str(line), self._filter_overlay_small_font, content.width),
-                True,
-                color,
-            )
-            surface.blit(rendered, (content.left, y))
-            y += line_height
+            x = content.left
+            for value, col_width in zip(values, col_widths):
+                self._draw_overlay_text(surface, value, (x, row_y), self._filter_overlay_small_font, color, col_width - 6)
+                x += col_width
+            row_y += row_h
+
+        notes_rect = pygame.Rect(content.left, content.bottom - 44, content.width, 44)
+        pygame.draw.rect(surface, (14, 18, 24), notes_rect, border_radius=5)
+        note_y = notes_rect.top + 6
+        for line in self._closed_loop_auto_tune_status_lines[-2:]:
+            color = DASHBOARD.warning_color if any(word in str(line).lower() for word in ("failed", "cancel", "reason", "blocked")) else DASHBOARD.muted_text_color
+            self._draw_overlay_text(surface, line, (notes_rect.left + 10, note_y), self._filter_overlay_small_font, color, notes_rect.width - 20)
+            note_y += 17
         pygame.display.flip()
+        self._closed_loop_auto_tune_last_draw_monotonic = now
+        self._closed_loop_auto_tune_progress_dirty = False
 
     def _update_closed_loop_auto_tune_live_line(self) -> None:
+        now = time.monotonic()
         wall = self._closed_loop_auto_tune_trial_wall_seconds()
         sim = self._closed_loop_auto_tune_trial_sim_seconds()
         speedup = sim / wall if wall > 1.0e-9 else 0.0
@@ -752,6 +963,19 @@ class SimulationApp:
             nis = diagnostics.get("latest_nis")
             nees = diagnostics.get("latest_nees")
         failure = self._last_benchmark_failure_reason or (self._test_runner.last_failure_reason if self._test_runner is not None else "")
+        self._closed_loop_auto_tune_live_metrics = {
+            "wall_time_s": wall,
+            "sim_time_s": sim,
+            "speedup": speedup,
+            "ticks_per_second": tps,
+            "route_progress_percent": progress,
+            "rmse_m": rmse,
+            "mean_cte_m": cte,
+            "max_cte_m": None,
+            "nis": nis,
+            "nees": nees,
+            "failure_reason": failure,
+        }
         self._closed_loop_auto_tune_live_line = (
             f"route {self._format_progress_percent(progress)} | "
             f"wall {wall:.1f}s | sim {sim:.1f}s | speedup {speedup:.2f}x | {tps:.1f} tick/s | "
@@ -760,6 +984,9 @@ class SimulationApp:
             f"NEES {self._format_live_number(nees)} | CTE {self._format_live_number(cte)}m | "
             f"failure {failure or 'none'}"
         )
+        if now - self._closed_loop_auto_tune_last_live_update_monotonic >= CLOSED_LOOP_AUTOTUNE_PROGRESS_REFRESH_S:
+            self._closed_loop_auto_tune_last_live_update_monotonic = now
+            self._mark_closed_loop_auto_tune_progress_dirty()
 
     def _closed_loop_auto_tune_trial_wall_seconds(self) -> float:
         if self._closed_loop_auto_tune_trial_wall_start is None:
@@ -783,6 +1010,146 @@ class SimulationApp:
             return "n/a"
         return f"{float(value):.1f}%"
 
+    @staticmethod
+    def _finite_metric(value: object) -> Optional[float]:
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _format_metric_number(value: object, digits: int = 2) -> str:
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return f"{float(value):.{digits}g}"
+        return "n/a"
+
+    @staticmethod
+    def _format_metric_seconds(value: object) -> str:
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return f"{float(value):.1f}s"
+        return "n/a"
+
+    @staticmethod
+    def _format_metric_ratio(value: object) -> str:
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return f"{float(value):.2f}x"
+        return "n/a"
+
+    def _reset_direct_closed_loop_trial_lifecycle(self) -> None:
+        """Clear app-side route/control state before one direct auto-tune trial."""
+        if self._test_runner is not None and self._test_runner.is_active:
+            self._test_runner.stop(aborted=True, reason="Direct auto-tune trial reset")
+        self._test_route_authoring_active = False
+        self._map_selection_active = False
+        self._cancel_route_activation()
+        if self.route_planner is not None:
+            self.route_planner.clear_route()
+        self.waypoint_tracker.clear_route()
+        self._latest_tracking = self._empty_tracking_status()
+        self._latest_state = None
+        self._latest_ground_truth_state = None
+        self._latest_estimated_state = None
+        self._latest_localization_status = None
+        self._latest_gnss_diagnostics = None
+        self._latest_gnss_frame = None
+        self._gnss_trail_xy.clear()
+        self._last_benchmark_failure_reason = ""
+        self._reset_benchmark_failure_monitor()
+        neutral = self._neutral_vehicle_control()
+        self._set_latest_control(neutral, neutral)
+        self.autonomous_controller = VehicleController(behavior_config=self.driving_behavior_config)
+        self.speed_planner = CurvatureSpeedPlanner(self.driving_behavior_config)
+        self.actuator_realism = ActuatorRealism(self.driving_behavior_config)
+        self._reset_driving_behavior(initial_speed_mps=0.0, actuator_control=neutral)
+        self._drive_mode = DriveMode.MANUAL
+        if self._vehicle is not None:
+            try:
+                self._vehicle.set_autopilot(False)
+                self._vehicle.apply_control(neutral)
+            except RuntimeError:
+                pass
+
+    def _reset_direct_closed_loop_trial_after_finish(self) -> None:
+        """Leave no completed-route or brake state for the next direct trial."""
+        neutral = self._neutral_vehicle_control()
+        if self._vehicle is not None:
+            try:
+                self._vehicle.set_autopilot(False)
+                self._vehicle.apply_control(neutral)
+            except RuntimeError:
+                pass
+        self._set_latest_control(neutral, neutral)
+        self.actuator_realism.reset(neutral)
+        self.speed_planner.reset(initial_speed_mps=0.0)
+        self._latest_speed_plan = self.speed_planner.latest_plan
+        if self.route_planner is not None:
+            self.route_planner.clear_route()
+        self.waypoint_tracker.clear_route()
+        self._latest_tracking = self._empty_tracking_status()
+        self._cancel_route_activation()
+        self._reset_benchmark_failure_monitor()
+        self._last_benchmark_failure_reason = ""
+        self._drive_mode = DriveMode.MANUAL
+
+    @staticmethod
+    def _neutral_vehicle_control() -> "carla.VehicleControl":
+        return carla.VehicleControl(
+            throttle=0.0,
+            steer=0.0,
+            brake=0.0,
+            hand_brake=False,
+            reverse=False,
+            manual_gear_shift=False,
+        )
+
+    def _closed_loop_trial_debug_snapshot(self, route: SavedTestRoute) -> dict[str, object]:
+        start_distance = None
+        if self._latest_ground_truth_state is not None:
+            route_data = route.to_dict()
+            start = route_data.get("start") if isinstance(route_data.get("start"), dict) else {}
+            x = start.get("x")
+            y = start.get("y")
+            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                start_distance = math.hypot(float(self._latest_ground_truth_state.x) - float(x), float(self._latest_ground_truth_state.y) - float(y))
+        requested = self._control_debug_dict(self._latest_requested_control)
+        applied = self._control_debug_dict(self._latest_applied_control)
+        return {
+            "route_activation_state": self._route_activation_state.value,
+            "target_waypoint_exists": self._latest_tracking.target_waypoint is not None,
+            "tracker_completed": bool(self._latest_tracking.completed),
+            "requested_control": requested,
+            "applied_control": applied,
+            "vehicle_speed_mps": self._latest_ground_truth_state.speed if self._latest_ground_truth_state is not None else None,
+            "route_progress_percent": self._route_completion_percent(),
+            "distance_from_route_start_m": start_distance,
+        }
+
+    @staticmethod
+    def _control_debug_dict(control: "carla.VehicleControl") -> dict[str, float]:
+        return {
+            "throttle": float(getattr(control, "throttle", 0.0)),
+            "brake": float(getattr(control, "brake", 0.0)),
+            "steer": float(getattr(control, "steer", 0.0)),
+        }
+
+    def _format_closed_loop_trial_debug_line(self, debug: dict[str, object]) -> str:
+        requested = debug.get("requested_control") if isinstance(debug.get("requested_control"), dict) else {}
+        applied = debug.get("applied_control") if isinstance(debug.get("applied_control"), dict) else {}
+        return (
+            "Trial start debug | "
+            f"activation {debug.get('route_activation_state')} | "
+            f"target {'yes' if debug.get('target_waypoint_exists') else 'no'} | "
+            f"completed {'yes' if debug.get('tracker_completed') else 'no'} | "
+            f"req T/B/S {self._format_live_number(requested.get('throttle'))}/"
+            f"{self._format_live_number(requested.get('brake'))}/"
+            f"{self._format_live_number(requested.get('steer'))} | "
+            f"app T/B/S {self._format_live_number(applied.get('throttle'))}/"
+            f"{self._format_live_number(applied.get('brake'))}/"
+            f"{self._format_live_number(applied.get('steer'))} | "
+            f"speed {self._format_live_number(debug.get('vehicle_speed_mps'))} | "
+            f"progress {self._format_progress_percent(self._finite_metric(debug.get('route_progress_percent')))} | "
+            f"start_dist {self._format_live_number(debug.get('distance_from_route_start_m'))}m"
+        )
+
     def _run_closed_loop_auto_tune_validation(self, request: ClosedLoopValidationRequest) -> dict[str, object]:
         route = self._saved_route_from_validation_request(request)
         if route is None:
@@ -800,12 +1167,13 @@ class SimulationApp:
         if self._filter_manager is None:
             return self._closed_loop_validation_failure_metrics(request, "Filter manager unavailable")
         if self._test_runner.is_active:
-            return self._closed_loop_validation_failure_metrics(request, "Benchmark runner is already active")
+            self._test_runner.stop(aborted=True, reason="Resetting benchmark runner for next direct auto-tune trial")
 
         sensor_config = SensorNoiseConfig.from_dict(request.sensor_noise_config)
         self.sensor_noise_config = sensor_config
         apply_behavior_values(self.driving_behavior_config, request.vehicle_behavior_config)
         apply_actuator_values(self.driving_behavior_config, request.actuator_realism_config)
+        self._reset_direct_closed_loop_trial_lifecycle()
         try:
             if self._gnss_sensor is not None:
                 self._gnss_sensor.apply_config(sensor_config, respawn=True)
@@ -814,7 +1182,9 @@ class SimulationApp:
         except Exception as exc:
             return self._closed_loop_validation_failure_metrics(request, f"Sensor setup failed: {exc}")
 
-        self._filter_manager.update_filter_tune(request.filter_id, request.finalist.candidate_tune, reset_active=False)
+        ok, message = self._filter_manager.update_filter_tune(request.filter_id, request.finalist.candidate_tune, reset_active=True)
+        if not ok:
+            return self._closed_loop_validation_failure_metrics(request, message)
         ok, message = self._filter_manager.switch_filter(request.filter_id, skip_current_sensor_frames=True)
         if not ok:
             return self._closed_loop_validation_failure_metrics(request, message)
@@ -825,7 +1195,7 @@ class SimulationApp:
             return self._closed_loop_validation_failure_metrics(request, "Selected filter is unsafe for autonomous control")
         self._sync_filter_tune_panel()
         self._clear_localization_after_filter_reset()
-        self._reset_driving_behavior()
+        self._reset_driving_behavior(actuator_control=self._neutral_vehicle_control())
 
         config = BenchmarkConfig(
             selected_filter=request.filter_id,
@@ -851,7 +1221,7 @@ class SimulationApp:
         )
         self._test_route_authoring_active = False
         self._map_selection_active = False
-        self._drive_mode = DriveMode.AUTONOMOUS
+        self._drive_mode = DriveMode.MANUAL
         started = self._test_runner.start_configured_benchmark(config, self._active_map_name)
         self._planner_status = self._test_runner.status_text
         self._control_status_text = self._test_runner.status_text
@@ -861,6 +1231,12 @@ class SimulationApp:
                 reason = "Validation blocked by route map mismatch"
             self._test_runner.stop(aborted=True, reason=reason)
             return self._closed_loop_validation_failure_metrics(request, reason)
+
+        self._closed_loop_auto_tune_trial_start_debug = self._closed_loop_trial_debug_snapshot(route)
+        self._closed_loop_auto_tune_status_lines.append(self._format_closed_loop_trial_debug_line(self._closed_loop_auto_tune_trial_start_debug))
+        self._closed_loop_auto_tune_status_lines = self._closed_loop_auto_tune_status_lines[-16:]
+        self._mark_closed_loop_auto_tune_progress_dirty()
+        self._draw_closed_loop_auto_tune_progress_frame(force=True)
 
         self._closed_loop_auto_tune_trial_wall_start = time.monotonic()
         self._closed_loop_auto_tune_trial_sim_start = None
@@ -878,6 +1254,7 @@ class SimulationApp:
 
         summary = dict(self._test_runner.last_exported_summary or {}) if self._test_runner is not None else {}
         if not summary:
+            self._reset_direct_closed_loop_trial_after_finish()
             return self._closed_loop_validation_failure_metrics(request, "Validation produced no route summary")
         summary.setdefault("route_completion_success", bool(summary.get("route_completion_success")))
         summary.setdefault("route_aborted", not bool(summary.get("route_completion_success")))
@@ -892,6 +1269,8 @@ class SimulationApp:
         summary["auto_tune_speedup"] = sim_time / wall_time if wall_time > 1.0e-9 else None
         summary["auto_tune_ticks_per_second"] = self._closed_loop_auto_tune_trial_tick_count / wall_time if wall_time > 1.0e-9 else None
         summary["actuator_realism_config"] = dict(request.actuator_realism_config)
+        summary["trial_start_debug"] = dict(self._closed_loop_auto_tune_trial_start_debug)
+        self._reset_direct_closed_loop_trial_after_finish()
         return summary
 
     def _run_closed_loop_validation_frame(self) -> bool:
@@ -904,12 +1283,12 @@ class SimulationApp:
             self._skip_frames_after_world_reload = max(0, self._skip_frames_after_world_reload - 1)
             self._update_closed_loop_auto_tune_live_line()
             self._draw_closed_loop_auto_tune_progress_frame()
-            self._clock.tick_pygame()
+            self._tick_closed_loop_auto_tune_pygame()
             return True
         if self._ground_truth_provider is None or self._filter_manager is None:
             self._update_closed_loop_auto_tune_live_line()
             self._draw_closed_loop_auto_tune_progress_frame()
-            self._clock.tick_pygame()
+            self._tick_closed_loop_auto_tune_pygame()
             return True
         try:
             self._latest_ground_truth_state = self._ground_truth_provider.get_state()
@@ -922,7 +1301,7 @@ class SimulationApp:
             self._control_status_text = self._planner_status
             self._update_closed_loop_auto_tune_live_line()
             self._draw_closed_loop_auto_tune_progress_frame()
-            self._clock.tick_pygame()
+            self._tick_closed_loop_auto_tune_pygame()
             return True
         self._update_route_activation_state()
         self._latest_state = self._state_for_tracking_and_control()
@@ -931,13 +1310,16 @@ class SimulationApp:
         self._update_sensor_diagnostics()
         world_reloaded = self._update_test_performance()
         if world_reloaded:
-            self._clock.tick_pygame()
+            self._tick_closed_loop_auto_tune_pygame()
             return True
         self._apply_closed_loop_validation_control()
         self._update_closed_loop_auto_tune_live_line()
         self._draw_closed_loop_auto_tune_progress_frame()
-        self._clock.tick_pygame()
+        self._tick_closed_loop_auto_tune_pygame()
         return True
+
+    def _tick_closed_loop_auto_tune_pygame(self) -> None:
+        self._clock.tick_pygame_unthrottled()
 
     def _apply_closed_loop_validation_control(self) -> None:
         if self._vehicle is None:
@@ -1993,11 +2375,21 @@ class SimulationApp:
         except Exception:
             return time.monotonic()
 
-    def _reset_driving_behavior(self) -> None:
-        initial_speed = self._latest_ground_truth_state.speed if self._latest_ground_truth_state is not None else 0.0
+    def _reset_driving_behavior(
+        self,
+        initial_speed_mps: Optional[float] = None,
+        actuator_control: Optional["carla.VehicleControl"] = None,
+    ) -> None:
+        initial_speed = (
+            float(initial_speed_mps)
+            if initial_speed_mps is not None
+            else self._latest_ground_truth_state.speed
+            if self._latest_ground_truth_state is not None
+            else 0.0
+        )
         self.speed_planner.reset(initial_speed_mps=initial_speed)
         self._latest_speed_plan = self.speed_planner.latest_plan
-        self.actuator_realism.reset(self._latest_applied_control)
+        self.actuator_realism.reset(actuator_control if actuator_control is not None else self._latest_applied_control)
 
     def _can_update_route_tracking(self) -> bool:
         if self._route_activation_state == RouteActivationState.WAITING_FOR_LOCALIZATION_STABILITY:
@@ -2556,7 +2948,12 @@ class SimulationApp:
                 self._drive_mode = DriveMode.AUTONOMOUS
                 if self._vehicle is not None:
                     self._vehicle.set_autopilot(False)
-                self._reset_driving_behavior()
+                if self._lightweight_closed_loop_auto_tune:
+                    neutral = self._neutral_vehicle_control()
+                    self._set_latest_control(neutral, neutral)
+                    self._reset_driving_behavior(actuator_control=neutral)
+                else:
+                    self._reset_driving_behavior()
             status_suffix = "timeout" if self._stabilization_timed_out else "stable"
             self._planner_status = f"Planner: {len(route)} wp, {status_suffix}, driving A->B"
         elif self.route_planner.planner_error:

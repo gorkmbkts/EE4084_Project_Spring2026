@@ -36,6 +36,8 @@ from src.evaluation.filter_auto_tuner import AutoTuneRequest, FilterAutoTuner, o
 import src.evaluation.filter_auto_tuner as filter_auto_tuner_module  # noqa: E402
 from src.evaluation.sensor_log_recorder import SENSOR_LOG_FIELDNAMES  # noqa: E402
 from src.evaluation.test_route_store import TestRouteStore  # noqa: E402
+from src.control.driving_behavior import ActuatorRealism, CurvatureSpeedPlanner, DrivingBehaviorConfig  # noqa: E402
+from src.control.vehicle_controller import VehicleController  # noqa: E402
 from src.evaluation.benchmark_config import (  # noqa: E402
     BEHAVIOR_PRESETS,
     BenchmarkConfig,
@@ -80,7 +82,7 @@ from src.visualization.startup_map_selector import (  # noqa: E402
     TOP_LEVEL_TABS,
     StartupMapSelector,
 )
-from src.core.app import AppClosedLoopValidationRunner, SimulationApp  # noqa: E402
+from src.core.app import AppClosedLoopValidationRunner, DriveMode, RouteActivationState, SimulationApp  # noqa: E402
 
 
 def test_offline_replay_runs_on_short_saved_route_log(tmp_path: Path) -> None:
@@ -1501,8 +1503,8 @@ def test_closed_loop_auto_tune_builder_includes_explicit_session_fields(tmp_path
         raise AssertionError("closed-loop autotune request did not preserve behavior config")
     if not request.actuator_realism_config.get("enabled"):
         raise AssertionError("closed-loop autotune request did not preserve actuator realism config")
-    if request.trial_count != 12 or request.finalist_count != 2:
-        raise AssertionError("closed-loop autotune request did not preserve trial/finalist counts")
+    if request.trial_count != 12 or request.finalist_count != 1:
+        raise AssertionError("closed-loop autotune request did not preserve direct trial count/finalist compatibility value")
     pending = request.metadata.get("pending_session")
     if not isinstance(pending, dict) or pending.get("validation_route_data") != route.route_data:
         raise AssertionError("closed-loop autotune request did not include explicit pending-session handoff metadata")
@@ -1520,6 +1522,143 @@ def test_closed_loop_auto_tune_modal_not_available_for_raw_gnss() -> None:
         raise AssertionError("closed-loop autotune modal should not open for raw_gnss")
     if "unavailable" not in selector._closed_loop_saved_tune_status:
         raise AssertionError("raw_gnss closed-loop autotune guard did not show a clear status")
+
+
+def test_direct_closed_loop_trial_reset_starts_two_trials_cleanly() -> None:
+    class FakeRoutePlanner:
+        planner_error = ""
+
+        def __init__(self) -> None:
+            self.route = ["stale"]
+            self.generated_count = 0
+
+        def clear_route(self) -> None:
+            self.route = []
+
+        def generate_route(self, start: object, goal: object) -> list[object]:
+            self.generated_count += 1
+            self.route = [start, goal]
+            return list(self.route)
+
+        def get_route(self) -> list[object]:
+            return list(self.route)
+
+    class FakeTracker:
+        def __init__(self) -> None:
+            self.completed = True
+            self.routes: list[list[object]] = []
+
+        def clear_route(self) -> None:
+            self.completed = False
+
+        def set_route(self, route: list[object]) -> None:
+            self.completed = False
+            self.routes.append(list(route))
+
+    class FakeVehicle:
+        def __init__(self) -> None:
+            self.controls: list[object] = []
+            self.autopilot_values: list[bool] = []
+
+        def set_autopilot(self, enabled: bool) -> None:
+            self.autopilot_values.append(bool(enabled))
+
+        def apply_control(self, control: object) -> None:
+            self.controls.append(control)
+
+    class FakeVehicleManager:
+        def __init__(self) -> None:
+            self.teleport_count = 0
+
+        def teleport_to_waypoint(self, waypoint: object) -> None:
+            self.teleport_count += 1
+
+    app = SimulationApp.__new__(SimulationApp)
+    app._test_runner = None
+    app._offline_recorder = None
+    app._test_route_authoring_active = True
+    app._map_selection_active = True
+    app._route_activation_state = RouteActivationState.ROUTE_ACTIVE
+    app._pending_start_waypoint = None
+    app._pending_goal_waypoint = None
+    app._pending_start_autonomous = False
+    app._stabilization_started_monotonic = None
+    app._stabilization_elapsed_seconds = 0.0
+    app._stabilization_stable_ticks = 0
+    app._stabilization_error_m = None
+    app._stabilization_timed_out = False
+    app._route_generation_blocked = False
+    app._planner_status = ""
+    app._lightweight_closed_loop_auto_tune = True
+    app._drive_mode = DriveMode.AUTONOMOUS
+    app._latest_state = None
+    app._latest_ground_truth_state = SimpleNamespace(speed=7.0)
+    app._latest_estimated_state = None
+    app._latest_localization_status = None
+    app._latest_gnss_diagnostics = None
+    app._latest_gnss_frame = None
+    app._gnss_trail_xy = []
+    app._failure_monitor_last_progress_time = 1.0
+    app._failure_monitor_last_position = (1.0, 2.0)
+    app._failure_monitor_last_distance_to_goal = 3.0
+    app._failure_monitor_last_closest_index = 4
+    app._failure_monitor_deviation_started = 5.0
+    app._last_benchmark_failure_reason = "Vehicle stuck"
+    app.route_planner = FakeRoutePlanner()
+    app.waypoint_tracker = FakeTracker()
+    app.driving_behavior_config = DrivingBehaviorConfig()
+    app.autonomous_controller = VehicleController(behavior_config=app.driving_behavior_config)
+    app.speed_planner = CurvatureSpeedPlanner(app.driving_behavior_config)
+    app.actuator_realism = ActuatorRealism(app.driving_behavior_config)
+    stale_brake = SimulationApp._neutral_vehicle_control()
+    stale_brake.brake = 1.0
+    app._latest_requested_control = stale_brake
+    app._latest_applied_control = stale_brake
+    app._vehicle = FakeVehicle()
+    app._vehicle_manager = FakeVehicleManager()
+    app._filter_manager = None
+    app._ground_truth_provider = None
+
+    start = SimpleNamespace()
+    goal = SimpleNamespace()
+    for _trial in range(2):
+        app._latest_tracking = app._empty_tracking_status()
+        app._latest_tracking = app._latest_tracking.__class__(
+            target_waypoint=None,
+            closest_index=99,
+            target_index=99,
+            cross_track_error_m=0.0,
+            distance_to_goal_m=0.0,
+            heading_error_deg=None,
+            completed=True,
+        )
+        app._latest_applied_control = stale_brake
+        app._latest_requested_control = stale_brake
+        app._last_benchmark_failure_reason = "Vehicle stuck"
+
+        app._reset_direct_closed_loop_trial_lifecycle()
+        app._begin_route_initialization(start, goal, start_autonomous=True)
+        app._activate_pending_route_after_stabilization()
+
+        if app._route_activation_state != RouteActivationState.ROUTE_ACTIVE:
+            raise AssertionError("direct trial did not activate a fresh route")
+        if not app.route_planner.get_route():
+            raise AssertionError("direct trial did not generate a fresh route")
+        if app._latest_tracking.completed:
+            raise AssertionError("direct trial inherited completed tracking state")
+        if app._latest_applied_control.brake != 0.0 or app._latest_requested_control.brake != 0.0:
+            raise AssertionError("direct trial inherited a stale brake command")
+        if app.actuator_realism.latest_applied_control.brake != 0.0:
+            raise AssertionError("direct trial actuator model started from stale braking")
+        if app._last_benchmark_failure_reason:
+            raise AssertionError("direct trial inherited previous failure reason")
+        if app._failure_monitor_last_progress_time is not None:
+            raise AssertionError("direct trial inherited stuck detector progress state")
+
+    if app._vehicle_manager.teleport_count != 2:
+        raise AssertionError("two direct trial starts did not teleport to the route start twice")
+    if len(app.waypoint_tracker.routes) != 2:
+        raise AssertionError("two direct trial starts did not install two fresh tracker routes")
 
 
 def test_app_closed_loop_validation_runner_delegates_to_app() -> None:
@@ -1604,7 +1743,7 @@ def _closed_loop_autotune_selector(tmp_path: Path, include_mixed_noise: bool = F
     selector._behavior_editor = None
     selector._behavior_preset = "Balanced"
     selector._closed_loop_auto_tune_trials = 12
-    selector._closed_loop_auto_tune_finalists = 2
+    selector._closed_loop_auto_tune_finalists = 1
     selector._closed_loop_auto_tune_status_lines = []
     selector._recommendation_applied_by_filter = {}
     selector._selected_route_indices = set()

@@ -613,7 +613,7 @@ class ClosedLoopBenchmarkAutoTuner:
         if request.tracking_mode not in {TRACKING_PASSIVE, TRACKING_ACTIVE}:
             raise ValueError(f"Unsupported tracking mode: {request.tracking_mode}")
         if not request.offline_log_paths:
-            raise ValueError("Select at least one offline sensor log for candidate generation.")
+            raise ValueError("Select at least one offline sensor log to lock the sensor-noise context.")
         if len(request.validation_routes) != 1:
             raise ValueError("Closed-loop auto tune requires exactly one validation route.")
         route = request.validation_routes[0]

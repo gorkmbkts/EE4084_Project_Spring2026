@@ -32,3 +32,9 @@ class SimulationClock:
         elapsed_ms = self._clock.tick(self._target_fps)
         self._last_frame_dt_seconds = elapsed_ms * 0.001
         return self._last_frame_dt_seconds
+
+    def tick_pygame_unthrottled(self) -> float:
+        """Pump pygame timing without sleeping for the display target FPS."""
+        elapsed_ms = self._clock.tick(0)
+        self._last_frame_dt_seconds = elapsed_ms * 0.001
+        return self._last_frame_dt_seconds
