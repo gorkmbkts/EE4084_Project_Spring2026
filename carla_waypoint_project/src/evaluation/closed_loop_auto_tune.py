@@ -157,11 +157,11 @@ class ClosedLoopValidationRoute:
 class ClosedLoopAutoTuneRequest:
     filter_id: str
     tracking_mode: str
-    offline_log_paths: tuple[Path, ...]
     validation_routes: tuple[ClosedLoopValidationRoute, ...]
     sensor_noise_config: dict[str, object]
     vehicle_behavior_config: dict[str, object]
     actuator_realism_config: dict[str, object]
+    offline_log_paths: tuple[Path, ...] = ()
     base_tune: dict[str, object] = field(default_factory=dict)
     auto_tune_profile: dict[str, object] = field(default_factory=dict)
     sensor_noise_profile: str = "Custom"
@@ -528,7 +528,7 @@ class ClosedLoopBenchmarkAutoTuner:
             filter_display_name=record.display_name,
             tracking_mode=request.tracking_mode,
             sensor_noise_profile=request.sensor_noise_profile,
-            noise_sig=locked.signature,
+            noise_sig=selected_noise_signature,
             representative_sensor_noise_config=dict(locked.representative_config),
             vehicle_behavior_profile=request.vehicle_behavior_profile,
             vehicle_behavior_config=dict(request.vehicle_behavior_config),
@@ -553,7 +553,7 @@ class ClosedLoopBenchmarkAutoTuner:
             output_folder=run_folder,
             extra=_closed_loop_extra_metadata(
                 request,
-                locked.signature,
+                selected_noise_signature,
                 run_folder,
                 locked.sources,
                 search_profile,
@@ -612,8 +612,6 @@ class ClosedLoopBenchmarkAutoTuner:
     def _validate_request(request: ClosedLoopAutoTuneRequest) -> None:
         if request.tracking_mode not in {TRACKING_PASSIVE, TRACKING_ACTIVE}:
             raise ValueError(f"Unsupported tracking mode: {request.tracking_mode}")
-        if not request.offline_log_paths:
-            raise ValueError("Select at least one offline sensor log to lock the sensor-noise context.")
         if len(request.validation_routes) != 1:
             raise ValueError("Closed-loop auto tune requires exactly one validation route.")
         route = request.validation_routes[0]
@@ -786,6 +784,7 @@ def _closed_loop_extra_metadata(
 ) -> dict[str, object]:
     return {
         "source": "closed_loop_auto_tune",
+        "direct_closed_loop_mode": True,
         "physical_output_folder": str(run_folder),
         "logical_output_group": _closed_loop_logical_group(request.filter_id, request.tracking_mode, noise_sig),
         "logical_output_root": str(_closed_loop_noise_root(request.output_root, request.filter_id, request.tracking_mode, noise_sig)),
@@ -797,12 +796,20 @@ def _closed_loop_extra_metadata(
         "direct_closed_loop_trial_results": direct_trial_results,
         "direct_closed_loop_finalists": direct_finalists,
         "direct_closed_loop_trial_count": len(direct_trial_results),
+        "sensor_noise_profile": request.sensor_noise_profile,
+        "sensor_noise_config": dict(request.sensor_noise_config),
+        "sensor_noise_signature": noise_sig,
+        "tracking_mode": request.tracking_mode,
+        "vehicle_behavior_profile": request.vehicle_behavior_profile,
+        "vehicle_behavior_config": dict(request.vehicle_behavior_config),
         "locked_sensor_noise_sources": dict(locked_sensor_noise_sources),
         "metadata": dict(request.metadata),
         "auto_tune_profile_used": dict(search_profile),
         "actuator_search_policy": _actuator_search_policy(request.actuator_realism_config),
         "actuator_model_profile": request.actuator_realism_profile,
         "actuator_model_config": dict(request.actuator_realism_config),
+        "route_attempt_policy": "one_attempt_per_candidate_trial",
+        "max_route_attempts_per_trial": 1,
         "active_control_parameter_policy": (
             "Active tracking tune search includes supported active-control prediction parameters and scores each "
             "candidate in a real closed-loop CARLA route trial."

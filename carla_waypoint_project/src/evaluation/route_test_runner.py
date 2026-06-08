@@ -195,6 +195,7 @@ class RouteTestRunner:
         self._route_summaries = []
         self._attempt_failures_by_route.clear()
         self._current_attempt = 0
+        self._max_route_attempts = MAX_ROUTE_ATTEMPTS
         self._last_failure_reason = ""
         self._route_status = "initializing"
         started = self._start_route(route, self._route_store.current_index, route_folder=None)
@@ -217,6 +218,7 @@ class RouteTestRunner:
         config.run_id = run_folder.name
         config.metadata = dict(config.metadata or {})
         config.metadata["project_commit"] = project_commit_hash()
+        self._max_route_attempts = _configured_route_attempt_limit(config)
         config.save(run_folder / "config.json")
 
         self._active = True
@@ -943,6 +945,18 @@ def _legacy_benchmark_root() -> Path:
         return root
     project_root = Path(__file__).resolve().parents[2]
     return project_root / root
+
+
+def _configured_route_attempt_limit(config: BenchmarkConfig) -> int:
+    metadata = config.metadata if isinstance(config.metadata, dict) else {}
+    value = metadata.get("max_route_attempts")
+    if isinstance(value, bool):
+        return MAX_ROUTE_ATTEMPTS
+    try:
+        attempts = int(value)
+    except (TypeError, ValueError):
+        return MAX_ROUTE_ATTEMPTS
+    return max(1, attempts)
 
 
 def _slugify(value: str) -> str:

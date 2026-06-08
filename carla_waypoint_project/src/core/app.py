@@ -90,7 +90,7 @@ BENCHMARK_PROGRESS_DISTANCE_M = 0.8
 BENCHMARK_GOAL_DISTANCE_PROGRESS_M = 1.0
 BENCHMARK_LATERAL_DEVIATION_M = 15.0
 BENCHMARK_LATERAL_DEVIATION_SECONDS = 3.0
-CLOSED_LOOP_AUTOTUNE_PROGRESS_REFRESH_S = 0.5
+CLOSED_LOOP_AUTOTUNE_PROGRESS_REFRESH_S = 1.0
 
 
 class DriveMode(Enum):
@@ -236,7 +236,11 @@ class SimulationApp:
         self._closed_loop_auto_tune_current_trial = 0
         self._closed_loop_auto_tune_total_trials = 0
         self._closed_loop_auto_tune_current_status = "idle"
-        self._closed_loop_auto_tune_background_surface: Optional[pygame.Surface] = None
+        self._closed_loop_auto_tune_background_surface: Optional[pygame.Surface] = (
+            existing_display_surface.copy()
+            if self._lightweight_closed_loop_auto_tune and existing_display_surface is not None
+            else None
+        )
         self._closed_loop_auto_tune_progress_dirty = True
         self._closed_loop_auto_tune_last_draw_monotonic = 0.0
         self._closed_loop_auto_tune_last_live_update_monotonic = 0.0
@@ -315,7 +319,11 @@ class SimulationApp:
         )
         self._map_selector = MapSelector(world_map=world_map)
         self.route_planner = RoutePlanner(world_map=world_map)
-        self._topdown_renderer = TopDownMapRenderer(world_map=world_map)
+        self._topdown_renderer = (
+            None
+            if self._lightweight_closed_loop_auto_tune
+            else TopDownMapRenderer(world_map=world_map)
+        )
         self._test_route_store = TestRouteStore(map_name=self._active_map_name)
         self._test_runner = RouteTestRunner(
             world_map=world_map,
@@ -374,7 +382,6 @@ class SimulationApp:
             "GNSS projector": self._gnss_projector,
             "map selector": self._map_selector,
             "route planner": self.route_planner,
-            "top-down renderer": self._topdown_renderer,
             "test route store": self._test_route_store,
             "test runner": self._test_runner,
             "offline recorder": self._offline_recorder,
@@ -382,6 +389,7 @@ class SimulationApp:
         if not self._lightweight_closed_loop_auto_tune:
             required["camera sensor"] = self._camera_sensor
             required["LiDAR sensor"] = self._lidar_sensor
+            required["top-down renderer"] = self._topdown_renderer
         missing = [name for name, value in required.items() if value is None]
         if missing:
             raise RuntimeError(f"Application is not initialized: {', '.join(missing)}.")
@@ -417,7 +425,8 @@ class SimulationApp:
         self._build_control_panel()
         self._sync_filter_tune_panel()
         self._control_status_text = "Dashboard ready"
-        self._draw_startup_frame()
+        if not self._lightweight_closed_loop_auto_tune:
+            self._draw_startup_frame()
 
     def _draw_startup_frame(self) -> None:
         if self._display is None or self._control_panel is None:
@@ -613,6 +622,7 @@ class SimulationApp:
             "sensor_noise": request.sensor_noise_profile or request.sensor_noise_config.get("preset_name") or "Custom",
             "behavior": request.vehicle_behavior_profile or request.vehicle_behavior_config.get("preset_name") or "Custom",
             "actuator": request.actuator_realism_profile or request.actuator_realism_config.get("preset_name") or "Custom",
+            "trial_count": self._closed_loop_auto_tune_total_trials,
             "active_control_policy": (
                 "active-control params may be tuned"
                 if request.tracking_mode == TRACKING_MODE_ACTIVE
@@ -621,7 +631,8 @@ class SimulationApp:
         }
         self._closed_loop_auto_tune_status_lines = [
             "Direct mode: every search trial is a no-render CARLA route trial.",
-            "Offline logs are used only to lock/verify the sensor-noise context.",
+            "Each trial uses the current selected sensor-noise profile.",
+            "Each candidate gets one route attempt; a route failure ends that trial.",
             "CARLA no-rendering mode enabled; fixed_delta_seconds is unchanged.",
         ]
         self._closed_loop_auto_tune_previous_no_rendering = self._client_manager.no_rendering_mode
@@ -713,9 +724,18 @@ class SimulationApp:
                 if isinstance(payload.get("best_score"), (int, float)) and math.isfinite(float(payload["best_score"]))
                 else self._closed_loop_auto_tune_best_score
             )
-            mean_cte = metrics.get("driving_mean_cross_track_error_m") or metrics.get("mean_cross_track_error_m")
-            max_cte = metrics.get("driving_max_cross_track_error_m") or metrics.get("max_cross_track_error_m")
-            nis = self._closed_loop_auto_tune_metric(metrics, "driving_legacy_mean_nis_mixed", "eval_legacy_mean_nis_mixed", "legacy_mean_nis_mixed", "mean_nis")
+            rmse = self._closed_loop_auto_tune_metric(metrics, "eval_filtered_rmse_m", "filtered_rmse_m")
+            mean_cte = self._closed_loop_auto_tune_metric(
+                metrics,
+                "driving_mean_cross_track_error_m",
+                "mean_cross_track_error_m",
+            )
+            max_cte = self._closed_loop_auto_tune_metric(
+                metrics,
+                "driving_max_cross_track_error_m",
+                "max_cross_track_error_m",
+            )
+            nis = self._closed_loop_auto_tune_nis_metric(metrics)
             nees = self._closed_loop_auto_tune_metric(
                 metrics,
                 "driving_mean_position_nees",
@@ -732,7 +752,7 @@ class SimulationApp:
                     "trial": int(payload.get("trial_index") or 0),
                     "status": "failed" if payload.get("failed") else "ok",
                     "score": payload.get("score"),
-                    "rmse": metrics.get("eval_filtered_rmse_m") or metrics.get("filtered_rmse_m"),
+                    "rmse": rmse,
                     "mean_cte": mean_cte,
                     "max_cte": max_cte,
                     "nis": nis,
@@ -743,7 +763,7 @@ class SimulationApp:
             text = (
                 f"Trial {payload.get('trial_index')}/{payload.get('trial_total')} finished | "
                 f"score {number_text(payload.get('score'))} | best {number_text(self._closed_loop_auto_tune_best_score)} | "
-                f"RMSE {number_text(metrics.get('eval_filtered_rmse_m') or metrics.get('filtered_rmse_m'))} m | "
+                f"RMSE {number_text(rmse)} m | "
                 f"CTE {number_text(mean_cte)} m | "
                 f"success {'yes' if payload.get('route_completion_success') else 'no'}"
             )
@@ -796,6 +816,30 @@ class SimulationApp:
                 return float(value)
         return None
 
+    @classmethod
+    def _closed_loop_auto_tune_nis_metric(cls, metrics: dict[str, object]) -> Optional[float]:
+        direct = cls._closed_loop_auto_tune_metric(
+            metrics,
+            "driving_legacy_mean_nis_mixed",
+            "eval_legacy_mean_nis_mixed",
+            "legacy_mean_nis_mixed",
+            "mean_nis",
+        )
+        if direct is not None:
+            return direct
+        values: list[float] = []
+        for key in ("driving_nis_by_type_summary", "eval_nis_by_type_summary", "nis_by_type_summary"):
+            summary = metrics.get(key)
+            if not isinstance(summary, dict):
+                continue
+            for item in summary.values():
+                if not isinstance(item, dict):
+                    continue
+                value = cls._closed_loop_auto_tune_metric(item, "mean")
+                if value is not None:
+                    values.append(value)
+        return max(values) if values else None
+
     def _restore_closed_loop_auto_tune_rendering(self) -> None:
         if self._closed_loop_auto_tune_previous_no_rendering is None:
             return
@@ -805,6 +849,11 @@ class SimulationApp:
     def _capture_closed_loop_auto_tune_background(self) -> None:
         if self._display is None:
             self._closed_loop_auto_tune_background_surface = None
+            return
+        if (
+            self._closed_loop_auto_tune_background_surface is not None
+            and self._closed_loop_auto_tune_background_surface.get_size() == self._display.surface.get_size()
+        ):
             return
         try:
             self._closed_loop_auto_tune_background_surface = self._display.surface.copy()
@@ -826,11 +875,7 @@ class SimulationApp:
         if self._display is None:
             return
         now = time.monotonic()
-        if (
-            not force
-            and not self._closed_loop_auto_tune_progress_dirty
-            and now - self._closed_loop_auto_tune_last_draw_monotonic < CLOSED_LOOP_AUTOTUNE_PROGRESS_REFRESH_S
-        ):
+        if not force and not self._closed_loop_auto_tune_progress_dirty:
             return
         surface = self._display.surface
         width, height = surface.get_size()
@@ -866,7 +911,7 @@ class SimulationApp:
         right_x = content.left + content.width // 2 + 14
         y = content.top + 58
         context_lines = [
-            f"Trial: {trial_text}",
+            f"Trial: {trial_text} | Planned trials: {context.get('trial_count', self._closed_loop_auto_tune_total_trials)}",
             f"Filter: {context.get('filter', 'n/a')}",
             f"Tracking: {context.get('tracking_mode', 'n/a')} ({context.get('active_control_policy', 'n/a')})",
             f"Route: {context.get('route', 'n/a')} | Map: {context.get('map', 'n/a')}",
@@ -1213,6 +1258,10 @@ class SimulationApp:
             metadata={
                 "startup_mode": "closed_loop_auto_tune_validation",
                 "compact_route_output": True,
+                "direct_closed_loop_mode": True,
+                "no_rendering_mode": True,
+                "max_route_attempts": 1,
+                "route_attempt_policy": "one_attempt_per_candidate_trial",
                 "finalist_rank": request.finalist.rank,
                 "offline_score": request.finalist.offline_score,
                 "offline_trial_index": request.finalist.trial_index,
@@ -3170,7 +3219,10 @@ class SimulationApp:
             world=self._client_manager.world,
             blueprint_library=self._client_manager.blueprint_library,
         )
-        self._camera_sensor = self._sensor_manager.create_rgb_camera(attach_to=self._vehicle)
+        if self._lightweight_closed_loop_auto_tune:
+            self._camera_sensor = None
+        else:
+            self._camera_sensor = self._sensor_manager.create_rgb_camera(attach_to=self._vehicle)
         self._gnss_sensor = self._sensor_manager.create_gnss(
             attach_to=self._vehicle,
             config=self.sensor_noise_config,
@@ -3179,7 +3231,10 @@ class SimulationApp:
             attach_to=self._vehicle,
             config=self.sensor_noise_config,
         )
-        self._lidar_sensor = self._sensor_manager.create_lidar(attach_to=self._vehicle)
+        if self._lightweight_closed_loop_auto_tune:
+            self._lidar_sensor = None
+        else:
+            self._lidar_sensor = self._sensor_manager.create_lidar(attach_to=self._vehicle)
         self._waypoint_manager = WaypointManager(world_map=self._client_manager.world_map)
         self._manual_controller = ManualController(vehicle=self._vehicle)
         self._ground_truth_provider = GroundTruthStateProvider(vehicle=self._vehicle)
@@ -3220,7 +3275,11 @@ class SimulationApp:
         self._sync_filter_tune_panel()
         self._map_selector = MapSelector(world_map=self._client_manager.world_map)
         self.route_planner = RoutePlanner(world_map=self._client_manager.world_map)
-        self._topdown_renderer = TopDownMapRenderer(world_map=self._client_manager.world_map)
+        self._topdown_renderer = (
+            None
+            if self._lightweight_closed_loop_auto_tune
+            else TopDownMapRenderer(world_map=self._client_manager.world_map)
+        )
         self._test_route_store = TestRouteStore(map_name=self._active_map_name)
         self.waypoint_tracker.clear_route()
         self._latest_tracking = self._empty_tracking_status()

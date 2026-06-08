@@ -888,7 +888,8 @@ class StartupMapSelector:
         return SENSOR_NOISE_PRESETS["Medium Noise"]
 
     def _current_sensor_noise_config(self) -> object:
-        return sensor_noise_config_from_values(self._current_sensor_values(), preset_name=self._sensor_preset)
+        preset = self._sensor_editor.active_preset if self._sensor_editor is not None else self._sensor_preset
+        return sensor_noise_config_from_values(self._current_sensor_values(), preset_name=preset)
 
     def _current_vehicle_behavior_config(self) -> dict[str, object]:
         values = self._behavior_editor.values() if self._behavior_editor is not None else BEHAVIOR_PRESETS["Balanced"]
@@ -1867,7 +1868,7 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_route_scroll = 0
         self._closed_loop_auto_tune_status_lines = [
             "Direct mode runs every search trial as a real CARLA route trial with no rendering.",
-            "Offline logs are used only to lock and verify the sensor-noise context.",
+            "Each trial uses the current selected sensor-noise profile.",
             "There is no offline finalist stage in this mode.",
         ]
 
@@ -1876,11 +1877,7 @@ class StartupMapSelector:
             self._closed_loop_auto_tune_modal_open = False
             return _NoSelection
         if event.type == pygame.MOUSEWHEEL:
-            mouse = pygame.mouse.get_pos()
-            if self._closed_loop_auto_tune_route_list_rect.collidepoint(mouse):
-                self._closed_loop_auto_tune_route_scroll = max(0, self._closed_loop_auto_tune_route_scroll - event.y * 2)
-            else:
-                self._closed_loop_auto_tune_log_scroll = max(0, self._closed_loop_auto_tune_log_scroll - event.y * 2)
+            self._closed_loop_auto_tune_route_scroll = max(0, self._closed_loop_auto_tune_route_scroll - event.y * 2)
             return _NoSelection
         if event.type != pygame.MOUSEBUTTONDOWN or getattr(event, "button", None) != 1 or not hasattr(event, "pos"):
             return _NoSelection
@@ -1889,29 +1886,12 @@ class StartupMapSelector:
         if self._closed_loop_auto_tune_close_rect.collidepoint(position) or self._closed_loop_auto_tune_cancel_rect.collidepoint(position):
             self._closed_loop_auto_tune_modal_open = False
             return _NoSelection
-        if self._closed_loop_auto_tune_refresh_logs_rect.collidepoint(position):
-            self._refresh_recorded_logs()
-            self._append_closed_loop_auto_tune_status(f"Found {len(self._recorded_logs)} recorded log(s).")
-            return _NoSelection
-        if self._closed_loop_auto_tune_select_matching_noise_rect.collidepoint(position):
-            self._select_closed_loop_auto_tune_matching_noise()
-            return _NoSelection
-        if self._closed_loop_auto_tune_clear_logs_rect.collidepoint(position):
-            self._closed_loop_auto_tune_selected_log_indices.clear()
-            return _NoSelection
         if self._closed_loop_auto_tune_trials_minus_rect.collidepoint(position):
             self._closed_loop_auto_tune_trials = max(1, self._closed_loop_auto_tune_trials - 5)
             return _NoSelection
         if self._closed_loop_auto_tune_trials_plus_rect.collidepoint(position):
             self._closed_loop_auto_tune_trials = min(500, self._closed_loop_auto_tune_trials + 5)
             return _NoSelection
-        for index, rect in self._closed_loop_auto_tune_log_rects.items():
-            if rect.collidepoint(position):
-                if index in self._closed_loop_auto_tune_selected_log_indices:
-                    self._closed_loop_auto_tune_selected_log_indices.remove(index)
-                else:
-                    self._closed_loop_auto_tune_selected_log_indices.add(index)
-                return _NoSelection
         for index, rect in self._closed_loop_auto_tune_route_rects.items():
             if rect.collidepoint(position):
                 self._closed_loop_auto_tune_validation_route_index = index
@@ -1946,23 +1926,9 @@ class StartupMapSelector:
             or not record.auto_tune_profile.get("primary")
         ):
             raise ValueError("Closed-loop auto tune is unavailable for this filter.")
-        selected_logs = [
-            info
-            for index, info in enumerate(self._recorded_logs)
-            if index in self._closed_loop_auto_tune_selected_log_indices
-        ]
-        if not selected_logs:
-            raise ValueError("Select at least one recorded offline sensor log to lock the sensor-noise context.")
-        log_metadata = [self._recorded_log_noise_metadata(info) for info in selected_logs]
-        log_noise = noise_profile_summary(log_metadata)
-        if log_noise.get("mixed"):
-            raise ValueError("Selected offline logs use mixed sensor noise signatures. Select matching-noise logs.")
-
         sensor_config_obj = self._current_sensor_noise_config()
         sensor_config = sensor_config_obj.to_dict() if hasattr(sensor_config_obj, "to_dict") else dict(sensor_config_obj)
         selected_signature = noise_signature(sensor_config)
-        if log_noise.get("signature") and log_noise.get("signature") != selected_signature:
-            raise ValueError("Selected offline logs do not match the current sensor noise profile/signature.")
 
         if self._closed_loop_auto_tune_validation_route_index is None:
             raise ValueError("Select exactly one validation route for direct closed-loop trial scoring.")
@@ -1980,7 +1946,7 @@ class StartupMapSelector:
         pending = PendingClosedLoopAutoTuneSession(
             selected_filter=record.filter_id,
             tracking_mode=self._tracking_mode,
-            offline_log_paths=tuple(str(info.sensor_log_path) for info in selected_logs),
+            offline_log_paths=(),
             noise_signature=selected_signature,
             validation_route_name=route.name,
             validation_route_map=route.map_name or "",
@@ -2000,7 +1966,7 @@ class StartupMapSelector:
         return ClosedLoopAutoTuneRequest(
             filter_id=record.filter_id,
             tracking_mode=self._tracking_mode,
-            offline_log_paths=tuple(info.sensor_log_path for info in selected_logs),
+            offline_log_paths=(),
             validation_routes=(
                 ClosedLoopValidationRoute(
                     name=route.name,
@@ -2014,7 +1980,7 @@ class StartupMapSelector:
             actuator_realism_config=dict(actuator_config),
             base_tune=self._current_filter_tune_values(record.filter_id),
             auto_tune_profile=dict(record.auto_tune_profile),
-            sensor_noise_profile=self._sensor_preset,
+            sensor_noise_profile=str(sensor_config.get("preset_name") or self._sensor_preset),
             vehicle_behavior_profile=self._behavior_preset,
             actuator_realism_enabled=True,
             actuator_realism_profile=str(actuator_config.get("preset_name") or self._actuator_preset),
@@ -2027,16 +1993,12 @@ class StartupMapSelector:
                 "pending_session": pending.to_dict(),
                 "validation_route_data": route.to_dict(),
                 "selected_sensor_noise_signature": selected_signature,
+                "selected_sensor_noise_config": dict(sensor_config),
+                "direct_closed_loop_mode": True,
+                "no_rendering_mode": True,
+                "route_attempt_policy": "one_attempt_per_candidate_trial",
             },
         )
-
-    def _recorded_log_noise_metadata(self, info: RecordedLogInfo) -> dict[str, object]:
-        metadata = read_json(info.route_folder / "route_metadata.json")
-        config = metadata.get("sensor_noise_config")
-        return {
-            "sensor_noise_preset": info.sensor_noise_preset,
-            "sensor_noise_config": config if isinstance(config, dict) else {},
-        }
 
     def _closed_loop_validation_route_identity(self, route: SavedTestRoute) -> str:
         payload = route.to_dict()
@@ -2063,18 +2025,15 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_status_lines.append(str(line))
         self._closed_loop_auto_tune_status_lines = self._closed_loop_auto_tune_status_lines[-80:]
 
-    def _select_closed_loop_auto_tune_matching_noise(self) -> None:
-        sensor_config_obj = self._current_sensor_noise_config()
-        sensor_config = sensor_config_obj.to_dict() if hasattr(sensor_config_obj, "to_dict") else dict(sensor_config_obj)
-        selected_signature = noise_signature(sensor_config)
-        self._closed_loop_auto_tune_selected_log_indices = {
-            index
-            for index, info in enumerate(self._recorded_logs)
-            if noise_profile_summary([self._recorded_log_noise_metadata(info)]).get("signature") == selected_signature
-        }
-        self._append_closed_loop_auto_tune_status(
-            f"Selected {len(self._closed_loop_auto_tune_selected_log_indices)} log(s) matching current noise signature."
+    def _closed_loop_sensor_noise_label(self) -> str:
+        preset = str(
+            self._sensor_editor.active_preset
+            if self._sensor_editor is not None
+            else self._sensor_preset or "Custom"
         )
+        if preset.strip().lower() == "custom":
+            return "Custom/current GUI values"
+        return preset
 
     def _draw_closed_loop_auto_tune_modal(self) -> None:
         width, height = self._surface.get_size()
@@ -2102,7 +2061,7 @@ class StartupMapSelector:
             content.width,
         )
         self._draw_text(
-            "Direct mode: every trial is driven in CARLA with no rendering; offline logs only lock sensor-noise context.",
+            "Each trial is driven in CARLA no-render mode using the current selected sensor-noise profile.",
             (content.left, content.top + 49),
             self._small_font,
             DASHBOARD.warning_color,
@@ -2111,53 +2070,11 @@ class StartupMapSelector:
 
         footer_h = 44
         body = pygame.Rect(content.left, content.top + 76, content.width, content.height - 76 - footer_h - 10)
-        left = pygame.Rect(body.left, body.top, int(body.width * 0.40), body.height)
-        center = pygame.Rect(left.right + 10, body.top, int(body.width * 0.29), body.height)
-        right = pygame.Rect(center.right + 10, body.top, body.right - center.right - 10, body.height)
-        self._draw_closed_loop_auto_tune_log_selection(left)
-        self._draw_closed_loop_auto_tune_route_selection(center)
+        left = pygame.Rect(body.left, body.top, int(body.width * 0.54), body.height)
+        right = pygame.Rect(left.right + 10, body.top, body.right - left.right - 10, body.height)
+        self._draw_closed_loop_auto_tune_route_selection(left)
         self._draw_closed_loop_auto_tune_settings_and_console(right)
         self._draw_closed_loop_auto_tune_footer(pygame.Rect(content.left, content.bottom - footer_h, content.width, footer_h))
-
-    def _draw_closed_loop_auto_tune_log_selection(self, rect: pygame.Rect) -> None:
-        pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, rect, border_radius=6)
-        pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, rect, width=1, border_radius=6)
-        content = rect.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
-        self._draw_text(
-            f"Offline Logs ({len(self._closed_loop_auto_tune_selected_log_indices)} selected)",
-            content.topleft,
-            self._subtitle_font,
-            DASHBOARD.title_color,
-            content.width,
-        )
-        button_y = content.top + 30
-        self._closed_loop_auto_tune_refresh_logs_rect = pygame.Rect(content.left, button_y, 92, 24)
-        self._closed_loop_auto_tune_select_matching_noise_rect = pygame.Rect(self._closed_loop_auto_tune_refresh_logs_rect.right + 8, button_y, 142, 24)
-        self._closed_loop_auto_tune_clear_logs_rect = pygame.Rect(self._closed_loop_auto_tune_select_matching_noise_rect.right + 8, button_y, 62, 24)
-        self._draw_button(self._closed_loop_auto_tune_refresh_logs_rect, "Refresh")
-        self._draw_button(self._closed_loop_auto_tune_select_matching_noise_rect, "Select Matching")
-        self._draw_button(self._closed_loop_auto_tune_clear_logs_rect, "Clear")
-        list_rect = pygame.Rect(content.left, button_y + 32, content.width, content.bottom - button_y - 32)
-        self._closed_loop_auto_tune_log_list_rect = list_rect
-        pygame.draw.rect(self._surface, (14, 18, 24), list_rect, border_radius=4)
-        self._closed_loop_auto_tune_log_rects.clear()
-        if not self._recorded_logs:
-            self._draw_text("No recorded logs found.", (list_rect.left + 8, list_rect.top + 10), self._small_font, DASHBOARD.warning_color, list_rect.width - 16)
-            return
-        row_h = 66
-        visible = max(1, list_rect.height // row_h)
-        self._closed_loop_auto_tune_log_scroll = min(self._closed_loop_auto_tune_log_scroll, max(0, len(self._recorded_logs) - visible))
-        for visible_index, info in enumerate(self._recorded_logs[self._closed_loop_auto_tune_log_scroll : self._closed_loop_auto_tune_log_scroll + visible]):
-            index = self._closed_loop_auto_tune_log_scroll + visible_index
-            row = pygame.Rect(list_rect.left + 5, list_rect.top + 5 + visible_index * row_h, list_rect.width - 10, row_h - 6)
-            self._closed_loop_auto_tune_log_rects[index] = row
-            selected = index in self._closed_loop_auto_tune_selected_log_indices
-            pygame.draw.rect(self._surface, (35, 73, 53) if selected else (24, 30, 39), row, border_radius=4)
-            pygame.draw.rect(self._surface, DASHBOARD.success_color if selected else DASHBOARD.panel_border_color, row, width=1, border_radius=4)
-            mark = "[x]" if selected else "[ ]"
-            self._draw_text(f"{mark} {info.route_name} | {display_map_name(info.map_name)}", (row.left + 8, row.top + 6), self._small_font, DASHBOARD.title_color, row.width - 16)
-            self._draw_text(f"Noise {info.sensor_noise_preset or 'n/a'} {self._compact_log_noise_details(info)}", (row.left + 8, row.top + 27), self._small_font, DASHBOARD.muted_text_color, row.width - 16)
-            self._draw_text(info.created_at or info.recording_id, (row.left + 8, row.top + 47), self._small_font, DASHBOARD.muted_text_color, row.width - 16)
 
     def _draw_closed_loop_auto_tune_route_selection(self, rect: pygame.Rect) -> None:
         pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, rect, border_radius=6)
@@ -2208,10 +2125,10 @@ class StartupMapSelector:
         )
         detail_lines = [
             "Mode: every search trial drives the selected route in CARLA no-render.",
-            "Offline logs: sensor-noise context only; no candidate generation.",
+            "One route attempt per candidate; route failures end the trial.",
             "Strategy: direct optuna_tpe ask/tell; fallback direct random search.",
             f"Tracking: {self._tracking_mode}. {active_policy}",
-            f"Sensor noise: {self._sensor_preset}",
+            f"Sensor Noise: {self._closed_loop_sensor_noise_label()}",
             f"Behavior: {self._behavior_preset}",
             f"Actuator: {self._actuator_preset} (applied during every trial)",
         ]
@@ -2237,24 +2154,20 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_cancel_rect = pygame.Rect(self._closed_loop_auto_tune_start_rect.right + 8, rect.top + 5, 122, 30)
         self._draw_button(self._closed_loop_auto_tune_start_rect, "Start", primary=True)
         self._draw_button(self._closed_loop_auto_tune_cancel_rect, "Cancel")
-        selected_logs = [info for index, info in enumerate(self._recorded_logs) if index in self._closed_loop_auto_tune_selected_log_indices]
-        noise = noise_profile_summary([self._recorded_log_noise_metadata(info) for info in selected_logs])
         route_name = "none"
         if self._closed_loop_auto_tune_validation_route_index is not None:
             route_item = next((item for item in self._route_items if item.index == self._closed_loop_auto_tune_validation_route_index), None)
             if route_item is not None:
                 route_name = f"{route_item.route.name} ({display_map_name(route_item.route.map_name)})"
         summary = (
-            f"Logs: {len(selected_logs)} | Noise: {noise.get('label') or 'n/a'} | "
+            f"Sensor Noise: {self._closed_loop_sensor_noise_label()} | "
             f"Route: {route_name} | Tracking: {self._tracking_mode} | Actuator: {self._actuator_preset}"
         )
         if self._tracking_mode == TRACKING_MODE_PASSIVE:
             summary += " | active-control params off"
         else:
             summary += " | active-control params may tune"
-        if noise.get("mixed"):
-            summary += " | mixed noise selected"
-        self._draw_text(summary, (rect.left, rect.top + 13), self._small_font, DASHBOARD.warning_color if noise.get("mixed") else DASHBOARD.muted_text_color, self._closed_loop_auto_tune_start_rect.left - rect.left - 10)
+        self._draw_text(summary, (rect.left, rect.top + 13), self._small_font, DASHBOARD.muted_text_color, self._closed_loop_auto_tune_start_rect.left - rect.left - 10)
 
     def _open_auto_tune_modal(self, filter_id: str) -> None:
         record = self._filter_record(filter_id)

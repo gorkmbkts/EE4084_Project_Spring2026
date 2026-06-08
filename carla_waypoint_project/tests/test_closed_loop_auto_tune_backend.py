@@ -23,7 +23,11 @@ from src.evaluation.closed_loop_auto_tune import (  # noqa: E402
 from src.evaluation.evaluation_artifacts import write_json  # noqa: E402
 from src.evaluation.filter_auto_tuner import AutoTuneResult, AutoTuneTrialResult, OfflineBenchmarkAutoTuner  # noqa: E402
 import src.evaluation.offline_replay_runner as offline_replay_runner_module  # noqa: E402
-from src.evaluation.route_test_runner import RouteTestRunner  # noqa: E402
+from src.evaluation.route_test_runner import (  # noqa: E402
+    MAX_ROUTE_ATTEMPTS,
+    RouteTestRunner,
+    _configured_route_attempt_limit,
+)
 from src.evaluation.sensor_noise_tune_mapper import noise_signature  # noqa: E402
 from src.evaluation.tune_config_schema import (  # noqa: E402
     BENCHMARK_MODE_CLOSED_LOOP,
@@ -66,6 +70,28 @@ def test_closed_loop_autotuner_rejects_mixed_noise_logs_by_default(tmp_path: Pat
         ClosedLoopBenchmarkAutoTuner(offline_tuner=offline, validation_runner=_FakeValidationRunner()).run(request)
     if offline.calls:
         raise AssertionError("mixed-noise rejection should happen before offline candidate generation")
+
+
+def test_closed_loop_autotuner_runs_without_offline_logs_using_request_noise(tmp_path: Path) -> None:
+    sensor = {"preset_name": "High Noise", "gnss_position_stddev_m": 2.75, "imu_accel_stddev_mps2": 0.8}
+    runner = _FakeValidationRunner({1: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0}})
+    request = _request(tmp_path, (), sensor, trial_count=1)
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+
+    if len(runner.requests) != 1:
+        raise AssertionError("zero-log direct request did not run its CARLA route trial")
+    if runner.requests[0].sensor_noise_config != sensor:
+        raise AssertionError("direct route trial did not receive request.sensor_noise_config")
+
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    if config.get("selected_logs") != [] or config.get("selected_offline_logs") != []:
+        raise AssertionError("zero-log direct config did not serialize empty selected log lists")
+    if config.get("noise_signature") != noise_signature(sensor):
+        raise AssertionError("direct config did not derive compatibility signature from request.sensor_noise_config")
+    if config.get("sensor_noise_config") != sensor or config.get("sensor_noise_profile") != "High Noise":
+        raise AssertionError("direct config did not preserve the selected sensor noise profile/config")
+    if config.get("route_attempt_policy") != "one_attempt_per_candidate_trial":
+        raise AssertionError("direct config did not record the one-attempt trial policy")
 
 
 def test_closed_loop_autotuner_runs_direct_closed_loop_trials_and_selects_best(tmp_path: Path) -> None:
@@ -233,6 +259,55 @@ def test_closed_loop_validation_route_runner_uses_compact_route_artifact_folders
     regular_folder = runner._route_output_folder(route, 0)
     if regular_folder.name != "route_001_mahalle_validation_route":
         raise AssertionError(f"regular benchmark route folder naming changed unexpectedly: {regular_folder}")
+
+
+def test_route_runner_one_attempt_policy_fails_without_retrying_candidate() -> None:
+    if _configured_route_attempt_limit(SimpleNamespace(metadata={"max_route_attempts": 1})) != 1:
+        raise AssertionError("direct benchmark metadata did not configure one route attempt")
+    if _configured_route_attempt_limit(SimpleNamespace(metadata={})) != MAX_ROUTE_ATTEMPTS:
+        raise AssertionError("normal visual benchmark retry default changed")
+
+    runner = RouteTestRunner.__new__(RouteTestRunner)
+    runner._active = True
+    runner._automated = True
+    runner._route_running = True
+    runner._current_route = SimpleNamespace(name="direct_trial_route")
+    runner._current_route_index = 0
+    runner._current_attempt = 1
+    runner._max_route_attempts = 1
+    runner._attempt_failures_by_route = {}
+    runner._last_failure_reason = ""
+    runner._route_status = "running"
+    runner._started_monotonic = None
+    runner._status_text = ""
+
+    finish_calls: list[dict[str, object]] = []
+    advance_calls: list[object] = []
+    retry_calls: list[object] = []
+
+    def finish_current_route(**kwargs: object) -> Path:
+        finish_calls.append(dict(kwargs))
+        runner._route_running = False
+        return Path("failed_trial")
+
+    runner._finish_current_route = finish_current_route
+    runner._advance_after_route = lambda active_map_name: advance_calls.append(active_map_name)
+    runner.begin_current_route = lambda active_map_name: retry_calls.append(active_map_name) or True
+
+    runner.fail_current_attempt(
+        reason="Vehicle stuck: no route progress",
+        simulation_time_s=12.0,
+        active_map_name="Town01",
+    )
+
+    if retry_calls:
+        raise AssertionError("one-attempt direct trial retried the same candidate")
+    if len(finish_calls) != 1 or finish_calls[0].get("record_result") is not True:
+        raise AssertionError("one-attempt direct failure was not recorded as the final trial result")
+    if finish_calls[0].get("final_status") != "TEST_NOT_COMPLETED":
+        raise AssertionError("one-attempt direct failure did not end as TEST_NOT_COMPLETED")
+    if len(advance_calls) != 1:
+        raise AssertionError("one-attempt direct failure did not advance to the next candidate")
 
 
 def test_backend_created_configs_cannot_mix_contexts(tmp_path: Path) -> None:

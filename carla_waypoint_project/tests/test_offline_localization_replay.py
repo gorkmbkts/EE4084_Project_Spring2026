@@ -1473,16 +1473,12 @@ def test_closed_loop_auto_tune_builder_requires_one_validation_route(tmp_path: P
         raise AssertionError("closed-loop autotune builder accepted missing validation route")
 
 
-def test_closed_loop_auto_tune_builder_rejects_mixed_noise_logs(tmp_path: Path) -> None:
+def test_closed_loop_auto_tune_builder_ignores_offline_log_selection(tmp_path: Path) -> None:
     selector = _closed_loop_autotune_selector(tmp_path, include_mixed_noise=True)
     selector._closed_loop_auto_tune_selected_log_indices = {0, 1}
-    try:
-        selector._build_closed_loop_auto_tune_request_from_modal()
-    except ValueError as exc:
-        if "mixed sensor noise" not in str(exc):
-            raise AssertionError(f"wrong mixed-noise rejection: {exc}") from exc
-    else:
-        raise AssertionError("closed-loop autotune builder accepted mixed-noise offline logs")
+    request = selector._build_closed_loop_auto_tune_request_from_modal()
+    if request.offline_log_paths:
+        raise AssertionError("direct closed-loop request included UI-selected offline logs")
 
 
 def test_closed_loop_auto_tune_builder_includes_explicit_session_fields(tmp_path: Path) -> None:
@@ -1490,8 +1486,8 @@ def test_closed_loop_auto_tune_builder_includes_explicit_session_fields(tmp_path
     request = selector._build_closed_loop_auto_tune_request_from_modal()
     if request.filter_id != "ca_kf" or request.tracking_mode != TRACKING_MODE_ACTIVE:
         raise AssertionError("closed-loop autotune request did not preserve selected filter/tracking mode")
-    if len(request.offline_log_paths) != 1 or not str(request.offline_log_paths[0]).endswith("sensor_log.csv"):
-        raise AssertionError("closed-loop autotune request did not preserve selected offline log")
+    if request.offline_log_paths:
+        raise AssertionError("direct closed-loop autotune request should not require offline logs")
     if len(request.validation_routes) != 1:
         raise AssertionError("closed-loop autotune request did not preserve exactly one validation route")
     route = request.validation_routes[0]
@@ -1508,6 +1504,24 @@ def test_closed_loop_auto_tune_builder_includes_explicit_session_fields(tmp_path
     pending = request.metadata.get("pending_session")
     if not isinstance(pending, dict) or pending.get("validation_route_data") != route.route_data:
         raise AssertionError("closed-loop autotune request did not include explicit pending-session handoff metadata")
+    if pending.get("offline_log_paths") != ():
+        raise AssertionError("direct pending-session metadata did not preserve an empty optional log list")
+
+
+def test_closed_loop_auto_tune_builder_uses_current_gui_sensor_noise(tmp_path: Path) -> None:
+    selector = _closed_loop_autotune_selector(tmp_path)
+    custom_values = dict(SENSOR_NOISE_PRESETS["High Noise"])
+    first_key = next(iter(custom_values))
+    custom_values[first_key] = float(custom_values[first_key]) * 1.1
+    selector._sensor_editor = SimpleNamespace(values=lambda: dict(custom_values), active_preset="Custom")
+    selector._sensor_preset = "Custom"
+
+    request = selector._build_closed_loop_auto_tune_request_from_modal()
+    expected = sensor_noise_config_from_values(custom_values, preset_name="Custom").to_dict()
+    if request.sensor_noise_config != expected:
+        raise AssertionError("direct request did not use the current Sensor Noise tab values")
+    if request.metadata.get("selected_sensor_noise_signature") != noise_signature(expected):
+        raise AssertionError("direct request did not derive its noise signature from current GUI values")
 
 
 def test_closed_loop_auto_tune_modal_not_available_for_raw_gnss() -> None:
