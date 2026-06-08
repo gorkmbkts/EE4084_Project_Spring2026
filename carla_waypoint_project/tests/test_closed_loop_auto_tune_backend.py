@@ -23,6 +23,7 @@ from src.evaluation.closed_loop_auto_tune import (  # noqa: E402
 from src.evaluation.evaluation_artifacts import write_json  # noqa: E402
 from src.evaluation.filter_auto_tuner import AutoTuneResult, AutoTuneTrialResult, OfflineBenchmarkAutoTuner  # noqa: E402
 import src.evaluation.offline_replay_runner as offline_replay_runner_module  # noqa: E402
+from src.evaluation.route_test_runner import RouteTestRunner  # noqa: E402
 from src.evaluation.sensor_noise_tune_mapper import noise_signature  # noqa: E402
 from src.evaluation.tune_config_schema import (  # noqa: E402
     BENCHMARK_MODE_CLOSED_LOOP,
@@ -99,6 +100,9 @@ def test_closed_loop_autotuner_selects_top_finalists_and_validates_only_them(tmp
         raise AssertionError("closed-loop validation should run only finalist_count finalists")
     if [call.finalist.trial_index for call in runner.requests] != [2, 3]:
         raise AssertionError("closed-loop validation did not use the top offline-score finalists")
+    validation_output_folders = [str(call.output_folder).replace("\\", "/") for call in runner.requests]
+    if not all("/v/f" in folder for folder in validation_output_folders):
+        raise AssertionError(f"closed-loop validation output did not use compact folders: {validation_output_folders}")
     if result.best_tune.get("process_jerk_stddev_mps3") != 3.0:
         raise AssertionError("final best tune should be selected by closed-loop score, not offline rank only")
 
@@ -216,6 +220,22 @@ def test_closed_loop_autotuner_saves_active_config_separately(tmp_path: Path) ->
         raise AssertionError(f"active closed-loop tune was saved to the wrong folder: {path_text}")
     if "closed_loop/auto_tune/active/ca_kf/" not in str(config.get("logical_output_group") or ""):
         raise AssertionError("active config did not preserve active logical output group")
+
+
+def test_closed_loop_validation_route_runner_uses_compact_route_artifact_folders(tmp_path: Path) -> None:
+    runner = RouteTestRunner.__new__(RouteTestRunner)
+    runner._run_folder = tmp_path / "run"
+    runner._config = SimpleNamespace(metadata={"compact_route_output": True})
+    route = SimpleNamespace(name="mahalle validation route")
+
+    route_folder = runner._route_output_folder(route, 0)
+    if route_folder != tmp_path / "run" / "routes" / "r001":
+        raise AssertionError(f"closed-loop validation route artifacts were not compacted: {route_folder}")
+
+    runner._config = SimpleNamespace(metadata={})
+    regular_folder = runner._route_output_folder(route, 0)
+    if regular_folder.name != "route_001_mahalle_validation_route":
+        raise AssertionError(f"regular benchmark route folder naming changed unexpectedly: {regular_folder}")
 
 
 def test_backend_created_configs_cannot_mix_contexts(tmp_path: Path) -> None:

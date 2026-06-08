@@ -670,9 +670,10 @@ class SimulationApp:
             sensor_noise_preset=str(request.sensor_noise_config.get("preset_name") or "Custom"),
             vehicle_behavior_preset=str(request.vehicle_behavior_config.get("preset_name") or "Custom"),
             output_root=str(request.output_folder),
-            run_id=f"validation_f{request.finalist.rank:03d}",
+            run_id="v",
             metadata={
                 "startup_mode": "closed_loop_auto_tune_validation",
+                "compact_route_output": True,
                 "finalist_rank": request.finalist.rank,
                 "offline_score": request.finalist.offline_score,
                 "offline_trial_index": request.finalist.trial_index,

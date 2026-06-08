@@ -407,7 +407,7 @@ class ClosedLoopBenchmarkAutoTuner:
                 sensor_noise_config=dict(request.sensor_noise_config),
                 vehicle_behavior_config=dict(request.vehicle_behavior_config),
                 actuator_realism_config=dict(request.actuator_realism_config),
-                output_folder=run_folder / "validations" / f"f{finalist.rank:03d}",
+                output_folder=run_folder / "v" / f"f{finalist.rank:03d}",
             )
             _emit(progress_callback, "finalist_validation_started", {"finalist_rank": finalist.rank})
             runner_result = self._run_validation(validation_request)

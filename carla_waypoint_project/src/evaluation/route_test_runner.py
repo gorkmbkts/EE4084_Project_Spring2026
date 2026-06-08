@@ -909,10 +909,19 @@ class RouteTestRunner:
             return None
         return self._routes[self._current_route_index]
 
+    def _compact_route_output_enabled(self) -> bool:
+        config = self._config
+        metadata = config.metadata if config is not None and isinstance(config.metadata, dict) else {}
+        return bool(metadata.get("compact_route_output"))
+
     def _route_output_folder(self, route: SavedTestRoute, route_index: int) -> Path:
+        if self._compact_route_output_enabled():
+            folder_name = f"r{route_index + 1:03d}"
+        else:
+            folder_name = f"route_{route_index + 1:03d}_{_slugify(route.name)}"
         if self._run_folder is None:
-            return _legacy_benchmark_root() / f"route_{route_index + 1:03d}_{_slugify(route.name)}"
-        return self._run_folder / "routes" / f"route_{route_index + 1:03d}_{_slugify(route.name)}"
+            return _legacy_benchmark_root() / folder_name
+        return self._run_folder / "routes" / folder_name
 
     def _next_attempt_number(self, route_index: int) -> int:
         return len(self._attempt_failures_by_route.get(route_index, [])) + 1
