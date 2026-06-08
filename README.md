@@ -4,7 +4,7 @@
 
 **A CARLA-based research framework for GNSS/IMU localization, Kalman-family filtering, offline replay, closed-loop autonomous evaluation, and filter auto-tuning.**
 
-![Python](https://img.shields.io/badge/Python-3.x-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.12.13-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![CARLA](https://img.shields.io/badge/CARLA-0.9.16-0B7285?style=for-the-badge)
 ![Pygame](https://img.shields.io/badge/Pygame-Dashboard-2E7D32?style=for-the-badge)
 ![Kalman Filters](https://img.shields.io/badge/Kalman-KF%20%7C%20EKF%20%7C%20UKF-6A1B9A?style=for-the-badge)
@@ -61,6 +61,7 @@ accuracy, consistency, robustness, and usefulness for autonomous driving.
 ## System Overview
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "Arial, sans-serif", "lineColor": "#64748b", "primaryTextColor": "#f8fafc"}}}%%
 flowchart LR
     CARLA["CARLA World<br/>vehicle, map, physics"] --> Sensors["Sensor Manager<br/>RGB, LiDAR, GNSS, IMU"]
     CARLA --> Truth["Ground Truth<br/>VehicleState"]
@@ -75,6 +76,20 @@ flowchart LR
     Eval --> Reports["benchmark_results/<br/>CSV, JSON, plots, tune configs"]
     Reports --> Replay["Offline Replay<br/>same logs, many filters"]
     Reports --> Tune["Auto-Tune<br/>offline + closed-loop search"]
+
+    classDef simulator fill:#0f766e,stroke:#5eead4,color:#ffffff,stroke-width:2px
+    classDef sensing fill:#1d4ed8,stroke:#93c5fd,color:#ffffff,stroke-width:2px
+    classDef estimation fill:#6d28d9,stroke:#c4b5fd,color:#ffffff,stroke-width:2px
+    classDef control fill:#c2410c,stroke:#fdba74,color:#ffffff,stroke-width:2px
+    classDef evaluation fill:#be123c,stroke:#fda4af,color:#ffffff,stroke-width:2px
+    classDef artifact fill:#334155,stroke:#cbd5e1,color:#ffffff,stroke-width:2px
+
+    class CARLA simulator
+    class Sensors,GNSS,Truth sensing
+    class FM,Est estimation
+    class Control control
+    class Eval evaluation
+    class Reports,Replay,Tune artifact
 ```
 
 ### Runtime Pipeline
@@ -307,7 +322,7 @@ autonomous route following, failure monitoring, and plot/report generation.
 | Requirement | Notes |
 | --- | --- |
 | CARLA | Project code is configured around `CARLA_0.9.16` |
-| Python | Use a Python environment compatible with your CARLA Python API package. **TODO:** document the exact tested Python version. |
+| Python | `3.12.13` (project development environment) |
 | OS | The launcher looks for `CarlaUE4.exe`, so the current setup is Windows-oriented. |
 
 ### Setup
