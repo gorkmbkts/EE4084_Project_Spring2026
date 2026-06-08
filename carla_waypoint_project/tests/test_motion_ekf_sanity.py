@@ -11,8 +11,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.KalmanLab.filters import ca_kf, ctra_ekf, ctrv_ekf
+from src.KalmanLab.filters import ca_kf, ctra_ekf, ctra_ukf, ctrv_ekf
 from src.KalmanLab.registry import discover_filters
+from src.evaluation.benchmark_config import SensorNoiseConfig
+from src.evaluation.filter_auto_tuner import AutoTuneRequest, FilterAutoTuner
+from src.evaluation.offline_replay_runner import OfflineReplayRequest, OfflineReplayRunner
+from src.evaluation.sensor_noise_tune_mapper import SensorNoiseTuneMapper
 from src.localization.gnss_projection import LocalGnssMeasurement
 
 
@@ -50,6 +54,41 @@ def test_ctra_zero_yaw_rate_positive_accel() -> None:
     assert_close(predicted[1], 0.0)
     assert_close(predicted[3], 5.0)
     assert_close(predicted[4], 1.5)
+
+
+def test_ctra_ukf_zero_yaw_rate_positive_accel() -> None:
+    state = [0.0, 0.0, 0.0, 2.0, 1.5, 0.0]
+    predicted = ctra_ukf.process_model(state, dt=2.0, turn_rate_epsilon_radps=1.0e-4)
+    assert_close(predicted[0], 2.0 * 2.0 + 0.5 * 1.5 * 4.0)
+    assert_close(predicted[1], 0.0)
+    assert_close(predicted[3], 5.0)
+    assert_close(predicted[4], 1.5)
+
+
+def test_ctra_ukf_core_predict_update_is_finite() -> None:
+    core = ctra_ukf._CtraUkfCore(dict(ctra_ukf.TUNE))
+    core.initialize((0.0, 0.0), 0.1, 4.0, 0.5, 0.05, 0.0)
+    core.predict(0.1, timestamp=0.1)
+    core.update_gnss_position((0.45, 0.05))
+    core.update_yaw_rate(0.06)
+    core.update_acceleration(0.4)
+    snapshot = core.snapshot()
+    if snapshot is None:
+        raise AssertionError("CTRA UKF snapshot missing after predict/update")
+    values = [
+        snapshot.px,
+        snapshot.py,
+        snapshot.yaw_rad,
+        snapshot.speed,
+        snapshot.acceleration_mps2,
+        snapshot.yaw_rate_radps,
+        *core.state_vector.reshape(-1),
+        *core.covariance.reshape(-1),
+    ]
+    if not all(math.isfinite(float(value)) for value in values):
+        raise AssertionError("CTRA UKF produced non-finite state or covariance")
+    if "gnss_position" not in core.nis_by_type:
+        raise AssertionError("CTRA UKF did not store GNSS NIS")
 
 
 def test_wrapped_yaw_update() -> None:
@@ -93,7 +132,7 @@ def test_filter_wrappers_initialize_from_gnss_and_imu() -> None:
         timestamp=0.0,
     )
     gnss = SimpleNamespace(x=5.0, y=2.0, frame=2, timestamp=0.01)
-    for module in (ctrv_ekf, ctra_ekf):
+    for module in (ctrv_ekf, ctra_ekf, ctra_ukf):
         filt = module.Filter(Projector())
         filt.process_imu(imu)
         state = filt.process_gnss(gnss)
@@ -103,8 +142,10 @@ def test_filter_wrappers_initialize_from_gnss_and_imu() -> None:
             raise AssertionError(f"{module.__name__} did not expose yaw-rate state")
         if state.curvature_1pm is not None and not math.isfinite(state.curvature_1pm):
             raise AssertionError(f"{module.__name__} exposed non-finite curvature")
-        if module is ctra_ekf and state.longitudinal_accel_mps2 is None:
-            raise AssertionError("CTRA did not expose longitudinal acceleration")
+        if module in (ctra_ekf, ctra_ukf) and state.longitudinal_accel_mps2 is None:
+            raise AssertionError(f"{module.__name__} did not expose longitudinal acceleration")
+        if module is ctra_ukf and state.source_filter_id != "ctra_ukf":
+            raise AssertionError("CTRA UKF state did not use the plugin filter id")
 
 
 def test_ca_kf_ignores_startup_imu_acceleration_spike() -> None:
@@ -145,7 +186,7 @@ def test_ca_kf_ignores_startup_imu_acceleration_spike() -> None:
 
 def test_registry_capabilities() -> None:
     records = {record.filter_id: record for record in discover_filters() if record.valid}
-    for filter_id in ("ctrv_ekf", "ctra_ekf"):
+    for filter_id in ("ctrv_ekf", "ctra_ekf", "ctra_ukf"):
         record = records.get(filter_id)
         if record is None:
             raise AssertionError(f"{filter_id} not discovered")
@@ -158,6 +199,115 @@ def test_registry_capabilities() -> None:
             raise AssertionError(f"{filter_id} does not advertise yaw-rate state")
         if record.filter_class is None or not hasattr(record.filter_class, "process_control"):
             raise AssertionError(f"{filter_id} has no process_control")
+    ctra_ukf_record = records["ctra_ukf"]
+    if not ctra_ukf_record.auto_tune_enabled or not ctra_ukf_record.auto_tune_profile:
+        raise AssertionError("CTRA UKF does not expose an auto-tune profile")
+    tunable_keys = {str(getattr(spec, "key", "")) for spec in ctra_ukf_record.tune_specs}
+    for key in ("process_position_stddev_m", "process_accel_stddev_mps2", "process_yaw_accel_stddev_radps2", "gnss_position_stddev_m"):
+        if key not in tunable_keys:
+            raise AssertionError(f"CTRA UKF missing tunable parameter: {key}")
+
+
+def test_ctra_ukf_autotune_candidate_generation() -> None:
+    records = {record.filter_id: record for record in discover_filters() if record.valid}
+    record = records["ctra_ukf"]
+    locked = SensorNoiseTuneMapper.locked_values(
+        "ctra_ukf",
+        dict(record.tune),
+        SensorNoiseConfig().to_dict(),
+        tuple(record.tune_specs),
+    )
+    if "gnss_position_stddev_m" not in locked.values:
+        raise AssertionError("CTRA UKF measurement noise is not lockable from sensor-noise config")
+    request = AutoTuneRequest(
+        filter_id="ctra_ukf",
+        sensor_log_paths=(Path("synthetic_sensor_log.csv"),),
+        base_tune=dict(record.tune),
+        auto_tune_profile=dict(record.auto_tune_profile or {}),
+        max_trials=2,
+        metadata={"random_seed": 4084},
+    )
+    candidates = FilterAutoTuner()._generated_candidates(request, max_trials=2, strategy="random_plus_coordinate_refinement")
+    if not candidates:
+        raise AssertionError("CTRA UKF auto-tuner did not generate candidates")
+    if not any(candidate.tune != record.tune for candidate in candidates):
+        raise AssertionError("CTRA UKF auto-tuner candidates did not change tune values")
+
+
+def test_ctra_ukf_short_offline_replay_smoke(tmp_path: Path) -> None:
+    log_path = tmp_path / "sensor_log.csv"
+    headers = [
+        "timestamp",
+        "frame",
+        "valid_for_metrics",
+        "gnss_local_x",
+        "gnss_local_y",
+        "gnss_local_z",
+        "gnss_timestamp",
+        "gnss_frame",
+        "imu_accel_x",
+        "imu_accel_y",
+        "imu_accel_z",
+        "imu_gyro_x",
+        "imu_gyro_y",
+        "imu_gyro_z",
+        "imu_compass",
+        "imu_timestamp",
+        "imu_frame",
+        "ground_truth_x",
+        "ground_truth_y",
+        "ground_truth_z",
+        "ground_truth_yaw",
+        "ground_truth_speed",
+        "ground_truth_vx_mps",
+        "ground_truth_vy_mps",
+    ]
+    lines = [",".join(headers)]
+    for index in range(8):
+        timestamp = index * 0.1
+        x = 2.0 * timestamp
+        row = {
+            "timestamp": timestamp,
+            "frame": index,
+            "valid_for_metrics": "true",
+            "gnss_local_x": x,
+            "gnss_local_y": 0.0,
+            "gnss_local_z": 0.0,
+            "gnss_timestamp": timestamp,
+            "gnss_frame": index,
+            "imu_accel_x": 0.0,
+            "imu_accel_y": 0.0,
+            "imu_accel_z": 0.0,
+            "imu_gyro_x": 0.0,
+            "imu_gyro_y": 0.0,
+            "imu_gyro_z": 0.0,
+            "imu_compass": math.pi / 2.0,
+            "imu_timestamp": timestamp,
+            "imu_frame": index,
+            "ground_truth_x": x,
+            "ground_truth_y": 0.0,
+            "ground_truth_z": 0.0,
+            "ground_truth_yaw": 0.0,
+            "ground_truth_speed": 2.0,
+            "ground_truth_vx_mps": 2.0,
+            "ground_truth_vy_mps": 0.0,
+        }
+        lines.append(",".join(str(row[key]) for key in headers))
+    log_path.write_text("\n".join(lines), encoding="utf-8")
+
+    result = OfflineReplayRunner().run(
+        OfflineReplayRequest(
+            sensor_log_paths=(log_path,),
+            selected_filter_ids=("ctra_ukf",),
+            output_root=str(tmp_path / "out"),
+            include_raw_gnss_baseline=True,
+            generate_plots=False,
+        )
+    )
+    if result.failures:
+        raise AssertionError(f"CTRA UKF offline replay failed: {result.failures}")
+    if result.best_filter_id != "ctra_ukf":
+        raise AssertionError(f"CTRA UKF missing from offline replay result: {result.best_filter_id}")
 
 
 def test_startup_setup_does_not_hide_experimental_filters() -> None:
@@ -193,11 +343,14 @@ def run_all() -> None:
     test_ctrv_straight_motion()
     test_ctrv_turning_prediction()
     test_ctra_zero_yaw_rate_positive_accel()
+    test_ctra_ukf_zero_yaw_rate_positive_accel()
+    test_ctra_ukf_core_predict_update_is_finite()
     test_wrapped_yaw_update()
     test_gyro_yaw_rate_update()
     test_filter_wrappers_initialize_from_gnss_and_imu()
     test_ca_kf_ignores_startup_imu_acceleration_spike()
     test_registry_capabilities()
+    test_ctra_ukf_autotune_candidate_generation()
     test_startup_setup_does_not_hide_experimental_filters()
     test_state_uses_plugin_model_type()
     test_filter_control_input_avoids_ground_truth_speed_yaw()
