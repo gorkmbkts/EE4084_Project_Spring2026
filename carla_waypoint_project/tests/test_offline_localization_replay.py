@@ -368,6 +368,43 @@ def test_startup_gui_uses_mode_based_tabs() -> None:
             raise AssertionError(f"startup setup still exposes removed label {removed}")
 
 
+def test_closed_loop_tracking_buttons_visible_with_long_filter_info() -> None:
+    pygame.init()
+    selector = StartupMapSelector.__new__(StartupMapSelector)
+    selector._surface = pygame.Surface((760, 420))
+    selector._init_fonts()
+    selector._tracking_mode = TRACKING_MODE_PASSIVE
+    selector._tracking_button_rects = {}
+    selector._setup_filter_buttons = {}
+    long_info = {
+        "model_type": "CTRA",
+        "type": "Unscented Kalman Filter",
+        "state_vector": "[px, py, yaw, speed, acceleration, yaw_rate]^T",
+        "process_model": "Constant Turn Rate and Acceleration with a deliberately long explanation",
+        "measurement_model": "GNSS position x/y plus IMU yaw and yaw-rate with a deliberately long explanation",
+        "autonomous_control_note": "Long note that previously pushed the tracking controls below the visible panel.",
+    }
+    record = SimpleNamespace(
+        filter_id="ctra_ukf",
+        display_name="CTRA UKF",
+        filter_info=long_info,
+        safe_for_autonomous_control=True,
+        active_tracking_supported=True,
+        benchmark_selectable=True,
+        experimental=True,
+    )
+    selector._setup_filter_records = [record]
+    selector._selected_filter_id = "ctra_ukf"
+
+    selector._draw_closed_loop_filter_selection(pygame.Rect(0, 0, 760, 220))
+
+    if TRACKING_MODE_PASSIVE not in selector._tracking_button_rects or TRACKING_MODE_ACTIVE not in selector._tracking_button_rects:
+        raise AssertionError(f"tracking buttons were not drawn: {selector._tracking_button_rects}")
+    for mode, rect in selector._tracking_button_rects.items():
+        if rect.top < 0 or rect.bottom > 220:
+            raise AssertionError(f"{mode} tracking button is outside the panel: {rect}")
+
+
 def test_startup_tune_storage_feeds_closed_loop_and_offline_requests() -> None:
     selector = StartupMapSelector.__new__(StartupMapSelector)
     selector._setup_filter_records = [record for record in discover_filters() if record.valid]

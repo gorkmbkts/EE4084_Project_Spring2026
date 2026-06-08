@@ -1353,6 +1353,10 @@ class StartupMapSelector:
         self._tracking_button_rects.clear()
         self._draw_text("Filter Selection", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
         y = content.top + 34
+        self._draw_text("Tracking Mode", (content.left, y), self._small_font, DASHBOARD.muted_text_color, content.width)
+        y += 20
+        self._draw_tracking_mode_buttons(pygame.Rect(content.left, y, content.width, 28))
+        y += 42
         self._setup_filter_buttons.clear()
         if not self._setup_filter_records:
             self._draw_text("No valid filters found.", (content.left, y), self._font, DASHBOARD.warning_color, content.width)
@@ -1383,11 +1387,6 @@ class StartupMapSelector:
                 color = DASHBOARD.warning_color if "NO" in line or "Experimental: YES" in line else DASHBOARD.text_color
                 self._draw_text(line, (content.left, y), self._small_font, color, content.width)
                 y += 18
-        if y + 58 <= content.bottom:
-            y += 8
-            self._draw_text("Tracking Mode", (content.left, y), self._small_font, DASHBOARD.muted_text_color, content.width)
-            y += 20
-            self._draw_tracking_mode_buttons(pygame.Rect(content.left, y, content.width, 28))
 
     def _draw_offline_filter_setup(self, rect: pygame.Rect) -> None:
         gap = 12
