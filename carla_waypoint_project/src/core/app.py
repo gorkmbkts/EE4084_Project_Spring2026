@@ -48,6 +48,7 @@ from src.evaluation.closed_loop_auto_tune import (
     ClosedLoopAutoTuneRequest,
     ClosedLoopBenchmarkAutoTuner,
     ClosedLoopValidationRequest,
+    closed_loop_stage_budgets,
 )
 from src.evaluation.filter_performance import FilterPerformanceLogger
 from src.evaluation.plot_job_worker import BenchmarkPlotJobWorker
@@ -235,6 +236,7 @@ class SimulationApp:
         self._closed_loop_auto_tune_trial_rows: list[dict[str, object]] = []
         self._closed_loop_auto_tune_current_trial = 0
         self._closed_loop_auto_tune_total_trials = 0
+        self._closed_loop_auto_tune_current_stage = ""
         self._closed_loop_auto_tune_current_status = "idle"
         self._closed_loop_auto_tune_background_surface: Optional[pygame.Surface] = (
             existing_display_surface.copy()
@@ -609,8 +611,10 @@ class SimulationApp:
         self._closed_loop_auto_tune_best_score = None
         self._closed_loop_auto_tune_live_line = ""
         self._closed_loop_auto_tune_current_trial = 0
-        self._closed_loop_auto_tune_total_trials = max(1, int(request.trial_count or 1))
-        self._closed_loop_auto_tune_current_status = "Starting direct CARLA route trials"
+        stage_budgets = closed_loop_stage_budgets(request)
+        self._closed_loop_auto_tune_total_trials = stage_budgets.total_trials
+        self._closed_loop_auto_tune_current_stage = "Context baseline"
+        self._closed_loop_auto_tune_current_status = "Starting staged CARLA route trials"
         self._closed_loop_auto_tune_live_metrics = {}
         self._closed_loop_auto_tune_trial_rows = []
         self._closed_loop_auto_tune_trial_start_debug = {}
@@ -623,6 +627,7 @@ class SimulationApp:
             "behavior": request.vehicle_behavior_profile or request.vehicle_behavior_config.get("preset_name") or "Custom",
             "actuator": request.actuator_realism_profile or request.actuator_realism_config.get("preset_name") or "Custom",
             "trial_count": self._closed_loop_auto_tune_total_trials,
+            "stage_budgets": stage_budgets.to_dict(),
             "active_control_policy": (
                 "active-control params may be tuned"
                 if request.tracking_mode == TRACKING_MODE_ACTIVE
@@ -630,14 +635,13 @@ class SimulationApp:
             ),
         }
         self._closed_loop_auto_tune_status_lines = [
-            "Direct mode: every search trial is a no-render CARLA route trial.",
-            "Each trial uses the current selected sensor-noise profile.",
+            "Staged mode: context baseline, passive Q/model, active-control when selected, then local fine-tune.",
             "Each candidate gets one route attempt; a route failure ends that trial.",
             "CARLA no-rendering mode enabled; fixed_delta_seconds is unchanged.",
         ]
         self._closed_loop_auto_tune_previous_no_rendering = self._client_manager.no_rendering_mode
         self._client_manager.set_no_rendering_mode(True)
-        self._planner_status = "Closed-loop auto tune: direct trial search starting"
+        self._planner_status = "Closed-loop auto tune: staged trial search starting"
         self._control_status_text = self._planner_status
         self._capture_closed_loop_auto_tune_background()
         self._mark_closed_loop_auto_tune_progress_dirty()
@@ -686,23 +690,33 @@ class SimulationApp:
                     "strategy": payload.get("strategy") or "direct",
                     "search_param_count": payload.get("search_param_count"),
                     "actuator_search_policy": payload.get("actuator_search_policy"),
+                    "stage_budgets": payload.get("stage_budgets"),
                 }
             )
-            self._closed_loop_auto_tune_current_status = "Search started"
+            self._closed_loop_auto_tune_current_status = "Staged search started"
             text = (
-                f"Direct search started | trials {payload.get('trial_count')} | {payload.get('strategy')} | "
+                f"Staged search started | trials {payload.get('trial_count')} | {payload.get('strategy')} | "
                 f"params {payload.get('search_param_count')} | actuator {payload.get('actuator_realism_profile')}"
+            )
+        elif event_name == "stage_started":
+            self._closed_loop_auto_tune_current_stage = str(payload.get("stage_label") or payload.get("stage") or "")
+            self._closed_loop_auto_tune_current_status = f"Running {self._closed_loop_auto_tune_current_stage}"
+            text = (
+                f"Stage started | {self._closed_loop_auto_tune_current_stage} | "
+                f"{payload.get('stage_trial_count')} trials | tracking {payload.get('tracking_mode')}"
             )
         elif event_name == "trial_started":
             self._closed_loop_auto_tune_current_trial = int(payload.get("trial_index") or 0)
+            self._closed_loop_auto_tune_current_stage = str(payload.get("stage_label") or payload.get("stage") or "")
             self._closed_loop_auto_tune_total_trials = max(
                 self._closed_loop_auto_tune_total_trials,
                 int(payload.get("trial_total") or self._closed_loop_auto_tune_total_trials or 1),
             )
-            self._closed_loop_auto_tune_current_status = "Trial running"
+            self._closed_loop_auto_tune_current_status = f"{self._closed_loop_auto_tune_current_stage}: trial running"
             self._upsert_closed_loop_auto_tune_trial_row(
                 {
                     "trial": self._closed_loop_auto_tune_current_trial,
+                    "stage": self._closed_loop_auto_tune_current_stage,
                     "status": "running",
                     "score": None,
                     "rmse": None,
@@ -711,10 +725,13 @@ class SimulationApp:
                     "nis": None,
                     "nees": None,
                     "reason": "",
+                    "changes": payload.get("changed_parameters_summary") or "",
                 }
             )
             text = (
-                f"Trial {payload.get('trial_index')}/{payload.get('trial_total')} started | "
+                f"{self._closed_loop_auto_tune_current_stage} | trial "
+                f"{payload.get('stage_trial_index')}/{payload.get('stage_trial_total')} "
+                f"(overall {payload.get('trial_index')}/{payload.get('trial_total')}) | "
                 f"route {payload.get('route_name')} | best {number_text(payload.get('best_score'))}"
             )
         elif event_name == "trial_finished":
@@ -745,11 +762,14 @@ class SimulationApp:
                 "eval_mean_nees",
                 "mean_nees",
             )
-            reason = str(payload.get("failure_reason") or "")
+            failure_class = str(payload.get("failure_class") or "")
+            reason = failure_class or str(payload.get("failure_reason") or "")
+            self._closed_loop_auto_tune_current_stage = str(payload.get("stage_label") or payload.get("stage") or "")
             self._closed_loop_auto_tune_current_status = "Trial failed" if payload.get("failed") else "Trial finished"
             self._upsert_closed_loop_auto_tune_trial_row(
                 {
                     "trial": int(payload.get("trial_index") or 0),
+                    "stage": self._closed_loop_auto_tune_current_stage,
                     "status": "failed" if payload.get("failed") else "ok",
                     "score": payload.get("score"),
                     "rmse": rmse,
@@ -758,10 +778,12 @@ class SimulationApp:
                     "nis": nis,
                     "nees": nees,
                     "reason": reason,
+                    "changes": payload.get("changed_parameters_summary") or "",
                 }
             )
             text = (
-                f"Trial {payload.get('trial_index')}/{payload.get('trial_total')} finished | "
+                f"{self._closed_loop_auto_tune_current_stage} | trial "
+                f"{payload.get('stage_trial_index')}/{payload.get('stage_trial_total')} finished | "
                 f"score {number_text(payload.get('score'))} | best {number_text(self._closed_loop_auto_tune_best_score)} | "
                 f"RMSE {number_text(rmse)} m | "
                 f"CTE {number_text(mean_cte)} m | "
@@ -776,7 +798,7 @@ class SimulationApp:
                 else self._closed_loop_auto_tune_best_score
             )
             text = (
-                f"New best | trial {payload.get('trial_index')} | "
+                f"New best | {payload.get('stage_label') or payload.get('stage')} | trial {payload.get('trial_index')} | "
                 f"score {number_text(self._closed_loop_auto_tune_best_score)}"
             )
         elif event_name == "completed":
@@ -888,8 +910,8 @@ class SimulationApp:
         dim.fill((0, 0, 0, 165))
         surface.blit(dim, (0, 0))
 
-        modal_w = min(width - 70, 1160)
-        modal_h = min(height - 70, 610)
+        modal_w = min(width - 50, 1280)
+        modal_h = min(height - 50, 650)
         modal = pygame.Rect(0, 0, modal_w, modal_h)
         modal.center = (width // 2, height // 2)
         pygame.draw.rect(surface, DASHBOARD.panel_background_color, modal, border_radius=8)
@@ -907,11 +929,17 @@ class SimulationApp:
 
         context = self._closed_loop_auto_tune_context
         trial_text = f"{self._closed_loop_auto_tune_current_trial}/{self._closed_loop_auto_tune_total_trials or '?'}"
+        stage_budgets = context.get("stage_budgets") if isinstance(context.get("stage_budgets"), dict) else {}
+        budget_text = (
+            f"P {stage_budgets.get('baseline_passive_q_model_trials', '?')} | "
+            f"A {stage_budgets.get('active_control_trials', '?')} | "
+            f"J {stage_budgets.get('joint_local_fine_tune_trials', '?')}"
+        )
         left_x = content.left
         right_x = content.left + content.width // 2 + 14
         y = content.top + 58
         context_lines = [
-            f"Trial: {trial_text} | Planned trials: {context.get('trial_count', self._closed_loop_auto_tune_total_trials)}",
+            f"Trial: {trial_text} | Stage budgets: {budget_text}",
             f"Filter: {context.get('filter', 'n/a')}",
             f"Tracking: {context.get('tracking_mode', 'n/a')} ({context.get('active_control_policy', 'n/a')})",
             f"Route: {context.get('route', 'n/a')} | Map: {context.get('map', 'n/a')}",
@@ -920,7 +948,7 @@ class SimulationApp:
             f"Sensor noise: {context.get('sensor_noise', 'n/a')}",
             f"Behavior: {context.get('behavior', 'n/a')}",
             f"Actuator: {context.get('actuator', 'n/a')}",
-            f"Status: {self._closed_loop_auto_tune_current_status}",
+            f"Stage: {self._closed_loop_auto_tune_current_stage} | Status: {self._closed_loop_auto_tune_current_status}",
         ]
         for offset, line in enumerate(context_lines):
             self._draw_overlay_text(surface, line, (left_x, y + offset * 18), self._filter_overlay_small_font, DASHBOARD.text_color, content.width // 2 - 22)
@@ -951,8 +979,9 @@ class SimulationApp:
         table_top = metrics_rect.bottom + 16
         self._draw_overlay_text(surface, "Trial Results", (content.left, table_top), self._filter_overlay_bold_font, DASHBOARD.title_color, content.width)
         header_y = table_top + 27
-        headers = ("Trial", "Status", "Score", "RMSE", "Mean CTE", "Max CTE", "NIS", "NEES", "Reason")
-        col_widths = (50, 74, 88, 76, 82, 76, 64, 64, content.width - 574)
+        headers = ("Stage", "Trial", "Status", "Score", "RMSE", "Mean CTE", "Max CTE", "NIS", "NEES", "Failure", "Changed parameters")
+        fixed_widths = (126, 44, 62, 76, 66, 72, 68, 58, 58, 144)
+        col_widths = fixed_widths + (max(110, content.width - sum(fixed_widths)),)
         x = content.left
         for header, col_width in zip(headers, col_widths):
             self._draw_overlay_text(surface, header, (x, header_y), self._filter_overlay_small_font, DASHBOARD.muted_text_color, col_width - 6)
@@ -965,6 +994,7 @@ class SimulationApp:
             status = str(row.get("status") or "")
             color = DASHBOARD.warning_color if status == "failed" else DASHBOARD.text_color
             values = (
+                str(row.get("stage") or ""),
                 str(row.get("trial") or ""),
                 status,
                 self._format_metric_number(row.get("score"), 3),
@@ -974,6 +1004,7 @@ class SimulationApp:
                 self._format_metric_number(row.get("nis"), 3),
                 self._format_metric_number(row.get("nees"), 3),
                 str(row.get("reason") or ""),
+                str(row.get("changes") or ""),
             )
             x = content.left
             for value, col_width in zip(values, col_widths):
@@ -1266,6 +1297,11 @@ class SimulationApp:
                 "offline_score": request.finalist.offline_score,
                 "offline_trial_index": request.finalist.trial_index,
                 "candidate_tune": dict(request.finalist.candidate_tune),
+                "tuning_stage": request.stage,
+                "stage_trial_index": request.stage_trial_index,
+                "stage_trial_total": request.stage_trial_total,
+                "changed_parameters": dict(request.changed_parameters),
+                "changed_parameters_summary": request.changed_parameters_summary,
             },
         )
         self._test_route_authoring_active = False
@@ -1383,7 +1419,8 @@ class SimulationApp:
             )
             if self._apply_vehicle_control_safely(control):
                 self._set_latest_control(control, control)
-                self._feed_filter_control_input(control, source="route_initialization_brake")
+                # Closed-loop tuning keeps active prediction dormant until route
+                # activation so startup brake commands cannot bias initialization.
                 self.actuator_realism.reset(control)
             return
         control_state = self._state_for_tracking_and_control()

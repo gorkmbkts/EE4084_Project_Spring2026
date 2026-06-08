@@ -47,8 +47,10 @@ from src.evaluation.filter_auto_tuner import (
 )
 from src.evaluation.closed_loop_auto_tune import (
     ClosedLoopAutoTuneRequest,
+    ClosedLoopStageBudgets,
     ClosedLoopValidationRoute,
     PendingClosedLoopAutoTuneSession,
+    closed_loop_default_stage_budgets,
 )
 from src.evaluation.offline_replay_runner import OfflineReplayRequest, OfflineReplayRunner
 from src.evaluation.sensor_noise_tune_mapper import noise_signature
@@ -250,6 +252,9 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_log_rects: dict[int, pygame.Rect] = {}
         self._closed_loop_auto_tune_route_rects: dict[int, pygame.Rect] = {}
         self._closed_loop_auto_tune_trials = 30
+        self._closed_loop_auto_tune_passive_trials = 15
+        self._closed_loop_auto_tune_active_trials = 9
+        self._closed_loop_auto_tune_joint_trials = 6
         self._closed_loop_auto_tune_finalists = 1
         self._closed_loop_auto_tune_status_lines: list[str] = []
         self._closed_loop_auto_tune_start_rect = pygame.Rect(0, 0, 1, 1)
@@ -260,6 +265,12 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_clear_logs_rect = pygame.Rect(0, 0, 1, 1)
         self._closed_loop_auto_tune_trials_minus_rect = pygame.Rect(0, 0, 1, 1)
         self._closed_loop_auto_tune_trials_plus_rect = pygame.Rect(0, 0, 1, 1)
+        self._closed_loop_auto_tune_passive_minus_rect = pygame.Rect(0, 0, 1, 1)
+        self._closed_loop_auto_tune_passive_plus_rect = pygame.Rect(0, 0, 1, 1)
+        self._closed_loop_auto_tune_active_minus_rect = pygame.Rect(0, 0, 1, 1)
+        self._closed_loop_auto_tune_active_plus_rect = pygame.Rect(0, 0, 1, 1)
+        self._closed_loop_auto_tune_joint_minus_rect = pygame.Rect(0, 0, 1, 1)
+        self._closed_loop_auto_tune_joint_plus_rect = pygame.Rect(0, 0, 1, 1)
         self._closed_loop_auto_tune_finalists_minus_rect = pygame.Rect(0, 0, 1, 1)
         self._closed_loop_auto_tune_finalists_plus_rect = pygame.Rect(0, 0, 1, 1)
         self._closed_loop_auto_tune_log_list_rect = pygame.Rect(0, 0, 1, 1)
@@ -1859,6 +1870,10 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_filter_id = filter_id
         search = record.auto_tune_profile.get("search") if isinstance(record.auto_tune_profile.get("search"), dict) else {}
         self._closed_loop_auto_tune_trials = int(search.get("default_trials") or 30)
+        budgets = closed_loop_default_stage_budgets(self._closed_loop_auto_tune_trials, self._tracking_mode)
+        self._closed_loop_auto_tune_passive_trials = budgets.passive_model_trials
+        self._closed_loop_auto_tune_active_trials = budgets.active_control_trials
+        self._closed_loop_auto_tune_joint_trials = budgets.joint_fine_tune_trials
         self._closed_loop_auto_tune_finalists = 1
         self._closed_loop_auto_tune_selected_log_indices = set()
         self._closed_loop_auto_tune_validation_route_index = (
@@ -1867,9 +1882,8 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_log_scroll = 0
         self._closed_loop_auto_tune_route_scroll = 0
         self._closed_loop_auto_tune_status_lines = [
-            "Direct mode runs every search trial as a real CARLA route trial with no rendering.",
-            "Each trial uses the current selected sensor-noise profile.",
-            "There is no offline finalist stage in this mode.",
+            "Each stage runs one-attempt CARLA route trials in no-render mode.",
+            "Trial 1 evaluates the context-aware sensor/model baseline.",
         ]
 
     def _handle_closed_loop_auto_tune_modal_event(self, event: pygame.event.Event, client: object) -> object:
@@ -1886,11 +1900,29 @@ class StartupMapSelector:
         if self._closed_loop_auto_tune_close_rect.collidepoint(position) or self._closed_loop_auto_tune_cancel_rect.collidepoint(position):
             self._closed_loop_auto_tune_modal_open = False
             return _NoSelection
-        if self._closed_loop_auto_tune_trials_minus_rect.collidepoint(position):
-            self._closed_loop_auto_tune_trials = max(1, self._closed_loop_auto_tune_trials - 5)
+        if self._closed_loop_auto_tune_passive_minus_rect.collidepoint(position):
+            self._closed_loop_auto_tune_passive_trials = max(1, int(self._closed_loop_auto_tune_passive_trials) - 1)
+            self._sync_closed_loop_auto_tune_trial_total()
             return _NoSelection
-        if self._closed_loop_auto_tune_trials_plus_rect.collidepoint(position):
-            self._closed_loop_auto_tune_trials = min(500, self._closed_loop_auto_tune_trials + 5)
+        if self._closed_loop_auto_tune_passive_plus_rect.collidepoint(position):
+            self._closed_loop_auto_tune_passive_trials = min(500, int(self._closed_loop_auto_tune_passive_trials) + 1)
+            self._sync_closed_loop_auto_tune_trial_total()
+            return _NoSelection
+        if self._tracking_mode == TRACKING_MODE_ACTIVE and self._closed_loop_auto_tune_active_minus_rect.collidepoint(position):
+            self._closed_loop_auto_tune_active_trials = max(1, int(self._closed_loop_auto_tune_active_trials) - 1)
+            self._sync_closed_loop_auto_tune_trial_total()
+            return _NoSelection
+        if self._tracking_mode == TRACKING_MODE_ACTIVE and self._closed_loop_auto_tune_active_plus_rect.collidepoint(position):
+            self._closed_loop_auto_tune_active_trials = min(500, int(self._closed_loop_auto_tune_active_trials) + 1)
+            self._sync_closed_loop_auto_tune_trial_total()
+            return _NoSelection
+        if self._closed_loop_auto_tune_joint_minus_rect.collidepoint(position):
+            self._closed_loop_auto_tune_joint_trials = max(0, int(self._closed_loop_auto_tune_joint_trials) - 1)
+            self._sync_closed_loop_auto_tune_trial_total()
+            return _NoSelection
+        if self._closed_loop_auto_tune_joint_plus_rect.collidepoint(position):
+            self._closed_loop_auto_tune_joint_trials = min(500, int(self._closed_loop_auto_tune_joint_trials) + 1)
+            self._sync_closed_loop_auto_tune_trial_total()
             return _NoSelection
         for index, rect in self._closed_loop_auto_tune_route_rects.items():
             if rect.collidepoint(position):
@@ -1915,6 +1947,35 @@ class StartupMapSelector:
             return _NoSelection
         self._append_closed_loop_auto_tune_status("Request accepted. Loading validation route map if needed.")
         return self._load_map_for_closed_loop_auto_tune(client, saved_route, request)
+
+    def _closed_loop_auto_tune_modal_budgets(self) -> ClosedLoopStageBudgets:
+        has_stage_values = all(
+            hasattr(self, name)
+            for name in (
+                "_closed_loop_auto_tune_passive_trials",
+                "_closed_loop_auto_tune_active_trials",
+                "_closed_loop_auto_tune_joint_trials",
+            )
+        )
+        if not has_stage_values:
+            return closed_loop_default_stage_budgets(
+                max(1, int(getattr(self, "_closed_loop_auto_tune_trials", 30) or 30)),
+                self._tracking_mode,
+            )
+        passive = max(1, int(self._closed_loop_auto_tune_passive_trials))
+        active = max(0, int(self._closed_loop_auto_tune_active_trials))
+        joint = max(0, int(self._closed_loop_auto_tune_joint_trials))
+        if self._tracking_mode != TRACKING_MODE_ACTIVE:
+            active = 0
+        return ClosedLoopStageBudgets(
+            passive_model_trials=passive,
+            active_control_trials=active,
+            joint_fine_tune_trials=joint,
+        )
+
+    def _sync_closed_loop_auto_tune_trial_total(self) -> None:
+        budgets = self._closed_loop_auto_tune_modal_budgets()
+        self._closed_loop_auto_tune_trials = budgets.total_trials
 
     def _build_closed_loop_auto_tune_request_from_modal(self) -> ClosedLoopAutoTuneRequest:
         record = self._filter_record(self._closed_loop_auto_tune_filter_id or self._selected_filter_id)
@@ -1943,6 +2004,8 @@ class StartupMapSelector:
         behavior_config = self._current_vehicle_behavior_config()
         actuator_config = self._current_actuator_realism_config()
         route_identity = self._closed_loop_validation_route_identity(route)
+        stage_budgets = self._closed_loop_auto_tune_modal_budgets()
+        self._closed_loop_auto_tune_trials = stage_budgets.total_trials
         pending = PendingClosedLoopAutoTuneSession(
             selected_filter=record.filter_id,
             tracking_mode=self._tracking_mode,
@@ -1954,7 +2017,10 @@ class StartupMapSelector:
             sensor_config=dict(sensor_config),
             vehicle_behavior_config=dict(behavior_config),
             actuator_realism_config=dict(actuator_config),
-            trial_count=max(1, int(self._closed_loop_auto_tune_trials or 30)),
+            trial_count=stage_budgets.total_trials,
+            passive_model_trials=stage_budgets.passive_model_trials,
+            active_control_trials=stage_budgets.active_control_trials,
+            joint_fine_tune_trials=stage_budgets.joint_fine_tune_trials,
             finalist_count=1,
             strategy="optuna_tpe",
             output_root="benchmark_results",
@@ -1984,7 +2050,10 @@ class StartupMapSelector:
             vehicle_behavior_profile=self._behavior_preset,
             actuator_realism_enabled=True,
             actuator_realism_profile=str(actuator_config.get("preset_name") or self._actuator_preset),
-            trial_count=max(1, int(self._closed_loop_auto_tune_trials or 30)),
+            trial_count=stage_budgets.total_trials,
+            passive_model_trials=stage_budgets.passive_model_trials,
+            active_control_trials=stage_budgets.active_control_trials,
+            joint_fine_tune_trials=stage_budgets.joint_fine_tune_trials,
             finalist_count=1,
             strategy="optuna_tpe",
             output_root="benchmark_results",
@@ -1997,6 +2066,7 @@ class StartupMapSelector:
                 "direct_closed_loop_mode": True,
                 "no_rendering_mode": True,
                 "route_attempt_policy": "one_attempt_per_candidate_trial",
+                "stage_budgets": stage_budgets.to_dict(),
             },
         )
 
@@ -2040,8 +2110,8 @@ class StartupMapSelector:
         dim = pygame.Surface((width, height), pygame.SRCALPHA)
         dim.fill((0, 0, 0, 150))
         self._surface.blit(dim, (0, 0))
-        modal_w = min(width - 70, 1160)
-        modal_h = min(height - 70, 730)
+        modal_w = min(width - 40, 1320)
+        modal_h = min(height - 40, 760)
         modal = pygame.Rect(0, 0, modal_w, modal_h)
         modal.center = (width // 2, height // 2)
         pygame.draw.rect(self._surface, DASHBOARD.panel_background_color, modal, border_radius=8)
@@ -2061,7 +2131,7 @@ class StartupMapSelector:
             content.width,
         )
         self._draw_text(
-            "Each trial is driven in CARLA no-render mode using the current selected sensor-noise profile.",
+            "Staged one-attempt CARLA trials. Trial 1 is the context-aware baseline.",
             (content.left, content.top + 49),
             self._small_font,
             DASHBOARD.warning_color,
@@ -2070,7 +2140,7 @@ class StartupMapSelector:
 
         footer_h = 44
         body = pygame.Rect(content.left, content.top + 76, content.width, content.height - 76 - footer_h - 10)
-        left = pygame.Rect(body.left, body.top, int(body.width * 0.54), body.height)
+        left = pygame.Rect(body.left, body.top, int(body.width * 0.40), body.height)
         right = pygame.Rect(left.right + 10, body.top, body.right - left.right - 10, body.height)
         self._draw_closed_loop_auto_tune_route_selection(left)
         self._draw_closed_loop_auto_tune_settings_and_console(right)
@@ -2104,36 +2174,79 @@ class StartupMapSelector:
             self._draw_text(f"{display_map_name(item.route.map_name)} | {length}", (row.left + 8, row.top + 29), self._small_font, DASHBOARD.muted_text_color, row.width - 16)
 
     def _draw_closed_loop_auto_tune_settings_and_console(self, rect: pygame.Rect) -> None:
-        settings_h = 210
+        settings_h = min(330, max(286, rect.height - 118))
         settings = pygame.Rect(rect.left, rect.top, rect.width, settings_h)
         console = pygame.Rect(rect.left, settings.bottom + 10, rect.width, rect.bottom - settings.bottom - 10)
         pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, settings, border_radius=6)
         pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, settings, width=1, border_radius=6)
         content = settings.inflate(-2 * DASHBOARD.panel_padding_px, -2 * DASHBOARD.panel_padding_px)
         self._draw_text("Direct Trial Settings", content.topleft, self._subtitle_font, DASHBOARD.title_color, content.width)
-        y = content.top + 30
-        self._closed_loop_auto_tune_trials_minus_rect = pygame.Rect(content.left + 82, y - 3, 24, 22)
-        self._closed_loop_auto_tune_trials_plus_rect = pygame.Rect(self._closed_loop_auto_tune_trials_minus_rect.right + 42, y - 3, 24, 22)
-        self._draw_text(f"CARLA trials: {self._closed_loop_auto_tune_trials}", (content.left, y), self._small_font, DASHBOARD.text_color, 82)
-        self._draw_button(self._closed_loop_auto_tune_trials_minus_rect, "-")
-        self._draw_button(self._closed_loop_auto_tune_trials_plus_rect, "+")
-        y += 29
-        active_policy = (
-            "Active-control params may be tuned."
-            if self._tracking_mode == TRACKING_MODE_ACTIVE
-            else "Passive tracking: active-control params are not tuned."
+        budgets = self._closed_loop_auto_tune_modal_budgets()
+        self._closed_loop_auto_tune_trials = budgets.total_trials
+        y = content.top + 34
+        label_w = max(260, content.width - 150)
+        button_x = content.right - 70
+
+        def draw_stage_row(
+            label: str,
+            value: object,
+            row_y: int,
+            minus_rect_name: str,
+            plus_rect_name: str,
+            *,
+            muted: bool = False,
+        ) -> None:
+            minus_rect = pygame.Rect(button_x, row_y - 3, 28, 24)
+            plus_rect = pygame.Rect(button_x + 36, row_y - 3, 28, 24)
+            setattr(self, minus_rect_name, minus_rect)
+            setattr(self, plus_rect_name, plus_rect)
+            self._draw_text(f"{label}: {value}", (content.left, row_y), self._small_font, DASHBOARD.muted_text_color if muted else DASHBOARD.text_color, label_w)
+            self._draw_button(minus_rect, "-", muted=muted)
+            self._draw_button(plus_rect, "+", muted=muted)
+
+        draw_stage_row(
+            "Baseline / Passive Q-model trials",
+            budgets.passive_model_trials,
+            y,
+            "_closed_loop_auto_tune_passive_minus_rect",
+            "_closed_loop_auto_tune_passive_plus_rect",
         )
-        detail_lines = [
-            "Mode: every search trial drives the selected route in CARLA no-render.",
-            "One route attempt per candidate; route failures end the trial.",
-            "Strategy: direct optuna_tpe ask/tell; fallback direct random search.",
-            f"Tracking: {self._tracking_mode}. {active_policy}",
-            f"Sensor Noise: {self._closed_loop_sensor_noise_label()}",
-            f"Behavior: {self._behavior_preset}",
-            f"Actuator: {self._actuator_preset} (applied during every trial)",
+        y += 31
+        active_skipped = self._tracking_mode != TRACKING_MODE_ACTIVE
+        draw_stage_row(
+            "Active-control trials",
+            "skipped" if active_skipped else budgets.active_control_trials,
+            y,
+            "_closed_loop_auto_tune_active_minus_rect",
+            "_closed_loop_auto_tune_active_plus_rect",
+            muted=active_skipped,
+        )
+        y += 31
+        draw_stage_row(
+            "Joint local fine-tune trials",
+            budgets.joint_fine_tune_trials,
+            y,
+            "_closed_loop_auto_tune_joint_minus_rect",
+            "_closed_loop_auto_tune_joint_plus_rect",
+        )
+        y += 34
+        self._draw_text(
+            f"Total planned trials: {budgets.total_trials}",
+            (content.left, y),
+            self._subtitle_font,
+            DASHBOARD.success_color,
+            content.width,
+        )
+        y += 31
+        context_lines = [
+            f"Filter: {getattr(self._filter_record(self._closed_loop_auto_tune_filter_id), 'display_name', self._closed_loop_auto_tune_filter_id)}",
+            f"Tracking: {self._tracking_mode} | Sensor noise: {self._closed_loop_sensor_noise_label()}",
+            f"Behavior: {self._behavior_preset} | Actuator: {self._actuator_preset}",
+            "Stage 1 always runs passive. Stage 2 runs only for active tracking.",
+            "Stage 3 uses narrow ranges around the current best tune.",
         ]
-        for line in detail_lines:
-            color = DASHBOARD.warning_color if line.startswith("Actuator:") or line.startswith("Tracking:") else DASHBOARD.text_color
+        for line in context_lines:
+            color = DASHBOARD.warning_color if line.startswith("Tracking:") else DASHBOARD.text_color
             self._draw_text(line, (content.left, y), self._small_font, color, content.width)
             y += 18
 
@@ -2160,8 +2273,8 @@ class StartupMapSelector:
             if route_item is not None:
                 route_name = f"{route_item.route.name} ({display_map_name(route_item.route.map_name)})"
         summary = (
-            f"Sensor Noise: {self._closed_loop_sensor_noise_label()} | "
-            f"Route: {route_name} | Tracking: {self._tracking_mode} | Actuator: {self._actuator_preset}"
+            f"Route: {route_name} | Tracking: {self._tracking_mode} | "
+            f"Trials: {self._closed_loop_auto_tune_modal_budgets().total_trials}"
         )
         if self._tracking_mode == TRACKING_MODE_PASSIVE:
             summary += " | active-control params off"

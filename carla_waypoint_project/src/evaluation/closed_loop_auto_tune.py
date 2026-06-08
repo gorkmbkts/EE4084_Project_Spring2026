@@ -9,7 +9,7 @@ Offline replay auto-tuning remains implemented separately in filter_auto_tuner.
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 import json
 import math
@@ -19,6 +19,7 @@ from typing import Callable, Optional
 
 from src.KalmanLab.registry import discover_filters
 from src.evaluation import filter_auto_tuner as offline_auto_tuner_module
+from src.evaluation.consistency_metrics import consistency_report_from_summaries
 from src.evaluation.evaluation_artifacts import benchmark_root, read_json, slugify, unique_folder, write_json
 from src.evaluation.filter_auto_tuner import (
     AutoTuneRequest,
@@ -56,7 +57,36 @@ ACTIVE_CONTROL_TUNE_KEYS = {
     "max_control_speed_delta_mps",
     "imu_accel_control_stddev_mps2",
     "command_accel_stddev_mps2",
+    "command_throttle_accel_gain_mps2",
+    "command_brake_decel_gain_mps2",
+    "command_max_accel_mps2",
+    "command_yaw_rate_stddev_dps",
+    "command_max_yaw_rate_dps",
 }
+
+PASSIVE_MODEL_STAGE = "stage1_passive_q_model"
+CONTEXT_BASELINE_STAGE = "stage0_context_baseline"
+ACTIVE_CONTROL_STAGE = "stage2_active_control"
+JOINT_FINE_TUNE_STAGE = "stage3_joint_local"
+
+
+@dataclass(frozen=True)
+class ClosedLoopStageBudgets:
+    passive_model_trials: int
+    active_control_trials: int
+    joint_fine_tune_trials: int
+
+    @property
+    def total_trials(self) -> int:
+        return self.passive_model_trials + self.active_control_trials + self.joint_fine_tune_trials
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "baseline_passive_q_model_trials": self.passive_model_trials,
+            "active_control_trials": self.active_control_trials,
+            "joint_local_fine_tune_trials": self.joint_fine_tune_trials,
+            "total_planned_trials": self.total_trials,
+        }
 
 
 @dataclass(frozen=True)
@@ -75,6 +105,9 @@ class PendingClosedLoopAutoTuneSession:
     finalist_count: int
     strategy: str
     output_root: str
+    passive_model_trials: Optional[int] = None
+    active_control_trials: Optional[int] = None
+    joint_fine_tune_trials: Optional[int] = None
     created_at: str = ""
     handoff_path: Optional[str] = None
     base_tune: dict[str, object] = field(default_factory=dict)
@@ -169,6 +202,9 @@ class ClosedLoopAutoTuneRequest:
     actuator_realism_enabled: bool = True
     actuator_realism_profile: str = "Custom"
     trial_count: int = 30
+    passive_model_trials: Optional[int] = None
+    active_control_trials: Optional[int] = None
+    joint_fine_tune_trials: Optional[int] = None
     finalist_count: int = 3
     strategy: str = "optuna_tpe"
     output_root: str = "benchmark_results"
@@ -207,6 +243,9 @@ class ClosedLoopAutoTuneRequest:
             actuator_realism_enabled=bool(session.actuator_realism_config),
             actuator_realism_profile=str(session.actuator_realism_config.get("preset_name") or "Custom"),
             trial_count=int(session.trial_count),
+            passive_model_trials=session.passive_model_trials,
+            active_control_trials=session.active_control_trials,
+            joint_fine_tune_trials=session.joint_fine_tune_trials,
             finalist_count=int(session.finalist_count),
             strategy=session.strategy,
             output_root=session.output_root,
@@ -250,6 +289,11 @@ class ClosedLoopValidationRequest:
     vehicle_behavior_config: dict[str, object]
     actuator_realism_config: dict[str, object]
     output_folder: Path
+    stage: str = ""
+    stage_trial_index: int = 0
+    stage_trial_total: int = 0
+    changed_parameters: dict[str, object] = field(default_factory=dict)
+    changed_parameters_summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -272,6 +316,12 @@ class ClosedLoopValidationResult:
     raw_metrics: dict[str, object]
     output_folder: Optional[Path]
     closed_loop_score: float
+    stage: str = ""
+    stage_trial_index: int = 0
+    stage_trial_total: int = 0
+    failure_class: str = ""
+    changed_parameters: dict[str, object] = field(default_factory=dict)
+    changed_parameters_summary: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -293,6 +343,12 @@ class ClosedLoopValidationResult:
             "raw_metrics": dict(self.raw_metrics),
             "output_folder": str(self.output_folder) if self.output_folder else None,
             "closed_loop_score": self.closed_loop_score,
+            "stage": self.stage,
+            "stage_trial_index": self.stage_trial_index,
+            "stage_trial_total": self.stage_trial_total,
+            "failure_class": self.failure_class,
+            "changed_parameters": dict(self.changed_parameters),
+            "changed_parameters_summary": self.changed_parameters_summary,
         }
 
 
@@ -368,6 +424,12 @@ class ClosedLoopBenchmarkAutoTuner:
         )
         base_tune = dict(request.base_tune)
         base_tune.update(locked.values)
+        context_baseline = _context_aware_baseline_tune(
+            base_tune,
+            request,
+            tuple(record.tune_specs),
+        )
+        stage_budgets = closed_loop_stage_budgets(request)
 
         run_folder = unique_folder(
             _closed_loop_physical_root(request.output_root, request.filter_id, request.tracking_mode),
@@ -381,114 +443,325 @@ class ClosedLoopBenchmarkAutoTuner:
         write_json(run_folder / "closed_loop_auto_tune_request.json", request.to_dict())
 
         strategy = _resolve_candidate_generation_strategy(request.strategy)
-        search_profile = _closed_loop_search_profile(request.auto_tune_profile, request.tracking_mode, request.actuator_realism_config)
-        search_params = _closed_loop_search_params(search_profile)
-        total_trials = max(1, int(request.trial_count or 1))
+        search_profile = _closed_loop_search_profile(
+            request.auto_tune_profile,
+            TRACKING_PASSIVE,
+            request.actuator_realism_config,
+        )
+        passive_params = _passive_model_search_params(
+            _closed_loop_search_params(search_profile),
+            context_baseline,
+        )
+        active_params = _active_control_search_params(
+            context_baseline,
+            tuple(record.tune_specs),
+            request.actuator_realism_config,
+        )
+        total_trials = stage_budgets.total_trials
         _emit(
             progress_callback,
             "search_started",
             {
                 "trial_count": total_trials,
+                "stage_budgets": stage_budgets.to_dict(),
                 "strategy": strategy,
-                "search_param_count": len(search_params),
+                "search_param_count": len(passive_params) + len(active_params),
+                "passive_search_param_count": len(passive_params),
+                "active_search_param_count": len(active_params),
                 "tracking_mode": request.tracking_mode,
                 "actuator_realism_profile": request.actuator_realism_profile,
                 "actuator_search_policy": _actuator_search_policy(request.actuator_realism_config),
             },
         )
         validation_results: list[ClosedLoopValidationResult] = []
-        optuna_study = _create_direct_optuna_study(strategy, request, search_params, base_tune)
         rng = random.Random(int(request.random_seed))
+        failure_counts: dict[str, int] = {}
+        seen_candidates: set[str] = set()
+        stage_summaries: list[dict[str, object]] = []
         best_score_so_far: Optional[float] = None
-        for trial_index in range(1, total_trials + 1):
-            if stop_requested is not None and stop_requested():
-                break
-            optuna_trial = None
-            if optuna_study is not None and search_params:
-                optuna_trial = optuna_study.ask()
-            candidate_tune = _direct_candidate_tune(
-                base_tune=base_tune,
-                params=search_params,
-                optuna_trial=optuna_trial,
-                rng=rng,
-                trial_index=trial_index,
-            )
-            finalist = ClosedLoopFinalist(
-                rank=trial_index,
-                candidate_tune=candidate_tune,
-                offline_score=0.0,
-                offline_metrics={
-                    "candidate_generation_stage": "direct_closed_loop",
-                    "candidate_type": "baseline_current" if trial_index == 1 else strategy,
-                    "tracking_mode": request.tracking_mode,
-                    "actuator_search_policy": _actuator_search_policy(request.actuator_realism_config),
-                },
-                trial_index=trial_index,
-                source_output_folder=None,
-            )
-            validation_request = ClosedLoopValidationRequest(
-                filter_id=request.filter_id,
-                tracking_mode=request.tracking_mode,
-                finalist=finalist,
-                validation_route=validation_route,
-                sensor_noise_config=dict(request.sensor_noise_config),
-                vehicle_behavior_config=dict(request.vehicle_behavior_config),
-                actuator_realism_config=dict(request.actuator_realism_config),
-                output_folder=run_folder / "trials" / f"t{trial_index:03d}",
-            )
+        global_trial_index = 0
+
+        def run_stage(
+            *,
+            stage: str,
+            stage_label: str,
+            stage_trial_count: int,
+            stage_tracking_mode: str,
+            stage_baseline: dict[str, object],
+            params: list[dict[str, object]],
+            evaluate_baseline_first: bool,
+        ) -> list[ClosedLoopValidationResult]:
+            nonlocal best_score_so_far, global_trial_index
+            if stage_trial_count <= 0:
+                return []
+            if not params and not evaluate_baseline_first:
+                return []
+            if not params and evaluate_baseline_first:
+                stage_trial_count = 1
             _emit(
                 progress_callback,
-                "trial_started",
+                "stage_started",
                 {
-                    "trial_index": trial_index,
+                    "stage": stage,
+                    "stage_label": stage_label,
+                    "stage_trial_count": stage_trial_count,
                     "trial_total": total_trials,
-                    "stage": "closed_loop_search",
-                    "candidate_tune": dict(candidate_tune),
-                    "route_name": validation_route.name,
-                    "tracking_mode": request.tracking_mode,
-                    "actuator_realism_profile": request.actuator_realism_profile,
-                    "best_score": best_score_so_far,
+                    "tracking_mode": stage_tracking_mode,
+                    "search_param_count": len(params),
                 },
             )
-            runner_result = self._run_validation(validation_request)
-            validation = _validation_result_from_runner(runner_result, validation_request)
-            validation_results.append(validation)
-            if optuna_study is not None and optuna_trial is not None:
-                optuna_study.tell(optuna_trial, validation.closed_loop_score)
-            if best_score_so_far is None or validation.closed_loop_score < best_score_so_far:
-                best_score_so_far = float(validation.closed_loop_score)
+            stage_results: list[ClosedLoopValidationResult] = []
+            optuna_study = _create_direct_optuna_study(
+                strategy,
+                request,
+                params,
+                stage_baseline,
+                enqueue_baseline=False,
+            )
+            for stage_trial_index in range(1, stage_trial_count + 1):
+                if stop_requested is not None and stop_requested():
+                    break
+                global_trial_index += 1
+                baseline_trial = evaluate_baseline_first and stage_trial_index == 1
+                optuna_trial = None
+                if not baseline_trial and optuna_study is not None and params:
+                    optuna_trial = optuna_study.ask()
+                candidate_tune = (
+                    dict(stage_baseline)
+                    if baseline_trial
+                    else _direct_candidate_tune(
+                        base_tune=stage_baseline,
+                        params=params,
+                        optuna_trial=optuna_trial,
+                        rng=rng,
+                        trial_index=stage_trial_index,
+                        sample_first=True,
+                    )
+                )
+                candidate_tune = _failure_aware_candidate(
+                    candidate_tune,
+                    stage_baseline,
+                    params,
+                    stage,
+                    failure_counts,
+                )
+                candidate_tune = _ensure_unique_candidate(
+                    candidate_tune,
+                    stage_baseline,
+                    params,
+                    stage_tracking_mode,
+                    seen_candidates,
+                    rng,
+                    allow_existing=baseline_trial,
+                )
+                changed_parameters = _changed_parameters(context_baseline, candidate_tune)
+                changed_summary = _changed_parameters_summary(changed_parameters)
+                candidate_type = "context_baseline" if stage == CONTEXT_BASELINE_STAGE else strategy
+                finalist = ClosedLoopFinalist(
+                    rank=global_trial_index,
+                    candidate_tune=candidate_tune,
+                    offline_score=0.0,
+                    offline_metrics={
+                        "candidate_generation_stage": stage,
+                        "candidate_type": candidate_type,
+                        "tracking_mode": stage_tracking_mode,
+                        "actuator_search_policy": _actuator_search_policy(request.actuator_realism_config),
+                        "changed_parameters": changed_parameters,
+                        "changed_parameters_summary": changed_summary,
+                    },
+                    trial_index=global_trial_index,
+                    source_output_folder=None,
+                )
+                validation_request = ClosedLoopValidationRequest(
+                    filter_id=request.filter_id,
+                    tracking_mode=stage_tracking_mode,
+                    finalist=finalist,
+                    validation_route=validation_route,
+                    sensor_noise_config=dict(request.sensor_noise_config),
+                    vehicle_behavior_config=dict(request.vehicle_behavior_config),
+                    actuator_realism_config=dict(request.actuator_realism_config),
+                    output_folder=run_folder / "trials" / f"t{global_trial_index:03d}",
+                    stage=stage,
+                    stage_trial_index=stage_trial_index,
+                    stage_trial_total=stage_trial_count,
+                    changed_parameters=changed_parameters,
+                    changed_parameters_summary=changed_summary,
+                )
                 _emit(
                     progress_callback,
-                    "new_search_best",
+                    "trial_started",
                     {
-                        "trial_index": trial_index,
-                        "score": best_score_so_far,
-                        "metrics": dict(validation.raw_metrics),
+                        "trial_index": global_trial_index,
+                        "trial_total": total_trials,
+                        "stage": stage,
+                        "stage_label": stage_label,
+                        "stage_trial_index": stage_trial_index,
+                        "stage_trial_total": stage_trial_count,
                         "candidate_tune": dict(candidate_tune),
+                        "changed_parameters": changed_parameters,
+                        "changed_parameters_summary": changed_summary,
+                        "route_name": validation_route.name,
+                        "tracking_mode": stage_tracking_mode,
+                        "actuator_realism_profile": request.actuator_realism_profile,
+                        "best_score": best_score_so_far,
                     },
                 )
-            write_json(run_folder / f"trial_{trial_index:03d}.json", validation.to_dict())
-            _emit(
-                progress_callback,
-                "trial_finished",
-                {
-                    "trial_index": trial_index,
-                    "trial_total": total_trials,
-                    "stage": "closed_loop_search",
-                    "score": validation.closed_loop_score,
-                    "best_score": best_score_so_far,
-                    "failed": not validation.route_completion_success,
-                    "failure_reason": validation.abort_reason,
-                    "metrics": dict(validation.raw_metrics),
-                    "route_completion_success": validation.route_completion_success,
-                    "tracking_mode": request.tracking_mode,
-                    "actuator_realism_profile": request.actuator_realism_profile,
-                },
+                runner_result = self._run_validation(validation_request)
+                validation = _validation_result_from_runner(runner_result, validation_request)
+                raw_metrics = dict(validation.raw_metrics)
+                raw_metrics.update(
+                    {
+                        "tuning_stage": stage,
+                        "stage_trial_index": stage_trial_index,
+                        "stage_trial_total": stage_trial_count,
+                        "failure_class": validation.failure_class,
+                        "changed_parameters": changed_parameters,
+                        "changed_parameters_summary": changed_summary,
+                        "candidate_type": candidate_type,
+                    }
+                )
+                validation = replace(
+                    validation,
+                    stage=stage,
+                    stage_trial_index=stage_trial_index,
+                    stage_trial_total=stage_trial_count,
+                    changed_parameters=changed_parameters,
+                    changed_parameters_summary=changed_summary,
+                    raw_metrics=raw_metrics,
+                )
+                validation_results.append(validation)
+                stage_results.append(validation)
+                failure_class = validation.failure_class
+                if failure_class:
+                    failure_counts[failure_class] = failure_counts.get(failure_class, 0) + 1
+                if optuna_study is not None and optuna_trial is not None:
+                    optuna_study.tell(optuna_trial, validation.closed_loop_score)
+                if best_score_so_far is None or validation.closed_loop_score < best_score_so_far:
+                    best_score_so_far = float(validation.closed_loop_score)
+                    _emit(
+                        progress_callback,
+                        "new_search_best",
+                        {
+                            "trial_index": global_trial_index,
+                            "stage": stage,
+                            "stage_label": stage_label,
+                            "score": best_score_so_far,
+                            "metrics": dict(validation.raw_metrics),
+                            "candidate_tune": dict(candidate_tune),
+                            "changed_parameters_summary": changed_summary,
+                        },
+                    )
+                write_json(run_folder / f"trial_{global_trial_index:03d}.json", validation.to_dict())
+                _emit(
+                    progress_callback,
+                    "trial_finished",
+                    {
+                        "trial_index": global_trial_index,
+                        "trial_total": total_trials,
+                        "stage": stage,
+                        "stage_label": stage_label,
+                        "stage_trial_index": stage_trial_index,
+                        "stage_trial_total": stage_trial_count,
+                        "score": validation.closed_loop_score,
+                        "best_score": best_score_so_far,
+                        "failed": not validation.route_completion_success,
+                        "failure_class": validation.failure_class,
+                        "failure_reason": validation.abort_reason,
+                        "changed_parameters": changed_parameters,
+                        "changed_parameters_summary": changed_summary,
+                        "metrics": dict(validation.raw_metrics),
+                        "route_completion_success": validation.route_completion_success,
+                        "tracking_mode": stage_tracking_mode,
+                        "actuator_realism_profile": request.actuator_realism_profile,
+                    },
+                )
+            if stage_results:
+                stage_best = min(stage_results, key=lambda item: item.closed_loop_score)
+                stage_summaries.append(
+                    {
+                        "stage": stage,
+                        "stage_label": stage_label,
+                        "tracking_mode": stage_tracking_mode,
+                        "planned_trials": stage_trial_count,
+                        "completed_trials": len(stage_results),
+                        "best_trial_index": stage_best.finalist_rank,
+                        "best_score": stage_best.closed_loop_score,
+                        "failure_classes": _failure_class_counts(stage_results),
+                    }
+                )
+            return stage_results
+
+        context_results = run_stage(
+            stage=CONTEXT_BASELINE_STAGE,
+            stage_label="Context baseline",
+            stage_trial_count=1,
+            stage_tracking_mode=TRACKING_PASSIVE,
+            stage_baseline=context_baseline,
+            params=[],
+            evaluate_baseline_first=True,
+        )
+        passive_search_results = run_stage(
+            stage=PASSIVE_MODEL_STAGE,
+            stage_label="Passive Q/model",
+            stage_trial_count=max(0, stage_budgets.passive_model_trials - 1),
+            stage_tracking_mode=TRACKING_PASSIVE,
+            stage_baseline=context_baseline,
+            params=passive_params,
+            evaluate_baseline_first=False,
+        )
+        passive_results = context_results + passive_search_results
+        best_passive = min(passive_results, key=lambda item: item.closed_loop_score) if passive_results else None
+
+        active_results: list[ClosedLoopValidationResult] = []
+        best_active: Optional[ClosedLoopValidationResult] = None
+        if request.tracking_mode == TRACKING_ACTIVE and best_passive is not None:
+            active_baseline = _active_control_baseline(
+                best_passive.candidate_tune,
+                context_baseline,
+                tuple(record.tune_specs),
+            )
+            active_results = run_stage(
+                stage=ACTIVE_CONTROL_STAGE,
+                stage_label="Active-control",
+                stage_trial_count=stage_budgets.active_control_trials,
+                stage_tracking_mode=TRACKING_ACTIVE,
+                stage_baseline=active_baseline,
+                params=active_params,
+                evaluate_baseline_first=True,
+            )
+            if active_results:
+                best_active = min(active_results, key=lambda item: item.closed_loop_score)
+
+        stage3_baseline_result = best_active if request.tracking_mode == TRACKING_ACTIVE else best_passive
+        joint_results: list[ClosedLoopValidationResult] = []
+        if stage3_baseline_result is not None and stage_budgets.joint_fine_tune_trials > 0:
+            joint_params = _joint_local_search_params(
+                passive_params,
+                active_params,
+                stage3_baseline_result.candidate_tune,
+                request.tracking_mode,
+                request.actuator_realism_config,
+            )
+            joint_results = run_stage(
+                stage=JOINT_FINE_TUNE_STAGE,
+                stage_label="Joint local fine-tune",
+                stage_trial_count=stage_budgets.joint_fine_tune_trials,
+                stage_tracking_mode=request.tracking_mode,
+                stage_baseline=stage3_baseline_result.candidate_tune,
+                params=joint_params,
+                evaluate_baseline_first=False,
             )
         if not validation_results:
             raise ValueError("No closed-loop auto-tune trials completed.")
 
-        best_validation = min(validation_results, key=lambda item: item.closed_loop_score)
+        final_candidates = (
+            active_results + joint_results
+            if request.tracking_mode == TRACKING_ACTIVE
+            else passive_results + joint_results
+        )
+        if not final_candidates:
+            final_candidates = validation_results
+        best_validation = min(final_candidates, key=lambda item: item.closed_loop_score)
         best_tune = dict(best_validation.candidate_tune)
         best_score = float(best_validation.closed_loop_score)
         best_metrics = dict(best_validation.raw_metrics)
@@ -559,6 +832,12 @@ class ClosedLoopBenchmarkAutoTuner:
                 search_profile,
                 validation_dicts,
                 finalist_dicts,
+                stage_budgets=stage_budgets,
+                stage_summaries=stage_summaries,
+                context_baseline=context_baseline,
+                best_passive=best_passive,
+                best_active=best_active,
+                final_validation=best_validation,
             ),
         )
         _ensure_backend_config_compatible(config, request)
@@ -570,7 +849,16 @@ class ClosedLoopBenchmarkAutoTuner:
             }
         )
         write_json(run_folder / "closed_loop_auto_tune_summary.json", summary)
-        _emit(progress_callback, "completed", {"best_score": best_score, "saved_config_path": str(saved_config_path)})
+        _emit(
+            progress_callback,
+            "completed",
+            {
+                "best_score": best_score,
+                "saved_config_path": str(saved_config_path),
+                "stage_budgets": stage_budgets.to_dict(),
+                "stage_summaries": stage_summaries,
+            },
+        )
         return ClosedLoopAutoTuneResult(
             filter_id=request.filter_id,
             tracking_mode=request.tracking_mode,
@@ -595,7 +883,8 @@ class ClosedLoopBenchmarkAutoTuner:
         raise TypeError("ClosedLoopBenchmarkAutoTuner.run expects ClosedLoopAutoTuneRequest or PendingClosedLoopAutoTuneSession.")
 
     def _fill_defaults_from_record(self, request: ClosedLoopAutoTuneRequest, record: object) -> ClosedLoopAutoTuneRequest:
-        base_tune = dict(request.base_tune or getattr(record, "tune", {}) or {})
+        base_tune = dict(getattr(record, "tune", {}) or {})
+        base_tune.update(dict(request.base_tune or {}))
         auto_tune_profile = dict(request.auto_tune_profile or getattr(record, "auto_tune_profile", {}) or {})
         routes = tuple(ClosedLoopValidationRoute.from_object(route) for route in request.validation_routes)
         return ClosedLoopAutoTuneRequest(
@@ -635,15 +924,30 @@ def closed_loop_objective_score(metrics: dict[str, object]) -> float:
     success = bool(metrics.get("route_completion_success"))
     aborted = bool(metrics.get("route_aborted"))
     timeout = bool(metrics.get("timeout"))
+    failure_class = _classify_failure(metrics)
     failure_penalty = 0.0
     if not success:
-        failure_penalty += 100000.0
+        failure_penalty += 75000.0
     if aborted:
-        failure_penalty += 50000.0
+        failure_penalty += 25000.0
     if timeout:
         failure_penalty += 50000.0
     if metrics.get("abort_reason"):
         failure_penalty += 10000.0
+    failure_penalty += {
+        "failed_before_route_activation": 35000.0,
+        "localization_stability_timeout": 40000.0,
+        "no_target_waypoint": 30000.0,
+        "vehicle_stuck_no_progress": 25000.0,
+        "large_lateral_deviation": 30000.0,
+        "control_instability": 35000.0,
+        "timeout": 30000.0,
+        "route_failure": 20000.0,
+    }.get(failure_class, 0.0)
+    progress = _first_float(metrics, "route_progress_percent", "route_completion_percent", "progress_percent")
+    if not success and progress is not None:
+        normalized_progress = progress * 100.0 if 0.0 <= progress <= 1.0 else progress
+        failure_penalty += 120.0 * max(0.0, 100.0 - min(100.0, normalized_progress))
 
     rmse = _first_float(metrics, "eval_filtered_rmse_m", "filtered_rmse_m", "mean_filtered_rmse_m")
     mean_cte = _first_float(metrics, "driving_mean_cross_track_error_m", "mean_cross_track_error_m")
@@ -652,9 +956,9 @@ def closed_loop_objective_score(metrics: dict[str, object]) -> float:
     yaw_rmse = _first_float(metrics, "eval_yaw_rmse_deg", "driving_yaw_rmse_deg", "yaw_rmse_deg")
     completion_time = _first_float(metrics, "completion_time_s")
     score = failure_penalty
-    score += 5.0 * (rmse if rmse is not None else 1000.0)
-    score += 2.0 * (mean_cte if mean_cte is not None else 100.0)
-    score += 0.5 * (max_cte if max_cte is not None else 100.0)
+    score += 8.0 * (rmse if rmse is not None else 1000.0)
+    score += 4.0 * (mean_cte if mean_cte is not None else 100.0)
+    score += 1.5 * (max_cte if max_cte is not None else 100.0)
     score += 0.5 * (speed_rmse if speed_rmse is not None else 0.0)
     score += 0.02 * (yaw_rmse if yaw_rmse is not None else 0.0)
     score += 0.02 * (completion_time if completion_time is not None else 0.0)
@@ -674,12 +978,42 @@ def closed_loop_objective_score(metrics: dict[str, object]) -> float:
         )
     if nees is None:
         nees = _first_float(metrics, "driving_mean_nees", "eval_mean_nees", "mean_nees")
-    if nis is not None and nis > 9.0:
-        score += 2.0 * (nis - 9.0)
-    if nees is not None and nees > 12.0:
-        score += 2.0 * (nees - 12.0)
+    consistency = consistency_report_from_summaries(
+        nis_by_type_summary=_first_object(
+            metrics,
+            "driving_nis_by_type_summary",
+            "eval_nis_by_type_summary",
+            "nis_by_type_summary",
+        ),
+        mean_position_nees=nees,
+        mean_position_nees_diagonal_approx=_first_float(
+            metrics,
+            "driving_mean_position_nees_diagonal_approx",
+            "eval_mean_position_nees_diagonal_approx",
+            "mean_position_nees_diagonal_approx",
+        ),
+        position_nees_source=_first_object(
+            metrics,
+            "driving_position_nees_source",
+            "eval_position_nees_source",
+            "position_nees_source",
+        ),
+    )
+    score += 8.0 * float(consistency.get("consistency_error") or 0.0)
+    if nis is not None and nis > 18.0:
+        score += 2.0 * (nis - 18.0)
+    if nees is not None and nees > 20.0:
+        score += 2.0 * (nees - 20.0)
+    if max_cte is not None and max_cte > 4.0:
+        score += 25.0 * (max_cte - 4.0)
 
-    oscillation = _first_float(metrics, "control_oscillation_score", "control_oscillation_count", "mean_abs_steer_rate")
+    oscillation = _first_float(
+        metrics,
+        "control_instability_score",
+        "control_oscillation_score",
+        "control_oscillation_count",
+        "mean_abs_steer_rate",
+    )
     if oscillation is not None:
         score += 2.0 * max(0.0, oscillation)
     return score if math.isfinite(score) else 1.0e12
@@ -696,6 +1030,52 @@ def save_closed_loop_best_tune(
     write_json(config_path, config)
     _update_closed_loop_saved_config_index(output_root, filter_id, tracking_mode, config_path, config)
     return config_path
+
+
+def closed_loop_stage_budgets(request: ClosedLoopAutoTuneRequest) -> ClosedLoopStageBudgets:
+    requested = (
+        request.passive_model_trials,
+        request.active_control_trials,
+        request.joint_fine_tune_trials,
+    )
+    if any(value is not None for value in requested):
+        passive = max(1, int(request.passive_model_trials or 1))
+        active = max(0, int(request.active_control_trials or 0))
+        joint = max(0, int(request.joint_fine_tune_trials or 0))
+        if request.tracking_mode == TRACKING_PASSIVE:
+            active = 0
+        else:
+            active = max(1, active)
+        return ClosedLoopStageBudgets(
+            passive_model_trials=passive,
+            active_control_trials=active,
+            joint_fine_tune_trials=joint,
+        )
+    return closed_loop_default_stage_budgets(request.trial_count, request.tracking_mode)
+
+
+def closed_loop_default_stage_budgets(total_trials: object, tracking_mode: str) -> ClosedLoopStageBudgets:
+    total = max(1, int(total_trials or 1))
+    if str(tracking_mode or TRACKING_PASSIVE) != TRACKING_ACTIVE:
+        joint = 0 if total < 5 else max(1, int(round(total * 0.20)))
+        passive = max(1, total - joint)
+        return ClosedLoopStageBudgets(
+            passive_model_trials=passive,
+            active_control_trials=0,
+            joint_fine_tune_trials=max(0, total - passive),
+        )
+    if total == 1:
+        return ClosedLoopStageBudgets(1, 1, 0)
+    passive = max(1, int(round(total * 0.50)))
+    active = max(1, int(round(total * 0.30)))
+    joint = max(0, total - passive - active)
+    while passive + active + joint > total and joint > 0:
+        joint -= 1
+    while passive + active + joint > total and passive > 1:
+        passive -= 1
+    while passive + active + joint < total:
+        joint += 1
+    return ClosedLoopStageBudgets(passive, active, joint)
 
 
 def _validation_result_from_runner(result: object, request: ClosedLoopValidationRequest) -> ClosedLoopValidationResult:
@@ -715,6 +1095,7 @@ def _validation_result_from_runner(result: object, request: ClosedLoopValidation
                 if not key.startswith("_") and not callable(getattr(result, key))
             }
     output_folder = _path_or_none(raw.get("output_folder") or raw.get("route_folder") or request.output_folder)
+    raw["failure_class"] = _classify_failure(raw)
     score = closed_loop_objective_score(raw)
     return ClosedLoopValidationResult(
         finalist_rank=request.finalist.rank,
@@ -740,6 +1121,12 @@ def _validation_result_from_runner(result: object, request: ClosedLoopValidation
         raw_metrics=raw,
         output_folder=output_folder,
         closed_loop_score=score,
+        stage=request.stage,
+        stage_trial_index=request.stage_trial_index,
+        stage_trial_total=request.stage_trial_total,
+        failure_class=str(raw.get("failure_class") or ""),
+        changed_parameters=dict(request.changed_parameters),
+        changed_parameters_summary=request.changed_parameters_summary,
     )
 
 
@@ -773,6 +1160,369 @@ def _select_finalists(offline_result: AutoTuneResult, finalist_count: int) -> li
     return finalists
 
 
+def _context_aware_baseline_tune(
+    base_tune: dict[str, object],
+    request: ClosedLoopAutoTuneRequest,
+    tune_specs: tuple[object, ...],
+) -> dict[str, object]:
+    baseline = dict(base_tune)
+    behavior_scale = _behavior_process_scale(request.vehicle_behavior_config)
+    actuator_scale = 1.0 + 0.18 * _actuator_imperfection_score(request.actuator_realism_config)
+    dynamic_scale = max(0.75, min(1.35, behavior_scale * actuator_scale))
+    for key in list(baseline.keys()):
+        if _is_process_model_key(key):
+            value = _optional_float(baseline.get(key))
+            if value is not None:
+                baseline[key] = value * dynamic_scale
+        elif key.endswith("_R_multiplier"):
+            baseline[key] = 1.0
+    return _clamp_tune_to_specs(baseline, tune_specs)
+
+
+def _behavior_process_scale(config: dict[str, object]) -> float:
+    speed = _optional_float(config.get("max_speed_mps")) or 8.0
+    accel = _optional_float(config.get("max_forward_accel_mps2")) or 1.6
+    aggressiveness = _optional_float(config.get("speed_change_aggressiveness")) or 1.0
+    profile = str(config.get("preset_name") or "").lower()
+    scale = 0.85 + 0.08 * (speed / 8.0) + 0.05 * (accel / 1.6) + 0.08 * aggressiveness
+    if "aggressive" in profile:
+        scale += 0.08
+    elif "conservative" in profile:
+        scale -= 0.06
+    return max(0.75, min(1.35, scale))
+
+
+def _is_process_model_key(key: str) -> bool:
+    text = str(key)
+    return (
+        text.startswith("process_")
+        or text in {"covariance_inflation", "yaw_from_velocity_min_speed_mps"}
+        or text.startswith("initial_")
+    )
+
+
+def _clamp_tune_to_specs(tune: dict[str, object], tune_specs: tuple[object, ...]) -> dict[str, object]:
+    result = dict(tune)
+    specs = {str(getattr(spec, "key", "")): spec for spec in tune_specs if getattr(spec, "key", "")}
+    for key, value in list(result.items()):
+        spec = specs.get(key)
+        if spec is not None and hasattr(spec, "clamp"):
+            result[key] = float(spec.clamp(value))
+    return result
+
+
+def _passive_model_search_params(
+    params: list[dict[str, object]],
+    baseline: dict[str, object],
+) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for param in params:
+        key = str(param.get("key") or "")
+        if not key or key in ACTIVE_CONTROL_TUNE_KEYS:
+            continue
+        result.append(_local_param_bounds(param, baseline, stage="passive_model"))
+    return result
+
+
+def _active_control_search_params(
+    baseline: dict[str, object],
+    tune_specs: tuple[object, ...],
+    actuator_realism_config: dict[str, object],
+) -> list[dict[str, object]]:
+    severity = _actuator_imperfection_score(actuator_realism_config)
+    radius = 0.45 if severity <= 0.08 else 0.28 if severity <= 0.35 else 0.16
+    result: list[dict[str, object]] = []
+    for spec in tune_specs:
+        key = str(getattr(spec, "key", "") or "")
+        group = str(getattr(spec, "group", "") or "")
+        if not key or key == "enable_control_input_prediction":
+            continue
+        if key not in ACTIVE_CONTROL_TUNE_KEYS and group.lower() != "active tracking":
+            continue
+        base_value = _optional_float(baseline.get(key))
+        if base_value is None:
+            continue
+        spec_low = _optional_float(getattr(spec, "minimum", None))
+        spec_high = _optional_float(getattr(spec, "maximum", None))
+        if spec_low is None or spec_high is None or spec_high <= spec_low:
+            continue
+        span = spec_high - spec_low
+        low = max(spec_low, base_value - span * radius)
+        high = min(spec_high, base_value + span * radius)
+        if key in {"control_steer_to_yaw_rate_gain", "max_control_yaw_rate_delta_radps", "command_yaw_rate_stddev_dps", "command_max_yaw_rate_dps"}:
+            high = min(high, base_value + span * radius * 0.75)
+        if high <= low:
+            low, high = _expand_degenerate_bounds(base_value, spec_low, spec_high)
+        result.append(
+            _actuator_adjusted_param(
+                {
+                    "key": key,
+                    "scale": "log" if base_value > 0.0 and ("stddev" in key or key.endswith("_gain_mps2")) else "linear",
+                    "min": low,
+                    "max": high,
+                },
+                actuator_realism_config,
+                TRACKING_ACTIVE,
+            )
+        )
+    return result
+
+
+def _joint_local_search_params(
+    passive_params: list[dict[str, object]],
+    active_params: list[dict[str, object]],
+    baseline: dict[str, object],
+    tracking_mode: str,
+    actuator_realism_config: dict[str, object],
+) -> list[dict[str, object]]:
+    candidates = passive_params + (active_params if tracking_mode == TRACKING_ACTIVE else [])
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for param in candidates:
+        key = str(param.get("key") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        local = _local_param_bounds(param, baseline, stage="joint_local")
+        if tracking_mode == TRACKING_ACTIVE and key in ACTIVE_CONTROL_TUNE_KEYS:
+            local = _actuator_adjusted_param(local, actuator_realism_config, TRACKING_ACTIVE)
+        result.append(local)
+    return result
+
+
+def _local_param_bounds(param: dict[str, object], baseline: dict[str, object], *, stage: str) -> dict[str, object]:
+    result = dict(param)
+    key = str(result.get("key") or "")
+    base = _optional_float(baseline.get(key))
+    if base is None:
+        return result
+    low, high = _param_bounds(result, base)
+    if key.endswith("_R_multiplier"):
+        factor = 0.15 if stage == "joint_local" else 0.45
+        result["min"] = max(low, 1.0 - factor)
+        result["max"] = min(high, 1.0 + factor)
+        return result
+    if str(result.get("scale") or "").lower() == "log" and base > 0.0:
+        factor = 1.25 if stage == "joint_local" else 2.4
+        result["min"] = max(low, base / factor)
+        result["max"] = min(high, base * factor)
+    else:
+        span = high - low
+        fraction = 0.12 if stage == "joint_local" else 0.32
+        result["min"] = max(low, base - span * fraction)
+        result["max"] = min(high, base + span * fraction)
+    if _optional_float(result.get("max")) is not None and _optional_float(result.get("min")) is not None:
+        if float(result["max"]) <= float(result["min"]):
+            result["min"], result["max"] = _expand_degenerate_bounds(base, low, high)
+    return result
+
+
+def _expand_degenerate_bounds(base: float, low: float, high: float) -> tuple[float, float]:
+    epsilon = max(1.0e-6, abs(base) * 0.05, (high - low) * 0.05)
+    return max(low, base - epsilon), min(high, base + epsilon)
+
+
+def _active_control_baseline(
+    passive_best_tune: dict[str, object],
+    context_baseline: dict[str, object],
+    tune_specs: tuple[object, ...],
+) -> dict[str, object]:
+    tune = dict(passive_best_tune)
+    for key in ACTIVE_CONTROL_TUNE_KEYS:
+        if key in context_baseline:
+            tune[key] = context_baseline[key]
+    if "enable_control_input_prediction" in context_baseline:
+        tune["enable_control_input_prediction"] = 1.0
+    return _clamp_tune_to_specs(tune, tune_specs)
+
+
+def _failure_aware_candidate(
+    candidate: dict[str, object],
+    baseline: dict[str, object],
+    params: list[dict[str, object]],
+    stage: str,
+    failure_counts: dict[str, int],
+) -> dict[str, object]:
+    result = dict(candidate)
+    activation_failures = (
+        failure_counts.get("failed_before_route_activation", 0)
+        + failure_counts.get("localization_stability_timeout", 0)
+    )
+    active_failures = (
+        failure_counts.get("control_instability", 0)
+        + failure_counts.get("vehicle_stuck_no_progress", 0)
+    )
+    lateral_failures = failure_counts.get("large_lateral_deviation", 0)
+    for param in params:
+        key = str(param.get("key") or "")
+        if not key or key not in result:
+            continue
+        if activation_failures >= 2 and (_is_initialization_key(key) or key in {"min_prediction_dt_s", "max_prediction_dt_s"}):
+            result[key] = baseline.get(key, result[key])
+            continue
+        if lateral_failures >= 1 and _is_yaw_or_steer_key(key):
+            result[key] = _blend_value(result.get(key), baseline.get(key), 0.35)
+            continue
+        if stage == ACTIVE_CONTROL_STAGE and active_failures >= 1 and key in ACTIVE_CONTROL_TUNE_KEYS:
+            result[key] = _blend_value(result.get(key), baseline.get(key), 0.50 if active_failures == 1 else 0.25)
+            continue
+        if activation_failures >= 3:
+            result[key] = _blend_value(result.get(key), baseline.get(key), 0.50)
+    return result
+
+
+def _blend_value(value: object, baseline: object, candidate_weight: float) -> object:
+    current = _optional_float(value)
+    base = _optional_float(baseline)
+    if current is None or base is None:
+        return baseline if baseline is not None else value
+    weight = max(0.0, min(1.0, candidate_weight))
+    return base + weight * (current - base)
+
+
+def _is_initialization_key(key: str) -> bool:
+    return str(key).startswith("initial_") or str(key).startswith("startup_")
+
+
+def _is_yaw_or_steer_key(key: str) -> bool:
+    text = str(key).lower()
+    return any(token in text for token in ("yaw", "steer", "turn", "gyro"))
+
+
+def _ensure_unique_candidate(
+    candidate: dict[str, object],
+    baseline: dict[str, object],
+    params: list[dict[str, object]],
+    tracking_mode: str,
+    seen: set[str],
+    rng: random.Random,
+    *,
+    allow_existing: bool = False,
+) -> dict[str, object]:
+    signature = _candidate_signature(candidate, tracking_mode)
+    if allow_existing or signature not in seen:
+        seen.add(signature)
+        return candidate
+    result = dict(candidate)
+    for _attempt in range(8):
+        for param in params:
+            key = str(param.get("key") or "")
+            if key:
+                result[key] = _sample_param(rng, param, baseline.get(key))
+        signature = _candidate_signature(result, tracking_mode)
+        if signature not in seen:
+            seen.add(signature)
+            return result
+    if params:
+        key = str(params[0].get("key") or "")
+        if key:
+            low, high = _param_bounds(params[0], baseline.get(key))
+            current = _optional_float(result.get(key))
+            if current is not None:
+                result[key] = max(low, min(high, current + 0.03 * (high - low)))
+    seen.add(_candidate_signature(result, tracking_mode))
+    return result
+
+
+def _candidate_signature(candidate: dict[str, object], tracking_mode: str) -> str:
+    rounded: dict[str, object] = {}
+    for key, value in sorted(candidate.items()):
+        number = _optional_float(value)
+        rounded[key] = round(number, 9) if number is not None else value
+    return f"{tracking_mode}:{json.dumps(rounded, sort_keys=True, separators=(',', ':'))}"
+
+
+def _changed_parameters(baseline: dict[str, object], candidate: dict[str, object]) -> dict[str, object]:
+    changes: dict[str, object] = {}
+    for key in sorted(set(baseline) | set(candidate)):
+        base = baseline.get(key)
+        value = candidate.get(key)
+        if not _values_differ(base, value):
+            continue
+        base_num = _optional_float(base)
+        value_num = _optional_float(value)
+        change: dict[str, object] = {"baseline": base, "candidate": value}
+        if base_num is not None and value_num is not None:
+            change["delta"] = value_num - base_num
+            change["delta_percent"] = None if abs(base_num) <= 1.0e-12 else 100.0 * (value_num - base_num) / base_num
+        changes[key] = change
+    return changes
+
+
+def _changed_parameters_summary(changes: dict[str, object], max_items: int = 4) -> str:
+    items: list[str] = []
+    for key, raw in list(changes.items())[:max_items]:
+        change = raw if isinstance(raw, dict) else {}
+        value = change.get("candidate")
+        base = change.get("baseline")
+        value_num = _optional_float(value)
+        base_num = _optional_float(base)
+        if value_num is not None and base_num is not None:
+            items.append(f"{key} {base_num:.3g}->{value_num:.3g}")
+        else:
+            items.append(f"{key} changed")
+    remaining = max(0, len(changes) - len(items))
+    if remaining:
+        items.append(f"+{remaining} more")
+    return ", ".join(items) if items else "baseline"
+
+
+def _values_differ(left: object, right: object) -> bool:
+    left_num = _optional_float(left)
+    right_num = _optional_float(right)
+    if left_num is not None and right_num is not None:
+        return abs(left_num - right_num) > max(1.0e-9, 1.0e-6 * max(abs(left_num), abs(right_num), 1.0))
+    return left != right
+
+
+def _failure_class_counts(results: list[ClosedLoopValidationResult]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        failure_class = result.failure_class
+        if failure_class:
+            counts[failure_class] = counts.get(failure_class, 0) + 1
+    return counts
+
+
+def _classify_failure(metrics: dict[str, object]) -> str:
+    explicit = str(metrics.get("failure_class") or "").strip()
+    if explicit:
+        return explicit
+    if bool(metrics.get("route_completion_success")):
+        return ""
+    reason = str(
+        metrics.get("abort_reason")
+        or metrics.get("last_failure_reason")
+        or metrics.get("error")
+        or ""
+    ).lower()
+    debug = metrics.get("trial_start_debug") if isinstance(metrics.get("trial_start_debug"), dict) else {}
+    if "localization" in reason and ("timeout" in reason or "stability" in reason or "stable" in reason):
+        return "localization_stability_timeout"
+    if "no target" in reason or "target waypoint" in reason:
+        return "no_target_waypoint"
+    if "stuck" in reason or "no route progress" in reason or "no progress" in reason:
+        return "vehicle_stuck_no_progress"
+    if "lateral deviation" in reason or "cross track" in reason or "cross-track" in reason:
+        return "large_lateral_deviation"
+    if "control instability" in reason or "oscillation" in reason:
+        return "control_instability"
+    if bool(metrics.get("timeout")) or "timeout" in reason:
+        return "timeout"
+    activation_state = str(debug.get("route_activation_state") or metrics.get("route_activation_state") or "").lower()
+    progress = _first_float(metrics, "route_progress_percent", "route_completion_percent", "progress_percent")
+    if (
+        "waiting" in activation_state
+        or "activation" in reason
+        or "did not start" in reason
+        or "benchmark runner unavailable" in reason
+        or "filter manager unavailable" in reason
+        or (progress is not None and progress <= 0.0)
+    ):
+        return "failed_before_route_activation"
+    return "route_failure"
+
+
 def _closed_loop_extra_metadata(
     request: ClosedLoopAutoTuneRequest,
     noise_sig: str,
@@ -781,6 +1531,13 @@ def _closed_loop_extra_metadata(
     search_profile: dict[str, object],
     direct_trial_results: list[dict[str, object]],
     direct_finalists: list[dict[str, object]],
+    *,
+    stage_budgets: ClosedLoopStageBudgets,
+    stage_summaries: list[dict[str, object]],
+    context_baseline: dict[str, object],
+    best_passive: Optional[ClosedLoopValidationResult],
+    best_active: Optional[ClosedLoopValidationResult],
+    final_validation: ClosedLoopValidationResult,
 ) -> dict[str, object]:
     return {
         "source": "closed_loop_auto_tune",
@@ -796,6 +1553,16 @@ def _closed_loop_extra_metadata(
         "direct_closed_loop_trial_results": direct_trial_results,
         "direct_closed_loop_finalists": direct_finalists,
         "direct_closed_loop_trial_count": len(direct_trial_results),
+        "stage_budgets": stage_budgets.to_dict(),
+        "tuning_stage_summary": list(stage_summaries),
+        "context_baseline": dict(context_baseline),
+        "best_passive_baseline": dict(best_passive.candidate_tune) if best_passive is not None else {},
+        "best_passive_score": best_passive.closed_loop_score if best_passive is not None else None,
+        "best_active_control_tune": dict(best_active.candidate_tune) if best_active is not None else {},
+        "best_active_control_score": best_active.closed_loop_score if best_active is not None else None,
+        "final_tune": dict(final_validation.candidate_tune),
+        "final_objective_score": final_validation.closed_loop_score,
+        "final_tuning_stage": final_validation.stage,
         "sensor_noise_profile": request.sensor_noise_profile,
         "sensor_noise_config": dict(request.sensor_noise_config),
         "sensor_noise_signature": noise_sig,
@@ -811,10 +1578,11 @@ def _closed_loop_extra_metadata(
         "route_attempt_policy": "one_attempt_per_candidate_trial",
         "max_route_attempts_per_trial": 1,
         "active_control_parameter_policy": (
-            "Active tracking tune search includes supported active-control prediction parameters and scores each "
-            "candidate in a real closed-loop CARLA route trial."
+            "Active tracking tune search includes supported active-control prediction parameters. "
+            "The staged tuner first builds a passive Q/model baseline, then uses actuator-aware bounds "
+            "before a narrow joint local fine-tune."
             if request.tracking_mode == TRACKING_ACTIVE
-            else "Passive tracking tune search excludes active-control prediction parameters and scores each candidate in passive closed-loop mode."
+            else "Passive mode builds and locally refines only the passive Q/model baseline; active-control tuning is skipped."
         ),
         "performance_mode": {
             "no_rendering_mode": True,
@@ -930,6 +1698,8 @@ def _create_direct_optuna_study(
     request: ClosedLoopAutoTuneRequest,
     params: list[dict[str, object]],
     base_tune: dict[str, object],
+    *,
+    enqueue_baseline: bool = True,
 ) -> object:
     optuna_module = offline_auto_tuner_module.optuna
     if strategy != "direct_closed_loop_optuna_tpe" or optuna_module is None or not params:
@@ -938,13 +1708,14 @@ def _create_direct_optuna_study(
         direction="minimize",
         sampler=optuna_module.samplers.TPESampler(seed=int(request.random_seed)),  # type: ignore[union-attr]
     )
-    study.enqueue_trial(
-        {
-            str(param.get("key")): _param_bound_or_base_value(param, base_tune)
-            for param in params
-            if str(param.get("key") or "")
-        }
-    )
+    if enqueue_baseline:
+        study.enqueue_trial(
+            {
+                str(param.get("key")): _param_bound_or_base_value(param, base_tune)
+                for param in params
+                if str(param.get("key") or "")
+            }
+        )
     return study
 
 
@@ -955,6 +1726,7 @@ def _direct_candidate_tune(
     optuna_trial: object,
     rng: random.Random,
     trial_index: int,
+    sample_first: bool = False,
 ) -> dict[str, object]:
     candidate = dict(base_tune)
     if not params:
@@ -969,7 +1741,7 @@ def _direct_candidate_tune(
             log = str(param.get("scale") or "").lower() == "log" and low > 0.0 and high > low
             candidate[key] = suggest_float(key, low, high, log=log)
         return candidate
-    if trial_index == 1:
+    if trial_index == 1 and not sample_first:
         return candidate
     for param in params:
         key = str(param.get("key") or "")
@@ -1012,6 +1784,9 @@ def _direct_auto_tune_trial_results(validations: list[ClosedLoopValidationResult
     for validation in validations:
         metrics = dict(validation.raw_metrics)
         metrics["closed_loop_score"] = validation.closed_loop_score
+        metrics["failure_class"] = validation.failure_class
+        metrics["tuning_stage"] = validation.stage
+        metrics["changed_parameters_summary"] = validation.changed_parameters_summary
         results.append(
             AutoTuneTrialResult(
                 trial_index=validation.finalist_rank,
@@ -1020,10 +1795,10 @@ def _direct_auto_tune_trial_results(validations: list[ClosedLoopValidationResult
                 metrics=metrics,
                 output_folder=validation.output_folder,
                 failed=not validation.route_completion_success,
-                failure_reason=validation.abort_reason,
-                candidate_id=f"direct_trial_{validation.finalist_rank:03d}",
-                candidate_type="direct_closed_loop",
-                stage="closed_loop_search",
+                failure_reason=validation.failure_class or validation.abort_reason,
+                candidate_id=f"{validation.stage or 'direct'}_trial_{validation.finalist_rank:03d}",
+                candidate_type=str(validation.raw_metrics.get("candidate_type") or "direct_closed_loop"),
+                stage=validation.stage or "closed_loop_search",
             )
         )
     return results
@@ -1178,11 +1953,14 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
         writer = csv.DictWriter(
             csv_file,
             fieldnames=(
+                "stage",
+                "stage_trial_index",
                 "finalist_rank",
                 "closed_loop_score",
                 "route_completion_success",
                 "route_aborted",
                 "timeout",
+                "failure_class",
                 "abort_reason",
                 "completion_time_s",
                 "eval_filtered_rmse_m",
@@ -1192,7 +1970,9 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
                 "position_nees_source",
                 "mean_position_nees",
                 "mean_position_nees_diagonal_approx",
+                "changed_parameters_summary",
                 "candidate_tune",
+                "changed_parameters",
                 "raw_metrics",
                 "output_folder",
             ),
@@ -1201,11 +1981,14 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
         for validation in validations:
             writer.writerow(
                 {
+                    "stage": validation.stage,
+                    "stage_trial_index": validation.stage_trial_index,
                     "finalist_rank": validation.finalist_rank,
                     "closed_loop_score": validation.closed_loop_score,
                     "route_completion_success": validation.route_completion_success,
                     "route_aborted": validation.route_aborted,
                     "timeout": validation.timeout,
+                    "failure_class": validation.failure_class,
                     "abort_reason": validation.abort_reason,
                     "completion_time_s": validation.completion_time_s,
                     "eval_filtered_rmse_m": validation.eval_filtered_rmse_m,
@@ -1215,7 +1998,9 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
                     "position_nees_source": validation.position_nees_source,
                     "mean_position_nees": validation.mean_position_nees,
                     "mean_position_nees_diagonal_approx": validation.mean_position_nees_diagonal_approx,
+                    "changed_parameters_summary": validation.changed_parameters_summary,
                     "candidate_tune": json.dumps(validation.candidate_tune, sort_keys=True),
+                    "changed_parameters": json.dumps(validation.changed_parameters, sort_keys=True),
                     "raw_metrics": json.dumps(validation.raw_metrics, sort_keys=True),
                     "output_folder": str(validation.output_folder) if validation.output_folder else "",
                 }

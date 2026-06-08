@@ -245,6 +245,113 @@ def test_closed_loop_autotuner_saves_active_config_separately(tmp_path: Path) ->
         raise AssertionError("active config did not preserve active logical output group")
 
 
+def test_closed_loop_autotuner_respects_staged_trial_budgets(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    runner = _FakeValidationRunner(
+        {
+            1: {"route_completion_success": True, "eval_filtered_rmse_m": 3.0},
+            2: {"route_completion_success": True, "eval_filtered_rmse_m": 2.0},
+            3: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0},
+        }
+    )
+    request = _with_stage_budgets(
+        _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_PASSIVE),
+        passive=2,
+        active=4,
+        joint=1,
+    )
+
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+
+    if len(runner.requests) != 3:
+        raise AssertionError("staged closed-loop tuner did not honor passive+joint trial budgets")
+    if [call.stage for call in runner.requests] != [
+        "stage0_context_baseline",
+        "stage1_passive_q_model",
+        "stage3_joint_local",
+    ]:
+        raise AssertionError("staged closed-loop tuner did not run expected passive stages")
+    budgets = config.get("stage_budgets") if isinstance(config.get("stage_budgets"), dict) else {}
+    if budgets.get("total_planned_trials") != 3 or config.get("direct_closed_loop_trial_count") != 3:
+        raise AssertionError("saved config did not preserve staged trial budget metadata")
+
+
+def test_closed_loop_autotuner_passive_mode_skips_active_control_stage(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    runner = _FakeValidationRunner({index: {"route_completion_success": True, "eval_filtered_rmse_m": float(index)} for index in range(1, 6)})
+    request = _with_stage_budgets(
+        _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_PASSIVE),
+        passive=2,
+        active=3,
+        joint=1,
+    )
+
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+    stages = [call.stage for call in runner.requests]
+    if "stage2_active_control" in stages:
+        raise AssertionError("passive closed-loop auto tune ran active-control tuning")
+    if any(call.tracking_mode != TRACKING_PASSIVE for call in runner.requests):
+        raise AssertionError("passive closed-loop auto tune used active tracking during staged trials")
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    budgets = config.get("stage_budgets") if isinstance(config.get("stage_budgets"), dict) else {}
+    if budgets.get("active_control_trials") != 0:
+        raise AssertionError("passive saved config did not mark active-control trials as skipped")
+
+
+def test_closed_loop_autotuner_active_mode_includes_active_control_stage(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    runner = _FakeValidationRunner({index: {"route_completion_success": True, "eval_filtered_rmse_m": float(index)} for index in range(1, 5)})
+    request = _with_stage_budgets(
+        _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_ACTIVE),
+        passive=1,
+        active=2,
+        joint=0,
+    )
+
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+    if [call.stage for call in runner.requests] != [
+        "stage0_context_baseline",
+        "stage2_active_control",
+        "stage2_active_control",
+    ]:
+        raise AssertionError("active closed-loop auto tune did not run active-control stage")
+    if [call.tracking_mode for call in runner.requests] != [TRACKING_PASSIVE, TRACKING_ACTIVE, TRACKING_ACTIVE]:
+        raise AssertionError("active staged auto tune did not use passive baseline before active tuning")
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    if not config.get("best_active_control_tune"):
+        raise AssertionError("active saved config did not store best active-control tune metadata")
+
+
+def test_closed_loop_autotuner_stores_failure_classes_in_trial_results(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    runner = _FakeValidationRunner(
+        {
+            1: {
+                "route_completion_success": False,
+                "route_aborted": True,
+                "abort_reason": "Vehicle stuck: speed 0.00 m/s, no route progress for 12.0s",
+                "eval_filtered_rmse_m": 1.0,
+            }
+        }
+    )
+    request = _with_stage_budgets(
+        _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_PASSIVE),
+        passive=1,
+        active=0,
+        joint=0,
+    )
+
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+    validation = result.validation_results[0]
+    if validation.failure_class != "vehicle_stuck_no_progress":
+        raise AssertionError(f"failure class was not stored on validation result: {validation.failure_class}")
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    direct_results = config.get("direct_closed_loop_trial_results") or []
+    if not direct_results or direct_results[0].get("failure_class") != "vehicle_stuck_no_progress":
+        raise AssertionError("saved direct trial result did not include failure class")
+
+
 def test_closed_loop_validation_route_runner_uses_compact_route_artifact_folders(tmp_path: Path) -> None:
     runner = RouteTestRunner.__new__(RouteTestRunner)
     runner._run_folder = tmp_path / "run"
@@ -488,6 +595,26 @@ def _request(
         finalist_count=finalist_count,
         strategy=strategy,
         output_root=str(tmp_path / "benchmark_results"),
+    )
+
+
+def _with_stage_budgets(
+    request: ClosedLoopAutoTuneRequest,
+    *,
+    passive: int,
+    active: int,
+    joint: int,
+) -> ClosedLoopAutoTuneRequest:
+    return ClosedLoopAutoTuneRequest(
+        **{
+            **request.to_dict(),
+            "offline_log_paths": request.offline_log_paths,
+            "validation_routes": request.validation_routes,
+            "trial_count": passive + active + joint,
+            "passive_model_trials": passive,
+            "active_control_trials": active,
+            "joint_fine_tune_trials": joint,
+        }
     )
 
 
