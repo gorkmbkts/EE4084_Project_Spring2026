@@ -352,6 +352,175 @@ def test_closed_loop_autotuner_stores_failure_classes_in_trial_results(tmp_path:
         raise AssertionError("saved direct trial result did not include failure class")
 
 
+def test_adaptive_search_probes_one_family_and_protects_best_baseline(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    runner = _FakeValidationRunner(
+        {
+            1: {"route_completion_success": True, "eval_filtered_rmse_m": 0.5},
+            2: {"route_completion_success": True, "eval_filtered_rmse_m": 4.0},
+            3: {"route_completion_success": True, "eval_filtered_rmse_m": 4.5},
+            4: {"route_completion_success": True, "eval_filtered_rmse_m": 5.0},
+            5: {"route_completion_success": True, "eval_filtered_rmse_m": 5.5},
+        }
+    )
+    request = _with_stage_budgets(
+        _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_PASSIVE, strategy="random_plus_coordinate_refinement"),
+        passive=5,
+        active=0,
+        joint=0,
+    )
+
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+    for trial_request in runner.requests[1:]:
+        if len(trial_request.affected_families) > 1:
+            raise AssertionError("early adaptive trial changed more than one parameter family")
+        families = {
+            change.get("parameter_family")
+            for change in trial_request.changed_parameters.values()
+            if isinstance(change, dict)
+        }
+        if families != set(trial_request.affected_families):
+            raise AssertionError("trial changed-parameter attribution did not match selected family")
+
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    history = config.get("bound_adaptation_history") or []
+    if not any("protected current best" in " ".join(item.get("decisions") or []) for item in history):
+        raise AssertionError("repeated degradation did not tighten bounds around the protected baseline")
+    if config.get("final_objective_score") != config.get("baseline_objective_score"):
+        raise AssertionError("degraded adaptive trials displaced the protected context baseline")
+    direct_results = config.get("direct_closed_loop_trial_results") or []
+    attributed = next((item for item in direct_results if item.get("parameter_attribution")), None)
+    if attributed is None:
+        raise AssertionError("adaptive trial did not save per-parameter attribution records")
+    record = attributed["parameter_attribution"][0]
+    required = {
+        "baseline_value",
+        "trial_value",
+        "absolute_change",
+        "relative_change_percent",
+        "parameter_family",
+        "stage",
+        "score",
+        "rmse_m",
+        "nis",
+        "nees",
+        "mean_cte_m",
+        "max_cte_m",
+        "failure_class",
+        "route_completion_success",
+    }
+    if not required.issubset(record):
+        raise AssertionError(f"parameter attribution record is incomplete: {record}")
+
+
+def test_high_nees_biases_process_uncertainty_upward(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    runner = _FakeValidationRunner(
+        {
+            1: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0, "driving_mean_position_nees": 2.0},
+            2: {"route_completion_success": True, "eval_filtered_rmse_m": 2.0, "driving_mean_position_nees": 20.0},
+            3: {"route_completion_success": True, "eval_filtered_rmse_m": 1.5, "driving_mean_position_nees": 2.0},
+        }
+    )
+    request = _with_stage_budgets(
+        _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_PASSIVE, strategy="random_plus_coordinate_refinement"),
+        passive=3,
+        active=0,
+        joint=0,
+    )
+
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+    if runner.requests[2].affected_families != ("Q_acceleration_jerk",):
+        raise AssertionError("adaptive family scheduler did not continue the available process-Q family")
+    process_change = runner.requests[2].changed_parameters.get("process_jerk_stddev_mps3")
+    if not isinstance(process_change, dict) or float(process_change.get("delta") or 0.0) <= 0.0:
+        raise AssertionError("high NEES did not bias the next process-noise probe upward")
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    history_text = json.dumps(config.get("bound_adaptation_history") or [])
+    if "high NEES" not in history_text or "biased" not in history_text:
+        raise AssertionError("high-NEES adaptation decision was not saved")
+
+
+def test_control_instability_shrinks_active_parameter_families(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    runner = _FakeValidationRunner(
+        {
+            1: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0},
+            2: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0},
+            3: {
+                "route_completion_success": False,
+                "route_aborted": True,
+                "abort_reason": "Control instability and steering oscillation",
+                "control_instability_score": 5.0,
+            },
+            4: {"route_completion_success": True, "eval_filtered_rmse_m": 1.2},
+        }
+    )
+    request = _with_stage_budgets(
+        _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_ACTIVE, strategy="random_plus_coordinate_refinement"),
+        passive=1,
+        active=3,
+        joint=0,
+    )
+
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    diagnostics = config.get("parameter_family_diagnostics") or {}
+    active_scales = [
+        float(item.get("final_bound_scale"))
+        for family, item in diagnostics.items()
+        if family.startswith("active_") and isinstance(item, dict) and item.get("final_bound_scale") is not None
+    ]
+    if not active_scales or max(active_scales) >= 0.5:
+        raise AssertionError("control instability did not shrink active-control family bounds")
+    if "control instability: shrunk all active-control families" not in json.dumps(config.get("bound_adaptation_history") or []):
+        raise AssertionError("active-control shrink decision was not recorded")
+
+
+def test_context_baseline_does_not_use_route_geometry(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    base_request = _with_stage_budgets(
+        _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_PASSIVE),
+        passive=1,
+        active=0,
+        joint=0,
+    )
+    route_a = ClosedLoopValidationRoute(
+        "route_a",
+        "Town01",
+        "route_a",
+        route_data={"start": {"x": 0.0, "y": 0.0}, "goal": {"x": 10.0, "y": 0.0}},
+    )
+    route_b = ClosedLoopValidationRoute(
+        "route_b",
+        "Town01",
+        "route_b",
+        route_data={
+            "start": {"x": -100.0, "y": 50.0},
+            "goal": {"x": 900.0, "y": -700.0},
+            "waypoints": [{"x": index, "y": index * index} for index in range(20)],
+        },
+    )
+    request_a = ClosedLoopAutoTuneRequest(
+        **{**base_request.to_dict(), "offline_log_paths": base_request.offline_log_paths, "validation_routes": (route_a,)}
+    )
+    request_b = ClosedLoopAutoTuneRequest(
+        **{**base_request.to_dict(), "offline_log_paths": base_request.offline_log_paths, "validation_routes": (route_b,)}
+    )
+    runner_a = _FakeValidationRunner()
+    runner_b = _FakeValidationRunner()
+
+    result_a = ClosedLoopBenchmarkAutoTuner(validation_runner=runner_a).run(request_a)
+    result_b = ClosedLoopBenchmarkAutoTuner(validation_runner=runner_b).run(request_b)
+
+    if runner_a.requests[0].finalist.candidate_tune != runner_b.requests[0].finalist.candidate_tune:
+        raise AssertionError("context baseline changed after only route geometry changed")
+    config = json.loads(result_a.saved_config_path.read_text(encoding="utf-8"))
+    policy = config.get("adaptive_search_policy") if isinstance(config.get("adaptive_search_policy"), dict) else {}
+    if policy.get("route_geometry_preanalysis") is not False:
+        raise AssertionError("saved adaptive policy did not explicitly disable route geometry pre-analysis")
+
+
 def test_closed_loop_validation_route_runner_uses_compact_route_artifact_folders(tmp_path: Path) -> None:
     runner = RouteTestRunner.__new__(RouteTestRunner)
     runner._run_folder = tmp_path / "run"

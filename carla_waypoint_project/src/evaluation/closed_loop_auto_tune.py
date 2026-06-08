@@ -89,6 +89,71 @@ class ClosedLoopStageBudgets:
         }
 
 
+@dataclass
+class ParameterFamilyStats:
+    trials: int = 0
+    successes: int = 0
+    failures: int = 0
+    improvements: int = 0
+    degradations: int = 0
+    stable_trials: int = 0
+    high_nis_count: int = 0
+    high_nees_count: int = 0
+    large_cte_count: int = 0
+    upward_improvements: int = 0
+    downward_improvements: int = 0
+    upward_degradations: int = 0
+    downward_degradations: int = 0
+    score_delta_sum: float = 0.0
+    failure_classes: dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class AdaptiveStageState:
+    stage: str
+    baseline_tune: dict[str, object]
+    params: list[dict[str, object]]
+    best_tune: dict[str, object]
+    best_score: Optional[float]
+    baseline_score: Optional[float]
+    family_by_key: dict[str, str]
+    initial_bounds: dict[str, tuple[float, float]]
+    family_scales: dict[str, float]
+    family_direction_bias: dict[str, float]
+    family_stats: dict[str, ParameterFamilyStats]
+    parameter_attempts: dict[str, int]
+    adaptation_history: list[dict[str, object]]
+    non_improving_trials: int = 0
+    completed_trials: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "stage": self.stage,
+            "baseline_score": self.baseline_score,
+            "best_score": self.best_score,
+            "completed_trials": self.completed_trials,
+            "non_improving_trials": self.non_improving_trials,
+            "family_scales": dict(self.family_scales),
+            "family_direction_bias": dict(self.family_direction_bias),
+            "parameter_family_stats": {
+                family: stats.to_dict()
+                for family, stats in sorted(self.family_stats.items())
+            },
+            "adaptation_history": list(self.adaptation_history),
+        }
+
+
+@dataclass(frozen=True)
+class AdaptiveCandidatePlan:
+    tune: dict[str, object]
+    anchor_tune: dict[str, object]
+    affected_families: tuple[str, ...]
+    candidate_rationale: str
+
+
 @dataclass(frozen=True)
 class PendingClosedLoopAutoTuneSession:
     selected_filter: str
@@ -294,6 +359,8 @@ class ClosedLoopValidationRequest:
     stage_trial_total: int = 0
     changed_parameters: dict[str, object] = field(default_factory=dict)
     changed_parameters_summary: str = ""
+    affected_families: tuple[str, ...] = ()
+    adaptation_decision: str = ""
 
 
 @dataclass(frozen=True)
@@ -322,6 +389,10 @@ class ClosedLoopValidationResult:
     failure_class: str = ""
     changed_parameters: dict[str, object] = field(default_factory=dict)
     changed_parameters_summary: str = ""
+    affected_families: tuple[str, ...] = ()
+    adaptation_decision: str = ""
+    outcome_class: str = ""
+    parameter_attribution: tuple[dict[str, object], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -349,6 +420,10 @@ class ClosedLoopValidationResult:
             "failure_class": self.failure_class,
             "changed_parameters": dict(self.changed_parameters),
             "changed_parameters_summary": self.changed_parameters_summary,
+            "affected_families": list(self.affected_families),
+            "adaptation_decision": self.adaptation_decision,
+            "outcome_class": self.outcome_class,
+            "parameter_attribution": [dict(item) for item in self.parameter_attribution],
         }
 
 
@@ -478,6 +553,7 @@ class ClosedLoopBenchmarkAutoTuner:
         failure_counts: dict[str, int] = {}
         seen_candidates: set[str] = set()
         stage_summaries: list[dict[str, object]] = []
+        adaptive_stage_states: list[AdaptiveStageState] = []
         best_score_so_far: Optional[float] = None
         global_trial_index = 0
 
@@ -490,6 +566,7 @@ class ClosedLoopBenchmarkAutoTuner:
             stage_baseline: dict[str, object],
             params: list[dict[str, object]],
             evaluate_baseline_first: bool,
+            protected_result: Optional[ClosedLoopValidationResult] = None,
         ) -> list[ClosedLoopValidationResult]:
             nonlocal best_score_so_far, global_trial_index
             if stage_trial_count <= 0:
@@ -511,52 +588,42 @@ class ClosedLoopBenchmarkAutoTuner:
                 },
             )
             stage_results: list[ClosedLoopValidationResult] = []
-            optuna_study = _create_direct_optuna_study(
-                strategy,
-                request,
-                params,
-                stage_baseline,
-                enqueue_baseline=False,
+            adaptive_state = _adaptive_stage_state(
+                stage=stage,
+                stage_baseline=stage_baseline,
+                params=params,
+                protected_result=protected_result,
             )
+            adaptive_stage_states.append(adaptive_state)
             for stage_trial_index in range(1, stage_trial_count + 1):
                 if stop_requested is not None and stop_requested():
                     break
                 global_trial_index += 1
                 baseline_trial = evaluate_baseline_first and stage_trial_index == 1
-                optuna_trial = None
-                if not baseline_trial and optuna_study is not None and params:
-                    optuna_trial = optuna_study.ask()
-                candidate_tune = (
-                    dict(stage_baseline)
-                    if baseline_trial
-                    else _direct_candidate_tune(
-                        base_tune=stage_baseline,
-                        params=params,
-                        optuna_trial=optuna_trial,
-                        rng=rng,
-                        trial_index=stage_trial_index,
-                        sample_first=True,
-                    )
-                )
-                candidate_tune = _failure_aware_candidate(
-                    candidate_tune,
-                    stage_baseline,
-                    params,
-                    stage,
-                    failure_counts,
+                plan = _adaptive_candidate_plan(
+                    adaptive_state,
+                    rng,
+                    baseline_trial=baseline_trial,
+                    failure_counts=failure_counts,
                 )
                 candidate_tune = _ensure_unique_candidate(
-                    candidate_tune,
-                    stage_baseline,
-                    params,
+                    plan.tune,
+                    plan.anchor_tune,
+                    [
+                        param
+                        for param in params
+                        if adaptive_state.family_by_key.get(str(param.get("key") or "")) in plan.affected_families
+                    ],
                     stage_tracking_mode,
                     seen_candidates,
                     rng,
                     allow_existing=baseline_trial,
                 )
-                changed_parameters = _changed_parameters(context_baseline, candidate_tune)
+                if candidate_tune is not plan.tune:
+                    plan = replace(plan, tune=candidate_tune)
+                changed_parameters = _changed_parameters(plan.anchor_tune, candidate_tune, adaptive_state.family_by_key)
                 changed_summary = _changed_parameters_summary(changed_parameters)
-                candidate_type = "context_baseline" if stage == CONTEXT_BASELINE_STAGE else strategy
+                candidate_type = "context_baseline" if stage == CONTEXT_BASELINE_STAGE else "adaptive_family_local"
                 finalist = ClosedLoopFinalist(
                     rank=global_trial_index,
                     candidate_tune=candidate_tune,
@@ -568,6 +635,8 @@ class ClosedLoopBenchmarkAutoTuner:
                         "actuator_search_policy": _actuator_search_policy(request.actuator_realism_config),
                         "changed_parameters": changed_parameters,
                         "changed_parameters_summary": changed_summary,
+                        "affected_families": list(plan.affected_families),
+                        "candidate_rationale": plan.candidate_rationale,
                     },
                     trial_index=global_trial_index,
                     source_output_folder=None,
@@ -586,6 +655,8 @@ class ClosedLoopBenchmarkAutoTuner:
                     stage_trial_total=stage_trial_count,
                     changed_parameters=changed_parameters,
                     changed_parameters_summary=changed_summary,
+                    affected_families=plan.affected_families,
+                    adaptation_decision=plan.candidate_rationale,
                 )
                 _emit(
                     progress_callback,
@@ -600,6 +671,8 @@ class ClosedLoopBenchmarkAutoTuner:
                         "candidate_tune": dict(candidate_tune),
                         "changed_parameters": changed_parameters,
                         "changed_parameters_summary": changed_summary,
+                        "affected_families": list(plan.affected_families),
+                        "adaptation_decision": plan.candidate_rationale,
                         "route_name": validation_route.name,
                         "tracking_mode": stage_tracking_mode,
                         "actuator_realism_profile": request.actuator_realism_profile,
@@ -608,6 +681,21 @@ class ClosedLoopBenchmarkAutoTuner:
                 )
                 runner_result = self._run_validation(validation_request)
                 validation = _validation_result_from_runner(runner_result, validation_request)
+                outcome_class = _trial_outcome_class(validation, adaptive_state.best_score)
+                adaptation_decisions = _update_adaptive_stage_state(
+                    adaptive_state,
+                    validation,
+                    changed_parameters,
+                    outcome_class,
+                    plan.affected_families,
+                )
+                adaptation_decision = "; ".join(adaptation_decisions) if adaptation_decisions else plan.candidate_rationale
+                parameter_attribution = _parameter_attribution_records(
+                    changed_parameters,
+                    validation,
+                    outcome_class,
+                    adaptation_decision,
+                )
                 raw_metrics = dict(validation.raw_metrics)
                 raw_metrics.update(
                     {
@@ -617,6 +705,10 @@ class ClosedLoopBenchmarkAutoTuner:
                         "failure_class": validation.failure_class,
                         "changed_parameters": changed_parameters,
                         "changed_parameters_summary": changed_summary,
+                        "affected_families": list(plan.affected_families),
+                        "adaptation_decision": adaptation_decision,
+                        "outcome_class": outcome_class,
+                        "parameter_attribution": [dict(item) for item in parameter_attribution],
                         "candidate_type": candidate_type,
                     }
                 )
@@ -627,6 +719,10 @@ class ClosedLoopBenchmarkAutoTuner:
                     stage_trial_total=stage_trial_count,
                     changed_parameters=changed_parameters,
                     changed_parameters_summary=changed_summary,
+                    affected_families=plan.affected_families,
+                    adaptation_decision=adaptation_decision,
+                    outcome_class=outcome_class,
+                    parameter_attribution=parameter_attribution,
                     raw_metrics=raw_metrics,
                 )
                 validation_results.append(validation)
@@ -634,8 +730,6 @@ class ClosedLoopBenchmarkAutoTuner:
                 failure_class = validation.failure_class
                 if failure_class:
                     failure_counts[failure_class] = failure_counts.get(failure_class, 0) + 1
-                if optuna_study is not None and optuna_trial is not None:
-                    optuna_study.tell(optuna_trial, validation.closed_loop_score)
                 if best_score_so_far is None or validation.closed_loop_score < best_score_so_far:
                     best_score_so_far = float(validation.closed_loop_score)
                     _emit(
@@ -649,6 +743,8 @@ class ClosedLoopBenchmarkAutoTuner:
                             "metrics": dict(validation.raw_metrics),
                             "candidate_tune": dict(candidate_tune),
                             "changed_parameters_summary": changed_summary,
+                            "affected_families": list(plan.affected_families),
+                            "adaptation_decision": adaptation_decision,
                         },
                     )
                 write_json(run_folder / f"trial_{global_trial_index:03d}.json", validation.to_dict())
@@ -669,6 +765,9 @@ class ClosedLoopBenchmarkAutoTuner:
                         "failure_reason": validation.abort_reason,
                         "changed_parameters": changed_parameters,
                         "changed_parameters_summary": changed_summary,
+                        "affected_families": list(plan.affected_families),
+                        "adaptation_decision": adaptation_decision,
+                        "outcome_class": outcome_class,
                         "metrics": dict(validation.raw_metrics),
                         "route_completion_success": validation.route_completion_success,
                         "tracking_mode": stage_tracking_mode,
@@ -684,9 +783,20 @@ class ClosedLoopBenchmarkAutoTuner:
                         "tracking_mode": stage_tracking_mode,
                         "planned_trials": stage_trial_count,
                         "completed_trials": len(stage_results),
-                        "best_trial_index": stage_best.finalist_rank,
-                        "best_score": stage_best.closed_loop_score,
+                        "baseline_score": adaptive_state.baseline_score,
+                        "best_trial_index": (
+                            stage_best.finalist_rank
+                            if adaptive_state.best_score == stage_best.closed_loop_score
+                            else protected_result.finalist_rank if protected_result is not None else stage_best.finalist_rank
+                        ),
+                        "best_score": adaptive_state.best_score,
+                        "stage_improvement": (
+                            adaptive_state.baseline_score - adaptive_state.best_score
+                            if adaptive_state.baseline_score is not None and adaptive_state.best_score is not None
+                            else None
+                        ),
                         "failure_classes": _failure_class_counts(stage_results),
+                        "adaptive_state": adaptive_state.to_dict(),
                     }
                 )
             return stage_results
@@ -699,6 +809,7 @@ class ClosedLoopBenchmarkAutoTuner:
             stage_baseline=context_baseline,
             params=[],
             evaluate_baseline_first=True,
+            protected_result=None,
         )
         passive_search_results = run_stage(
             stage=PASSIVE_MODEL_STAGE,
@@ -708,6 +819,7 @@ class ClosedLoopBenchmarkAutoTuner:
             stage_baseline=context_baseline,
             params=passive_params,
             evaluate_baseline_first=False,
+            protected_result=context_results[0] if context_results else None,
         )
         passive_results = context_results + passive_search_results
         best_passive = min(passive_results, key=lambda item: item.closed_loop_score) if passive_results else None
@@ -728,6 +840,7 @@ class ClosedLoopBenchmarkAutoTuner:
                 stage_baseline=active_baseline,
                 params=active_params,
                 evaluate_baseline_first=True,
+                protected_result=None,
             )
             if active_results:
                 best_active = min(active_results, key=lambda item: item.closed_loop_score)
@@ -750,6 +863,7 @@ class ClosedLoopBenchmarkAutoTuner:
                 stage_baseline=stage3_baseline_result.candidate_tune,
                 params=joint_params,
                 evaluate_baseline_first=False,
+                protected_result=stage3_baseline_result,
             )
         if not validation_results:
             raise ValueError("No closed-loop auto-tune trials completed.")
@@ -838,6 +952,8 @@ class ClosedLoopBenchmarkAutoTuner:
                 best_passive=best_passive,
                 best_active=best_active,
                 final_validation=best_validation,
+                adaptive_stage_states=adaptive_stage_states,
+                baseline_validation=context_results[0] if context_results else None,
             ),
         )
         _ensure_backend_config_compatible(config, request)
@@ -1127,6 +1243,8 @@ def _validation_result_from_runner(result: object, request: ClosedLoopValidation
         failure_class=str(raw.get("failure_class") or ""),
         changed_parameters=dict(request.changed_parameters),
         changed_parameters_summary=request.changed_parameters_summary,
+        affected_families=tuple(request.affected_families),
+        adaptation_decision=request.adaptation_decision,
     )
 
 
@@ -1209,6 +1327,566 @@ def _clamp_tune_to_specs(tune: dict[str, object], tune_specs: tuple[object, ...]
         if spec is not None and hasattr(spec, "clamp"):
             result[key] = float(spec.clamp(value))
     return result
+
+
+def _adaptive_stage_state(
+    *,
+    stage: str,
+    stage_baseline: dict[str, object],
+    params: list[dict[str, object]],
+    protected_result: Optional[ClosedLoopValidationResult],
+) -> AdaptiveStageState:
+    family_by_key: dict[str, str] = {}
+    initial_bounds: dict[str, tuple[float, float]] = {}
+    for param in params:
+        key = str(param.get("key") or "")
+        if not key:
+            continue
+        family_by_key[key] = _parameter_family(key)
+        initial_bounds[key] = _param_bounds(param, stage_baseline.get(key))
+    families = sorted(set(family_by_key.values()))
+    initial_scale = {
+        PASSIVE_MODEL_STAGE: 0.55,
+        ACTIVE_CONTROL_STAGE: 0.50,
+        JOINT_FINE_TUNE_STAGE: 0.32,
+    }.get(stage, 0.0)
+    protected_tune = dict(protected_result.candidate_tune) if protected_result is not None else dict(stage_baseline)
+    protected_score = float(protected_result.closed_loop_score) if protected_result is not None else None
+    return AdaptiveStageState(
+        stage=stage,
+        baseline_tune=dict(stage_baseline),
+        params=[dict(param) for param in params],
+        best_tune=protected_tune,
+        best_score=protected_score,
+        baseline_score=protected_score,
+        family_by_key=family_by_key,
+        initial_bounds=initial_bounds,
+        family_scales={family: initial_scale for family in families},
+        family_direction_bias={family: 0.0 for family in families},
+        family_stats={family: ParameterFamilyStats() for family in families},
+        parameter_attempts={key: 0 for key in family_by_key},
+        adaptation_history=[],
+    )
+
+
+def _adaptive_candidate_plan(
+    state: AdaptiveStageState,
+    rng: random.Random,
+    *,
+    baseline_trial: bool,
+    failure_counts: dict[str, int],
+) -> AdaptiveCandidatePlan:
+    if baseline_trial or not state.params:
+        return AdaptiveCandidatePlan(
+            tune=dict(state.baseline_tune),
+            anchor_tune=dict(state.baseline_tune),
+            affected_families=(),
+            candidate_rationale="protected context baseline",
+        )
+    family_params: dict[str, list[dict[str, object]]] = {}
+    for param in state.params:
+        key = str(param.get("key") or "")
+        family = state.family_by_key.get(key)
+        if key and family:
+            family_params.setdefault(family, []).append(param)
+    if not family_params:
+        return AdaptiveCandidatePlan(
+            tune=dict(state.best_tune),
+            anchor_tune=dict(state.best_tune),
+            affected_families=(),
+            candidate_rationale="no supported adaptive parameters",
+        )
+
+    family = _select_adaptive_family(state, family_params)
+    candidates = sorted(
+        family_params[family],
+        key=lambda param: (
+            state.parameter_attempts.get(str(param.get("key") or ""), 0),
+            str(param.get("key") or ""),
+        ),
+    )
+    chosen = candidates[:1]
+    stats = state.family_stats[family]
+    if stats.improvements >= 2 and stats.failures == 0 and len(candidates) > 1:
+        chosen = candidates[:2]
+    anchor = dict(state.best_tune)
+    tune = dict(anchor)
+    direction_bias = state.family_direction_bias.get(family, 0.0)
+    for param in chosen:
+        key = str(param.get("key") or "")
+        direction = _adaptive_direction(direction_bias, state.parameter_attempts.get(key, 0), rng)
+        tune[key] = _adaptive_sample_value(state, param, anchor.get(key), family, direction, rng)
+        state.parameter_attempts[key] = state.parameter_attempts.get(key, 0) + 1
+    scale = state.family_scales.get(family, 0.0)
+    direction_text = "upward" if direction_bias > 0.20 else "downward" if direction_bias < -0.20 else "two-sided"
+    protection = " protected-best local" if state.non_improving_trials >= 3 else ""
+    failure_note = ""
+    if failure_counts.get("control_instability", 0) and family.startswith("active_"):
+        failure_note = " after control failures"
+    return AdaptiveCandidatePlan(
+        tune=tune,
+        anchor_tune=anchor,
+        affected_families=(family,),
+        candidate_rationale=(
+            f"probe {family} near current best; {direction_text} bias; "
+            f"bound scale {scale:.2f}{protection}{failure_note}"
+        ),
+    )
+
+
+def _select_adaptive_family(
+    state: AdaptiveStageState,
+    family_params: dict[str, list[dict[str, object]]],
+) -> str:
+    families = sorted(family_params)
+    if state.non_improving_trials >= 3:
+        improving = [
+            family
+            for family in families
+            if state.family_stats[family].improvements > 0
+        ]
+        if improving:
+            return min(
+                improving,
+                key=lambda family: (
+                    -state.family_stats[family].improvements,
+                    state.family_stats[family].failures,
+                    state.family_stats[family].trials,
+                    family,
+                ),
+            )
+    return min(
+        families,
+        key=lambda family: (
+            state.family_stats[family].trials,
+            state.family_stats[family].failures + state.family_stats[family].degradations
+            - state.family_stats[family].improvements,
+            -state.family_scales.get(family, 0.0),
+            family,
+        ),
+    )
+
+
+def _adaptive_direction(bias: float, attempt_count: int, rng: random.Random) -> int:
+    if bias > 0.20:
+        return 1 if rng.random() < 0.80 else -1
+    if bias < -0.20:
+        return -1 if rng.random() < 0.80 else 1
+    return 1 if attempt_count % 2 == 0 else -1
+
+
+def _adaptive_sample_value(
+    state: AdaptiveStageState,
+    param: dict[str, object],
+    anchor_value: object,
+    family: str,
+    direction: int,
+    rng: random.Random,
+) -> float:
+    key = str(param.get("key") or "")
+    anchor = _optional_float(anchor_value)
+    if anchor is None:
+        low, high = state.initial_bounds[key]
+        anchor = low + 0.5 * (high - low)
+    low, high = _adaptive_effective_bounds(state, key, anchor, family)
+    target = high if direction > 0 else low
+    if abs(target - anchor) <= 1.0e-12:
+        target = low if direction > 0 else high
+    fraction = rng.uniform(0.25, 0.62)
+    if str(param.get("scale") or "").lower() == "log" and anchor > 0.0 and target > 0.0:
+        value = math.exp(math.log(anchor) + fraction * (math.log(target) - math.log(anchor)))
+    else:
+        value = anchor + fraction * (target - anchor)
+    if abs(value - anchor) <= max(1.0e-9, abs(anchor) * 1.0e-6):
+        value = target
+    return max(low, min(high, value))
+
+
+def _adaptive_effective_bounds(
+    state: AdaptiveStageState,
+    key: str,
+    anchor: float,
+    family: str,
+) -> tuple[float, float]:
+    initial_low, initial_high = state.initial_bounds[key]
+    scale = max(0.06, min(1.0, state.family_scales.get(family, 0.5)))
+    if anchor > 0.0 and initial_low > 0.0 and initial_high > 0.0:
+        low = math.exp(math.log(anchor) + scale * (math.log(initial_low) - math.log(anchor)))
+        high = math.exp(math.log(anchor) + scale * (math.log(initial_high) - math.log(anchor)))
+    else:
+        low = anchor + scale * (initial_low - anchor)
+        high = anchor + scale * (initial_high - anchor)
+    low = max(initial_low, min(initial_high, low))
+    high = max(initial_low, min(initial_high, high))
+    if high <= low:
+        return _expand_degenerate_bounds(anchor, initial_low, initial_high)
+    return low, high
+
+
+def _trial_outcome_class(
+    validation: ClosedLoopValidationResult,
+    reference_score: Optional[float],
+) -> str:
+    if not validation.route_completion_success:
+        return "failed"
+    if reference_score is None:
+        return "baseline"
+    tolerance = max(0.02, abs(reference_score) * 0.01)
+    if validation.closed_loop_score < reference_score - tolerance:
+        return "improved"
+    if validation.closed_loop_score > reference_score + max(0.10, abs(reference_score) * 0.05):
+        return "degraded"
+    return "stable"
+
+
+def _update_adaptive_stage_state(
+    state: AdaptiveStageState,
+    validation: ClosedLoopValidationResult,
+    changed_parameters: dict[str, object],
+    outcome_class: str,
+    affected_families: tuple[str, ...],
+) -> list[str]:
+    state.completed_trials += 1
+    reference_score = state.best_score
+    if state.baseline_score is None:
+        state.baseline_score = validation.closed_loop_score
+    diagnostics = _trial_diagnostic_flags(validation)
+    decisions: list[str] = []
+    if not affected_families:
+        if state.best_score is None or validation.closed_loop_score < state.best_score:
+            state.best_score = validation.closed_loop_score
+            state.best_tune = dict(validation.candidate_tune)
+        state.adaptation_history.append(
+            {
+                "trial_index": validation.finalist_rank,
+                "outcome_class": outcome_class,
+                "affected_families": [],
+                "decisions": ["protected baseline evaluated"],
+                "diagnostics": diagnostics,
+            }
+        )
+        return ["protected baseline evaluated"]
+
+    for family in affected_families:
+        stats = state.family_stats.setdefault(family, ParameterFamilyStats())
+        stats.trials += 1
+        direction = _family_change_direction(changed_parameters, family)
+        if validation.route_completion_success:
+            stats.successes += 1
+        else:
+            stats.failures += 1
+            if validation.failure_class:
+                stats.failure_classes[validation.failure_class] = stats.failure_classes.get(validation.failure_class, 0) + 1
+        if reference_score is not None:
+            stats.score_delta_sum += validation.closed_loop_score - reference_score
+        if diagnostics["high_nis"]:
+            stats.high_nis_count += 1
+        if diagnostics["high_nees"]:
+            stats.high_nees_count += 1
+        if diagnostics["large_cte"]:
+            stats.large_cte_count += 1
+
+        if outcome_class == "improved":
+            stats.improvements += 1
+            state.family_direction_bias[family] = _clamp_bias(
+                state.family_direction_bias.get(family, 0.0) + 0.35 * direction
+            )
+            if direction > 0:
+                stats.upward_improvements += 1
+            elif direction < 0:
+                stats.downward_improvements += 1
+            decisions.append(f"biased {family} {'upward' if direction > 0 else 'downward' if direction < 0 else 'locally'}")
+            if stats.improvements >= 2 and stats.failures == 0:
+                old_scale = state.family_scales.get(family, 0.5)
+                state.family_scales[family] = min(1.0, old_scale * 1.12)
+                if state.family_scales[family] > old_scale:
+                    decisions.append(f"expanded {family} bounds after repeated stable improvements")
+        elif outcome_class == "stable":
+            stats.stable_trials += 1
+        else:
+            stats.degradations += 1
+            if direction > 0:
+                stats.upward_degradations += 1
+            elif direction < 0:
+                stats.downward_degradations += 1
+            shrink = 0.52 if outcome_class == "failed" else 0.72
+            if validation.failure_class == "control_instability" and family.startswith("active_"):
+                shrink = 0.42
+            state.family_scales[family] = max(0.06, state.family_scales.get(family, 0.5) * shrink)
+            state.family_direction_bias[family] = _clamp_bias(
+                state.family_direction_bias.get(family, 0.0) - 0.30 * direction
+            )
+            decisions.append(f"shrunk {family} bounds after {outcome_class}")
+
+    if outcome_class == "improved":
+        state.best_score = validation.closed_loop_score
+        state.best_tune = dict(validation.candidate_tune)
+        state.non_improving_trials = 0
+    else:
+        state.non_improving_trials += 1
+
+    decisions.extend(_diagnostic_adaptation_decisions(state, validation, diagnostics, changed_parameters))
+    if state.non_improving_trials >= 3 and state.non_improving_trials % 3 == 0:
+        for family in state.family_scales:
+            state.family_scales[family] = max(0.06, state.family_scales[family] * 0.70)
+        decisions.append("protected current best and tightened all stage bounds")
+
+    decisions = _dedupe_text(decisions)
+    state.adaptation_history.append(
+        {
+            "trial_index": validation.finalist_rank,
+            "score": validation.closed_loop_score,
+            "reference_best_score": reference_score,
+            "outcome_class": outcome_class,
+            "failure_class": validation.failure_class,
+            "affected_families": list(affected_families),
+            "decisions": decisions,
+            "diagnostics": diagnostics,
+            "family_scales_after": dict(state.family_scales),
+            "family_direction_bias_after": dict(state.family_direction_bias),
+        }
+    )
+    return decisions
+
+
+def _diagnostic_adaptation_decisions(
+    state: AdaptiveStageState,
+    validation: ClosedLoopValidationResult,
+    diagnostics: dict[str, object],
+    changed_parameters: dict[str, object],
+) -> list[str]:
+    decisions: list[str] = []
+    if diagnostics.get("high_nees"):
+        targets = _existing_families(
+            state,
+            {"Q_position", "Q_acceleration_jerk", "Q_yaw", "Q_process_general", "covariance_initialization"},
+        )
+        for family in targets:
+            state.family_direction_bias[family] = max(
+                0.35,
+                _clamp_bias(state.family_direction_bias.get(family, 0.0) + 0.25),
+            )
+        if targets:
+            decisions.append(f"high NEES: biased {', '.join(targets)} upward")
+    if diagnostics.get("high_nis"):
+        targets = _existing_families(state, {"R_GNSS_effective", "R_IMU_effective"})
+        for family in targets:
+            state.family_direction_bias[family] = max(
+                0.30,
+                _clamp_bias(state.family_direction_bias.get(family, 0.0) + 0.20),
+            )
+        if targets:
+            decisions.append(f"high NIS: avoided lower measurement uncertainty and biased {', '.join(targets)} upward")
+    failure_class = validation.failure_class
+    if failure_class in {"failed_before_route_activation", "localization_stability_timeout"}:
+        targets = _existing_families(
+            state,
+            {"covariance_initialization", "Q_position", "Q_acceleration_jerk", "Q_yaw", "Q_process_general"},
+        )
+        _shrink_families(state, targets, 0.68)
+        if targets:
+            decisions.append(f"{failure_class}: shrunk initialization/process families")
+    elif failure_class == "vehicle_stuck_no_progress":
+        targets = _existing_families(state, {"Q_position", "Q_acceleration_jerk", "Q_process_general"})
+        downward = any(_family_change_direction(changed_parameters, family) < 0 for family in targets)
+        if downward:
+            for family in targets:
+                state.family_direction_bias[family] = _clamp_bias(state.family_direction_bias.get(family, 0.0) + 0.22)
+            decisions.append("stuck outcome after reduced model flexibility: biased process uncertainty upward")
+    elif failure_class == "large_lateral_deviation":
+        targets = _existing_families(state, {"Q_yaw", "active_yaw_steer_control"})
+        _shrink_families(state, targets, 0.55)
+        if targets:
+            decisions.append(f"large CTE: shrunk {', '.join(targets)} bounds")
+    elif failure_class == "control_instability":
+        targets = _existing_families(
+            state,
+            {
+                "active_acceleration_control",
+                "active_yaw_steer_control",
+                "active_timeout_input_memory",
+                "active_delta_limits",
+            },
+        )
+        _shrink_families(state, targets, 0.48)
+        if targets:
+            decisions.append("control instability: shrunk all active-control families")
+    if diagnostics.get("divergence"):
+        targets = _existing_families(state, set(state.family_scales))
+        _shrink_families(state, targets, 0.65)
+        decisions.append("divergence indicator: tightened current stage around the best tune")
+    return decisions
+
+
+def _trial_diagnostic_flags(validation: ClosedLoopValidationResult) -> dict[str, object]:
+    consistency = consistency_report_from_summaries(
+        nis_by_type_summary=validation.nis_by_type_summary,
+        mean_position_nees=validation.mean_position_nees,
+        mean_position_nees_diagonal_approx=validation.mean_position_nees_diagonal_approx,
+        position_nees_source=validation.position_nees_source,
+    )
+    nis_report = consistency.get("nis_by_type") if isinstance(consistency.get("nis_by_type"), dict) else {}
+    high_nis = any(
+        isinstance(item, dict) and str(item.get("status") or "") in {"warning", "severe"}
+        and str(item.get("behavior") or "") == "overconfident"
+        for item in nis_report.values()
+    )
+    nees_report = consistency.get("position_nees") if isinstance(consistency.get("position_nees"), dict) else {}
+    high_nees = (
+        str(nees_report.get("status") or "") in {"warning", "severe"}
+        and str(nees_report.get("behavior") or "") == "overconfident"
+    )
+    raw = validation.raw_metrics
+    divergence_count = _first_float(
+        raw,
+        "divergence_event_count",
+        "filter_divergence_event_count",
+        "estimator_divergence_count",
+    ) or 0.0
+    covariance_growth = _first_float(
+        raw,
+        "covariance_growth_ratio",
+        "max_covariance_growth_ratio",
+        "position_covariance_growth_ratio",
+    ) or 0.0
+    oscillation = _first_float(
+        raw,
+        "control_instability_score",
+        "control_oscillation_score",
+        "control_oscillation_count",
+    ) or 0.0
+    return {
+        "high_nis": bool(high_nis),
+        "high_nees": bool(high_nees),
+        "large_cte": bool(
+            validation.failure_class == "large_lateral_deviation"
+            or (
+                validation.max_cross_track_error_m is not None
+                and validation.max_cross_track_error_m > 4.0
+            )
+        ),
+        "divergence": bool(divergence_count > 0.0 or covariance_growth > 8.0),
+        "control_instability": bool(
+            validation.failure_class == "control_instability"
+            or oscillation > 0.0
+        ),
+        "consistency_status": consistency.get("overall_status"),
+        "consistency_error": consistency.get("consistency_error"),
+    }
+
+
+def _parameter_family(key: str) -> str:
+    text = str(key or "").lower()
+    if text == "enable_control_input_prediction":
+        return "active_enable"
+    if text in ACTIVE_CONTROL_TUNE_KEYS or any(
+        token in text
+        for token in ("control_", "command_", "input_timeout", "input_memory")
+    ):
+        if "timeout" in text or "memory" in text:
+            return "active_timeout_input_memory"
+        if any(token in text for token in ("delta", "limit", "max_")):
+            return "active_delta_limits"
+        if any(token in text for token in ("yaw", "steer", "turn")):
+            return "active_yaw_steer_control"
+        if any(token in text for token in ("accel", "brake", "throttle")):
+            return "active_acceleration_control"
+        return "active_control_other"
+    if any(token in text for token in ("sigma", "alpha", "beta", "kappa", "lambda")) and "imu" not in text:
+        return "UKF_sigma_point"
+    if text.startswith("initial_") or text.startswith("startup_") or "covariance_inflation" in text:
+        return "covariance_initialization"
+    if text.endswith("_r_multiplier") or "_r_" in text:
+        if "gnss" in text or "position" in text:
+            return "R_GNSS_effective"
+        if any(token in text for token in ("imu", "yaw", "gyro", "accel")):
+            return "R_IMU_effective"
+        return "R_measurement_effective"
+    if text.startswith("process_") or text == "process_noise_multiplier":
+        if any(token in text for token in ("yaw", "turn", "heading", "gyro")):
+            return "Q_yaw"
+        if any(token in text for token in ("accel", "jerk", "velocity", "speed")):
+            return "Q_acceleration_jerk"
+        if "position" in text:
+            return "Q_position"
+        return "Q_process_general"
+    if any(token in text for token in ("prediction_dt", "turn_rate_epsilon", "yaw_from_velocity")):
+        return "model_dynamics"
+    return "estimator_specific"
+
+
+def _family_change_direction(changes: dict[str, object], family: str) -> int:
+    directions: list[int] = []
+    for raw in changes.values():
+        if not isinstance(raw, dict) or str(raw.get("parameter_family") or "") != family:
+            continue
+        delta = _optional_float(raw.get("delta"))
+        if delta is not None:
+            directions.append(1 if delta > 0.0 else -1 if delta < 0.0 else 0)
+    total = sum(directions)
+    return 1 if total > 0 else -1 if total < 0 else 0
+
+
+def _existing_families(state: AdaptiveStageState, requested: set[str]) -> list[str]:
+    return sorted(family for family in requested if family in state.family_scales)
+
+
+def _shrink_families(state: AdaptiveStageState, families: list[str], factor: float) -> None:
+    for family in families:
+        state.family_scales[family] = max(0.06, state.family_scales.get(family, 0.5) * factor)
+
+
+def _clamp_bias(value: float) -> float:
+    return max(-1.0, min(1.0, float(value)))
+
+
+def _dedupe_text(items: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def _parameter_attribution_records(
+    changes: dict[str, object],
+    validation: ClosedLoopValidationResult,
+    outcome_class: str,
+    adaptation_decision: str,
+) -> tuple[dict[str, object], ...]:
+    nis = _max_nis_type_mean(validation.nis_by_type_summary)
+    nees = validation.mean_position_nees
+    if nees is None:
+        nees = validation.mean_position_nees_diagonal_approx
+    records: list[dict[str, object]] = []
+    for key, raw in changes.items():
+        change = raw if isinstance(raw, dict) else {}
+        records.append(
+            {
+                "parameter": key,
+                "parameter_family": change.get("parameter_family") or _parameter_family(key),
+                "baseline_value": change.get("baseline"),
+                "trial_value": change.get("candidate"),
+                "absolute_change": change.get("absolute_change"),
+                "relative_change_percent": change.get("relative_change_percent"),
+                "direction": change.get("direction"),
+                "stage": validation.stage,
+                "score": validation.closed_loop_score,
+                "rmse_m": validation.eval_filtered_rmse_m or validation.filtered_rmse_m,
+                "nis": nis,
+                "nees": nees,
+                "mean_cte_m": validation.mean_cross_track_error_m,
+                "max_cte_m": validation.max_cross_track_error_m,
+                "failure_class": validation.failure_class,
+                "route_completion_success": validation.route_completion_success,
+                "outcome_class": outcome_class,
+                "adaptation_decision": adaptation_decision,
+            }
+        )
+    return tuple(records)
 
 
 def _passive_model_search_params(
@@ -1432,7 +2110,11 @@ def _candidate_signature(candidate: dict[str, object], tracking_mode: str) -> st
     return f"{tracking_mode}:{json.dumps(rounded, sort_keys=True, separators=(',', ':'))}"
 
 
-def _changed_parameters(baseline: dict[str, object], candidate: dict[str, object]) -> dict[str, object]:
+def _changed_parameters(
+    baseline: dict[str, object],
+    candidate: dict[str, object],
+    family_by_key: Optional[dict[str, str]] = None,
+) -> dict[str, object]:
     changes: dict[str, object] = {}
     for key in sorted(set(baseline) | set(candidate)):
         base = baseline.get(key)
@@ -1441,10 +2123,19 @@ def _changed_parameters(baseline: dict[str, object], candidate: dict[str, object
             continue
         base_num = _optional_float(base)
         value_num = _optional_float(value)
-        change: dict[str, object] = {"baseline": base, "candidate": value}
+        change: dict[str, object] = {
+            "baseline": base,
+            "candidate": value,
+            "parameter_family": (family_by_key or {}).get(key) or _parameter_family(key),
+        }
         if base_num is not None and value_num is not None:
-            change["delta"] = value_num - base_num
-            change["delta_percent"] = None if abs(base_num) <= 1.0e-12 else 100.0 * (value_num - base_num) / base_num
+            signed_change = value_num - base_num
+            relative_change = None if abs(base_num) <= 1.0e-12 else 100.0 * signed_change / base_num
+            change["delta"] = signed_change
+            change["delta_percent"] = relative_change
+            change["absolute_change"] = abs(signed_change)
+            change["relative_change_percent"] = relative_change
+            change["direction"] = "up" if signed_change > 0.0 else "down" if signed_change < 0.0 else "unchanged"
         changes[key] = change
     return changes
 
@@ -1482,6 +2173,96 @@ def _failure_class_counts(results: list[ClosedLoopValidationResult]) -> dict[str
         if failure_class:
             counts[failure_class] = counts.get(failure_class, 0) + 1
     return counts
+
+
+def _aggregate_parameter_family_diagnostics(
+    states: list[AdaptiveStageState],
+) -> dict[str, object]:
+    aggregate: dict[str, ParameterFamilyStats] = {}
+    final_scales: dict[str, float] = {}
+    final_biases: dict[str, float] = {}
+    for state in states:
+        for family, stats in state.family_stats.items():
+            target = aggregate.setdefault(family, ParameterFamilyStats())
+            target.trials += stats.trials
+            target.successes += stats.successes
+            target.failures += stats.failures
+            target.improvements += stats.improvements
+            target.degradations += stats.degradations
+            target.stable_trials += stats.stable_trials
+            target.high_nis_count += stats.high_nis_count
+            target.high_nees_count += stats.high_nees_count
+            target.large_cte_count += stats.large_cte_count
+            target.upward_improvements += stats.upward_improvements
+            target.downward_improvements += stats.downward_improvements
+            target.upward_degradations += stats.upward_degradations
+            target.downward_degradations += stats.downward_degradations
+            target.score_delta_sum += stats.score_delta_sum
+            for failure_class, count in stats.failure_classes.items():
+                target.failure_classes[failure_class] = target.failure_classes.get(failure_class, 0) + count
+            final_scales[family] = state.family_scales.get(family, final_scales.get(family, 0.0))
+            final_biases[family] = state.family_direction_bias.get(family, final_biases.get(family, 0.0))
+    families: dict[str, object] = {}
+    for family, stats in sorted(aggregate.items()):
+        mean_score_delta = stats.score_delta_sum / stats.trials if stats.trials else None
+        families[family] = {
+            **stats.to_dict(),
+            "mean_score_delta_vs_best_at_trial": mean_score_delta,
+            "final_bound_scale": final_scales.get(family),
+            "final_direction_bias": final_biases.get(family),
+            "diagnostic_guidance": _family_diagnostic_guidance(
+                family,
+                stats,
+                final_scales.get(family),
+                final_biases.get(family),
+            ),
+        }
+    changed_families = [
+        family
+        for family in families
+        if int(dict(families[family]).get("trials") or 0) > 0
+    ]
+    best = sorted(
+        changed_families,
+        key=lambda family: (
+            -int(dict(families[family]).get("improvements") or 0),
+            int(dict(families[family]).get("failures") or 0),
+            float(dict(families[family]).get("mean_score_delta_vs_best_at_trial") or 0.0),
+            family,
+        ),
+    )
+    worst = sorted(
+        changed_families,
+        key=lambda family: (
+            -(
+                int(dict(families[family]).get("failures") or 0)
+                + int(dict(families[family]).get("degradations") or 0)
+            ),
+            int(dict(families[family]).get("improvements") or 0),
+            family,
+        ),
+    )
+    return {
+        "families": families,
+        "best_families": best[:3],
+        "worst_families": worst[:3],
+    }
+
+
+def _family_diagnostic_guidance(
+    family: str,
+    stats: ParameterFamilyStats,
+    bound_scale: Optional[float],
+    direction_bias: Optional[float],
+) -> str:
+    if stats.failures + stats.degradations > stats.improvements:
+        return f"{family} is associated with degradation/failure; keep bounds tight"
+    if stats.improvements > 0:
+        direction = "upward" if (direction_bias or 0.0) > 0.20 else "downward" if (direction_bias or 0.0) < -0.20 else "locally"
+        return f"{family} is associated with improvements; bias {direction}"
+    if bound_scale is not None and bound_scale < 0.30:
+        return f"{family} remains uncertain; protected-best bounds were tightened"
+    return f"{family} has limited evidence; continue local probing"
 
 
 def _classify_failure(metrics: dict[str, object]) -> str:
@@ -1538,7 +2319,15 @@ def _closed_loop_extra_metadata(
     best_passive: Optional[ClosedLoopValidationResult],
     best_active: Optional[ClosedLoopValidationResult],
     final_validation: ClosedLoopValidationResult,
+    adaptive_stage_states: list[AdaptiveStageState],
+    baseline_validation: Optional[ClosedLoopValidationResult],
 ) -> dict[str, object]:
+    family_diagnostics = _aggregate_parameter_family_diagnostics(adaptive_stage_states)
+    adaptation_history = [
+        {"stage": state.stage, **dict(entry)}
+        for state in adaptive_stage_states
+        for entry in state.adaptation_history
+    ]
     return {
         "source": "closed_loop_auto_tune",
         "direct_closed_loop_mode": True,
@@ -1563,6 +2352,26 @@ def _closed_loop_extra_metadata(
         "final_tune": dict(final_validation.candidate_tune),
         "final_objective_score": final_validation.closed_loop_score,
         "final_tuning_stage": final_validation.stage,
+        "baseline_objective_score": (
+            baseline_validation.closed_loop_score if baseline_validation is not None else None
+        ),
+        "baseline_to_final_improvement": (
+            baseline_validation.closed_loop_score - final_validation.closed_loop_score
+            if baseline_validation is not None
+            else None
+        ),
+        "parameter_family_diagnostics": family_diagnostics["families"],
+        "best_changed_parameter_families": family_diagnostics["best_families"],
+        "worst_changed_parameter_families": family_diagnostics["worst_families"],
+        "bound_adaptation_history": adaptation_history,
+        "adaptive_stage_diagnostics": [state.to_dict() for state in adaptive_stage_states],
+        "adaptive_search_policy": {
+            "candidate_scope": "one parameter family or a small same-family group per trial",
+            "anchor_policy": "all perturbations are anchored to the current protected best tune",
+            "baseline_protection": "after repeated non-improvements all remaining stage bounds tighten around the best tune",
+            "expansion_policy": "a family expands only after repeated stable improvements without failures",
+            "route_geometry_preanalysis": False,
+        },
         "sensor_noise_profile": request.sensor_noise_profile,
         "sensor_noise_config": dict(request.sensor_noise_config),
         "sensor_noise_signature": noise_sig,
@@ -1787,6 +2596,10 @@ def _direct_auto_tune_trial_results(validations: list[ClosedLoopValidationResult
         metrics["failure_class"] = validation.failure_class
         metrics["tuning_stage"] = validation.stage
         metrics["changed_parameters_summary"] = validation.changed_parameters_summary
+        metrics["affected_families"] = list(validation.affected_families)
+        metrics["adaptation_decision"] = validation.adaptation_decision
+        metrics["outcome_class"] = validation.outcome_class
+        metrics["parameter_attribution"] = [dict(item) for item in validation.parameter_attribution]
         results.append(
             AutoTuneTrialResult(
                 trial_index=validation.finalist_rank,
@@ -1962,6 +2775,9 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
                 "timeout",
                 "failure_class",
                 "abort_reason",
+                "outcome_class",
+                "affected_families",
+                "adaptation_decision",
                 "completion_time_s",
                 "eval_filtered_rmse_m",
                 "filtered_rmse_m",
@@ -1973,6 +2789,7 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
                 "changed_parameters_summary",
                 "candidate_tune",
                 "changed_parameters",
+                "parameter_attribution",
                 "raw_metrics",
                 "output_folder",
             ),
@@ -1990,6 +2807,9 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
                     "timeout": validation.timeout,
                     "failure_class": validation.failure_class,
                     "abort_reason": validation.abort_reason,
+                    "outcome_class": validation.outcome_class,
+                    "affected_families": ",".join(validation.affected_families),
+                    "adaptation_decision": validation.adaptation_decision,
                     "completion_time_s": validation.completion_time_s,
                     "eval_filtered_rmse_m": validation.eval_filtered_rmse_m,
                     "filtered_rmse_m": validation.filtered_rmse_m,
@@ -2001,6 +2821,7 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
                     "changed_parameters_summary": validation.changed_parameters_summary,
                     "candidate_tune": json.dumps(validation.candidate_tune, sort_keys=True),
                     "changed_parameters": json.dumps(validation.changed_parameters, sort_keys=True),
+                    "parameter_attribution": json.dumps(validation.parameter_attribution, sort_keys=True),
                     "raw_metrics": json.dumps(validation.raw_metrics, sort_keys=True),
                     "output_folder": str(validation.output_folder) if validation.output_folder else "",
                 }

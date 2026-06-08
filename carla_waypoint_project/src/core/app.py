@@ -725,7 +725,9 @@ class SimulationApp:
                     "nis": None,
                     "nees": None,
                     "reason": "",
+                    "families": ", ".join(str(item) for item in (payload.get("affected_families") or [])),
                     "changes": payload.get("changed_parameters_summary") or "",
+                    "adaptation": payload.get("adaptation_decision") or "",
                 }
             )
             text = (
@@ -778,7 +780,9 @@ class SimulationApp:
                     "nis": nis,
                     "nees": nees,
                     "reason": reason,
+                    "families": ", ".join(str(item) for item in (payload.get("affected_families") or [])),
                     "changes": payload.get("changed_parameters_summary") or "",
+                    "adaptation": payload.get("adaptation_decision") or "",
                 }
             )
             text = (
@@ -979,8 +983,8 @@ class SimulationApp:
         table_top = metrics_rect.bottom + 16
         self._draw_overlay_text(surface, "Trial Results", (content.left, table_top), self._filter_overlay_bold_font, DASHBOARD.title_color, content.width)
         header_y = table_top + 27
-        headers = ("Stage", "Trial", "Status", "Score", "RMSE", "Mean CTE", "Max CTE", "NIS", "NEES", "Failure", "Changed parameters")
-        fixed_widths = (126, 44, 62, 76, 66, 72, 68, 58, 58, 144)
+        headers = ("Stage", "Trial", "Status", "Score", "RMSE", "Mean CTE", "Max CTE", "NIS", "NEES", "Failure", "Family", "Changed", "Decision")
+        fixed_widths = (110, 42, 56, 68, 58, 66, 62, 50, 50, 112, 100, 150)
         col_widths = fixed_widths + (max(110, content.width - sum(fixed_widths)),)
         x = content.left
         for header, col_width in zip(headers, col_widths):
@@ -1004,7 +1008,9 @@ class SimulationApp:
                 self._format_metric_number(row.get("nis"), 3),
                 self._format_metric_number(row.get("nees"), 3),
                 str(row.get("reason") or ""),
+                str(row.get("families") or ""),
                 str(row.get("changes") or ""),
+                str(row.get("adaptation") or ""),
             )
             x = content.left
             for value, col_width in zip(values, col_widths):
