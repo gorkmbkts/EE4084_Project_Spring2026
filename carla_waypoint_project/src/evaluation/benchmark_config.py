@@ -162,21 +162,10 @@ BEHAVIOR_SPECS: tuple[ParameterSpec, ...] = (
     ParameterSpec("min_curve_speed_mps", "Min curve speed", 0.8, 7.0, "m/s", 1, "Speed planner"),
     ParameterSpec("max_forward_accel_mps2", "Max accel", 0.3, 4.0, "m/s2", 1, "Speed planner"),
     ParameterSpec("max_braking_decel_mps2", "Max braking", 0.5, 7.0, "m/s2", 1, "Speed planner"),
-    ParameterSpec("max_steer_rate_per_s", "Max steer rate", 0.4, 4.0, "/s", 1, "Actuator"),
     ParameterSpec("curve_lookahead_m", "Curve lookahead", 8.0, 55.0, "m", 0, "Speed planner"),
     ParameterSpec("curvature_sensitivity", "Curvature sens", 0.2, 3.0, "x", 2, "Speed planner"),
     ParameterSpec("safe_cornering_factor", "Safe cornering", 0.6, 1.8, "x", 2, "Speed planner"),
     ParameterSpec("speed_change_aggressiveness", "Speed aggress", 0.2, 2.5, "x", 2, "Speed planner"),
-    ParameterSpec("throttle_smoothing", "Throttle smooth", 0.0, 0.9, "", 2, "Actuator"),
-    ParameterSpec("brake_smoothing", "Brake smooth", 0.0, 0.9, "", 2, "Actuator"),
-    ParameterSpec("steering_smoothing", "Steer smooth", 0.0, 0.9, "", 2, "Actuator"),
-    ParameterSpec("actuator_delay_s", "Actuator delay", 0.0, 0.35, "s", 2, "Actuator"),
-    ParameterSpec("actuator_noise", "Imperfection", 0.0, 0.05, "", 3, "Actuator"),
-    ParameterSpec("throttle_response_gain", "Throttle gain", 0.4, 1.6, "x", 2, "Actuator"),
-    ParameterSpec("brake_response_gain", "Brake gain", 0.4, 1.6, "x", 2, "Actuator"),
-    ParameterSpec("steering_response_gain", "Steering gain", 0.4, 1.8, "x", 2, "Actuator"),
-    ParameterSpec("max_throttle_rate_per_s", "Throttle rate", 0.2, 4.0, "/s", 1, "Actuator"),
-    ParameterSpec("max_brake_rate_per_s", "Brake rate", 0.2, 5.0, "/s", 1, "Actuator"),
     ParameterSpec("enable_model_aware_control", "Model-aware ctrl", 0.0, 1.0, "", 0, "Model-aware control"),
     ParameterSpec("yaw_rate_feedforward_gain", "Yaw-rate FF", 0.0, 1.0, "x", 2, "Model-aware control"),
     ParameterSpec("yaw_rate_feedback_gain", "Yaw-rate FB", 0.0, 1.0, "x", 2, "Model-aware control"),
@@ -192,8 +181,27 @@ BEHAVIOR_SPECS: tuple[ParameterSpec, ...] = (
 )
 
 
+ACTUATOR_SPECS: tuple[ParameterSpec, ...] = (
+    ParameterSpec("throttle_smoothing", "Throttle smooth", 0.0, 0.9, "", 2, "Actuator lag"),
+    ParameterSpec("brake_smoothing", "Brake smooth", 0.0, 0.9, "", 2, "Actuator lag"),
+    ParameterSpec("steering_smoothing", "Steer smooth", 0.0, 0.9, "", 2, "Actuator lag"),
+    ParameterSpec("actuator_delay_s", "Actuator delay", 0.0, 0.35, "s", 2, "Delay"),
+    ParameterSpec("actuator_noise", "Command noise", 0.0, 0.05, "", 3, "Noise"),
+    ParameterSpec("throttle_response_gain", "Throttle gain", 0.4, 1.6, "x", 2, "Response gain"),
+    ParameterSpec("brake_response_gain", "Brake gain", 0.4, 1.6, "x", 2, "Response gain"),
+    ParameterSpec("steering_response_gain", "Steering gain", 0.4, 1.8, "x", 2, "Response gain"),
+    ParameterSpec("max_throttle_rate_per_s", "Throttle rate", 0.2, 6.0, "/s", 1, "Rate limits"),
+    ParameterSpec("max_brake_rate_per_s", "Brake rate", 0.2, 8.0, "/s", 1, "Rate limits"),
+    ParameterSpec("max_steer_rate_per_s", "Steer rate", 0.4, 8.0, "/s", 1, "Rate limits"),
+)
+
+
 def behavior_values_from_config(config: object) -> dict[str, float]:
     return {spec.key: float(getattr(config, spec.key)) for spec in BEHAVIOR_SPECS}
+
+
+def actuator_values_from_config(config: object) -> dict[str, float]:
+    return {spec.key: float(getattr(config, spec.key)) for spec in ACTUATOR_SPECS}
 
 
 def driving_behavior_from_values(
@@ -214,6 +222,30 @@ def apply_behavior_values(config: object, values: dict[str, object]) -> None:
         setattr(config, spec.key, spec.clamp(values.get(spec.key, getattr(config, spec.key))))
     if config.min_curve_speed_mps > config.max_speed_mps:
         config.min_curve_speed_mps = config.max_speed_mps
+    # Backward compatibility: older configs stored actuator fields in vehicle_behavior_config.
+    if any(spec.key in values for spec in ACTUATOR_SPECS):
+        apply_actuator_values(config, values)
+
+
+def default_actuator_realism_values() -> dict[str, float]:
+    return dict(_base_actuator_values())
+
+
+def actuator_realism_from_values(
+    values: dict[str, object],
+    preset_name: str = "Realistic",
+) -> dict[str, object]:
+    result = _base_actuator_values()
+    for spec in ACTUATOR_SPECS:
+        result[spec.key] = spec.clamp(values.get(spec.key, result[spec.key]))
+    result["preset_name"] = preset_name
+    result["enabled"] = True
+    return result
+
+
+def apply_actuator_values(config: object, values: dict[str, object]) -> None:
+    for spec in ACTUATOR_SPECS:
+        setattr(config, spec.key, spec.clamp(values.get(spec.key, getattr(config, spec.key))))
 
 
 def _base_behavior_values() -> dict[str, float]:
@@ -222,21 +254,10 @@ def _base_behavior_values() -> dict[str, float]:
         "min_curve_speed_mps": 2.6,
         "max_forward_accel_mps2": 1.6,
         "max_braking_decel_mps2": 3.2,
-        "max_steer_rate_per_s": 1.8,
-        "throttle_smoothing": 0.35,
-        "brake_smoothing": 0.28,
-        "steering_smoothing": 0.30,
         "curve_lookahead_m": 28.0,
         "curvature_sensitivity": 1.15,
         "speed_change_aggressiveness": 1.0,
-        "actuator_noise": 0.008,
-        "actuator_delay_s": 0.08,
-        "throttle_response_gain": 1.0,
-        "brake_response_gain": 1.0,
-        "steering_response_gain": 1.0,
         "safe_cornering_factor": 1.0,
-        "max_throttle_rate_per_s": 1.8,
-        "max_brake_rate_per_s": 2.4,
         "enable_model_aware_control": 0.0,
         "yaw_rate_feedforward_gain": 0.25,
         "yaw_rate_feedback_gain": 0.0,
@@ -252,6 +273,22 @@ def _base_behavior_values() -> dict[str, float]:
     }
 
 
+def _base_actuator_values() -> dict[str, float]:
+    return {
+        "throttle_smoothing": 0.35,
+        "brake_smoothing": 0.28,
+        "steering_smoothing": 0.30,
+        "actuator_noise": 0.008,
+        "actuator_delay_s": 0.08,
+        "throttle_response_gain": 1.0,
+        "brake_response_gain": 1.0,
+        "steering_response_gain": 1.0,
+        "max_throttle_rate_per_s": 1.8,
+        "max_brake_rate_per_s": 2.4,
+        "max_steer_rate_per_s": 1.8,
+    }
+
+
 BEHAVIOR_PRESETS: dict[str, dict[str, float]] = {
     "Balanced": _base_behavior_values(),
     "Conservative": {
@@ -263,7 +300,6 @@ BEHAVIOR_PRESETS: dict[str, dict[str, float]] = {
         "curvature_sensitivity": 1.55,
         "safe_cornering_factor": 1.25,
         "speed_change_aggressiveness": 0.65,
-        "actuator_noise": 0.006,
     },
     "Aggressive": {
         **_base_behavior_values(),
@@ -274,22 +310,47 @@ BEHAVIOR_PRESETS: dict[str, dict[str, float]] = {
         "curvature_sensitivity": 0.85,
         "safe_cornering_factor": 0.85,
         "speed_change_aggressiveness": 1.65,
-        "throttle_response_gain": 1.20,
-        "brake_response_gain": 1.15,
-        "steering_response_gain": 1.12,
     },
-    "Smooth Realistic": {
-        **_base_behavior_values(),
-        "max_speed_mps": 6.8,
-        "min_curve_speed_mps": 2.3,
-        "max_forward_accel_mps2": 1.1,
-        "max_braking_decel_mps2": 2.8,
-        "throttle_smoothing": 0.55,
-        "brake_smoothing": 0.46,
-        "steering_smoothing": 0.48,
-        "actuator_delay_s": 0.14,
-        "actuator_noise": 0.012,
-        "speed_change_aggressiveness": 0.75,
+}
+
+
+ACTUATOR_REALISM_PRESETS: dict[str, dict[str, float]] = {
+    "Perfect Actuator": {
+        **_base_actuator_values(),
+        "throttle_smoothing": 0.0,
+        "brake_smoothing": 0.0,
+        "steering_smoothing": 0.0,
+        "actuator_delay_s": 0.0,
+        "actuator_noise": 0.0,
+        "max_throttle_rate_per_s": 6.0,
+        "max_brake_rate_per_s": 8.0,
+        "max_steer_rate_per_s": 8.0,
+    },
+    "Mild Realistic": {
+        **_base_actuator_values(),
+        "throttle_smoothing": 0.22,
+        "brake_smoothing": 0.18,
+        "steering_smoothing": 0.20,
+        "actuator_delay_s": 0.04,
+        "actuator_noise": 0.004,
+        "max_throttle_rate_per_s": 2.8,
+        "max_brake_rate_per_s": 3.6,
+        "max_steer_rate_per_s": 2.8,
+    },
+    "Realistic": _base_actuator_values(),
+    "Delayed / Harsh Realistic": {
+        **_base_actuator_values(),
+        "throttle_smoothing": 0.58,
+        "brake_smoothing": 0.50,
+        "steering_smoothing": 0.54,
+        "actuator_delay_s": 0.18,
+        "actuator_noise": 0.018,
+        "throttle_response_gain": 0.88,
+        "brake_response_gain": 1.12,
+        "steering_response_gain": 0.82,
+        "max_throttle_rate_per_s": 0.9,
+        "max_brake_rate_per_s": 1.2,
+        "max_steer_rate_per_s": 1.0,
     },
 }
 
@@ -302,10 +363,12 @@ class BenchmarkConfig:
     selected_routes: tuple[SavedTestRoute, ...]
     sensor_noise_config: SensorNoiseConfig
     vehicle_behavior_config: dict[str, object]
+    actuator_realism_config: dict[str, object] | None = None
     selected_filter_tune: dict[str, object] | None = None
     tracking_mode: str = "passive"
     sensor_noise_preset: str = "Medium Noise"
     vehicle_behavior_preset: str = "Balanced"
+    actuator_realism_preset: str = "Realistic"
     random_seed: int = 4084
     output_root: str = "benchmark_results"
     run_id: str = ""
@@ -321,6 +384,20 @@ class BenchmarkConfig:
             self.metadata = {}
         if self.selected_filter_tune is None:
             self.selected_filter_tune = {}
+        if self.actuator_realism_config is None:
+            legacy_actuator_values = {
+                spec.key: self.vehicle_behavior_config[spec.key]
+                for spec in ACTUATOR_SPECS
+                if spec.key in self.vehicle_behavior_config
+            }
+            if legacy_actuator_values:
+                preset = str(self.vehicle_behavior_config.get("preset_name") or self.actuator_realism_preset)
+                self.actuator_realism_config = actuator_realism_from_values(legacy_actuator_values, preset_name=preset)
+            else:
+                self.actuator_realism_config = actuator_realism_from_values(
+                    ACTUATOR_REALISM_PRESETS.get(self.actuator_realism_preset, ACTUATOR_REALISM_PRESETS["Realistic"]),
+                    preset_name=self.actuator_realism_preset,
+                )
         self.tracking_mode = _normalize_tracking_mode(self.tracking_mode)
 
     def to_dict(self) -> dict[str, object]:
@@ -329,10 +406,12 @@ class BenchmarkConfig:
             "selected_routes": [route.to_dict() for route in self.selected_routes],
             "sensor_noise_config": self.sensor_noise_config.to_dict(),
             "vehicle_behavior_config": dict(self.vehicle_behavior_config),
+            "actuator_realism_config": dict(self.actuator_realism_config or {}),
             "selected_filter_tune": dict(self.selected_filter_tune or {}),
             "tracking_mode": self.tracking_mode,
             "sensor_noise_preset": self.sensor_noise_preset,
             "vehicle_behavior_preset": self.vehicle_behavior_preset,
+            "actuator_realism_preset": self.actuator_realism_preset,
             "random_seed": self.random_seed,
             "output_root": self.output_root,
             "run_id": self.run_id,
@@ -415,6 +494,11 @@ def validate_benchmark_config(
             errors.append(f"{spec.label} is outside [{spec.minimum}, {spec.maximum}].")
     for spec in BEHAVIOR_SPECS:
         value = config.vehicle_behavior_config.get(spec.key)
+        if spec.clamp(value) != float(value):
+            errors.append(f"{spec.label} is outside [{spec.minimum}, {spec.maximum}].")
+    actuator_config = config.actuator_realism_config or {}
+    for spec in ACTUATOR_SPECS:
+        value = actuator_config.get(spec.key)
         if spec.clamp(value) != float(value):
             errors.append(f"{spec.label} is outside [{spec.minimum}, {spec.maximum}].")
     return errors

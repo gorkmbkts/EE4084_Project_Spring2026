@@ -68,7 +68,7 @@ def test_closed_loop_autotuner_rejects_mixed_noise_logs_by_default(tmp_path: Pat
         raise AssertionError("mixed-noise rejection should happen before offline candidate generation")
 
 
-def test_closed_loop_autotuner_selects_top_finalists_and_validates_only_them(tmp_path: Path) -> None:
+def test_closed_loop_autotuner_runs_direct_closed_loop_trials_and_selects_best(tmp_path: Path) -> None:
     log_a, sensor = _recorded_log(tmp_path, "route_001")
     log_b, _sensor_b = _recorded_log(tmp_path, "route_002")
     offline = _FakeOfflineTuner(
@@ -91,20 +91,18 @@ def test_closed_loop_autotuner_selects_top_finalists_and_validates_only_them(tmp
     )
     result = ClosedLoopBenchmarkAutoTuner(offline_tuner=offline, validation_runner=runner).run(request)
 
-    if len(offline.calls) != 1:
-        raise AssertionError("offline candidate generation was not delegated to the offline tuner")
-    offline_request = offline.calls[0]
-    if offline_request.sensor_log_paths != (log_a, log_b) or offline_request.max_trials != 4:
-        raise AssertionError("offline tuner did not receive selected logs and trial count")
-    if len(runner.requests) != 2:
-        raise AssertionError("closed-loop validation should run only finalist_count finalists")
-    if [call.finalist.trial_index for call in runner.requests] != [2, 3]:
-        raise AssertionError("closed-loop validation did not use the top offline-score finalists")
+    if offline.calls:
+        raise AssertionError("direct closed-loop auto tune must not delegate candidate scoring to the offline tuner")
+    if len(runner.requests) != 4:
+        raise AssertionError("closed-loop auto tune should run one real route trial per search trial")
+    if [call.finalist.trial_index for call in runner.requests] != [1, 2, 3, 4]:
+        raise AssertionError("closed-loop validation did not run direct sequential trial candidates")
     validation_output_folders = [str(call.output_folder).replace("\\", "/") for call in runner.requests]
-    if not all("/v/f" in folder for folder in validation_output_folders):
-        raise AssertionError(f"closed-loop validation output did not use compact folders: {validation_output_folders}")
-    if result.best_tune.get("process_jerk_stddev_mps3") != 3.0:
-        raise AssertionError("final best tune should be selected by closed-loop score, not offline rank only")
+    if not all("/trials/t" in folder for folder in validation_output_folders):
+        raise AssertionError(f"closed-loop trial output did not use compact direct trial folders: {validation_output_folders}")
+    best_validation = min(result.validation_results, key=lambda item: item.closed_loop_score)
+    if best_validation.finalist_rank != 2:
+        raise AssertionError("final best tune should be selected by direct closed-loop score")
 
     config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
     if config.get("schema_version") != SCHEMA_VERSION:
@@ -131,11 +129,15 @@ def test_closed_loop_autotuner_selects_top_finalists_and_validates_only_them(tmp
     )
     if not any(str(item.get("path")) == str(result.saved_config_path) for item in listed):
         raise AssertionError(f"saved tune browser did not find compact closed-loop config: {listed}")
-    if len(config.get("closed_loop_validation_results") or []) != 2:
-        raise AssertionError("saved config did not preserve finalist validation results")
+    if config.get("candidate_generation_stage") != "direct_closed_loop_route_trials":
+        raise AssertionError("saved config did not record direct closed-loop candidate generation")
+    if len(config.get("closed_loop_validation_results") or []) != 4:
+        raise AssertionError("saved config did not preserve all direct closed-loop trial results")
+    if config.get("direct_closed_loop_trial_count") != 4:
+        raise AssertionError("saved config did not record direct trial count")
 
 
-def test_closed_loop_autotuner_candidate_generation_uses_compact_replay_staging(tmp_path: Path) -> None:
+def test_closed_loop_autotuner_direct_trials_use_compact_output_without_replay_staging(tmp_path: Path) -> None:
     long_root = tmp_path / "long_project_segment" / "benchmark_results"
     log_path, sensor = _recorded_log(long_root.parent, "route_001")
     replay_calls = []
@@ -179,16 +181,8 @@ def test_closed_loop_autotuner_candidate_generation_uses_compact_replay_staging(
         validation_runner=runner,
     ).run(request)
 
-    if len(replay_calls) < 3:
-        raise AssertionError("closed-loop candidate generation did not run baseline/search/verification offline replays")
-    for replay_call in replay_calls:
-        replay_path = Path(replay_call.run_folder_override)
-        path_text = str(replay_path).replace("\\", "/")
-        if "/_tmp/at/" not in path_text:
-            raise AssertionError(f"closed-loop candidate replay did not use compact staging: {replay_path}")
-        metrics_path = replay_path / "r001" / "met" / "summary_metrics.json"
-        if len(str(metrics_path.resolve())) >= offline_replay_runner_module.WINDOWS_PATH_LENGTH_GUARD:
-            raise AssertionError(f"closed-loop candidate replay metrics path is too long: {metrics_path}")
+    if replay_calls:
+        raise AssertionError("direct closed-loop auto tune should not run offline replay staging")
 
     config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
     final_summary_path = result.output_folder / "closed_loop_auto_tune_summary.json"
@@ -200,8 +194,11 @@ def test_closed_loop_autotuner_candidate_generation_uses_compact_replay_staging(
         raise AssertionError("closed-loop saved config did not preserve logical output group")
     if config.get("noise_signature") != noise_signature(sensor):
         raise AssertionError("closed-loop saved config did not preserve full noise_signature")
-    if "/_tmp/at/" not in str(config.get("offline_candidate_staging_folder") or "").replace("\\", "/"):
-        raise AssertionError("closed-loop saved config did not link compact offline candidate staging folder")
+    if config.get("offline_candidate_staging_folder"):
+        raise AssertionError("direct closed-loop saved config should not link offline candidate staging")
+    direct_results = config.get("direct_closed_loop_trial_results") or []
+    if len(direct_results) != 1:
+        raise AssertionError("direct closed-loop saved config did not preserve trial results")
 
 
 def test_closed_loop_autotuner_saves_active_config_separately(tmp_path: Path) -> None:
@@ -213,8 +210,8 @@ def test_closed_loop_autotuner_saves_active_config_separately(tmp_path: Path) ->
     config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
     if config.get("tracking_mode") != TRACKING_ACTIVE or config.get("recommended_usage") != "closed_loop_active":
         raise AssertionError("active closed-loop backend did not save active usage metadata")
-    if "passive sensor-log replay" not in str(config.get("active_control_parameter_policy") or ""):
-        raise AssertionError("active config did not document passive offline candidate-generation limitation")
+    if "Active tracking tune search includes" not in str(config.get("active_control_parameter_policy") or ""):
+        raise AssertionError("active config did not document active-control direct search policy")
     path_text = str(result.saved_config_path).replace("\\", "/")
     if "/_at/cl/a/ca_kf/" not in path_text:
         raise AssertionError(f"active closed-loop tune was saved to the wrong folder: {path_text}")
@@ -290,7 +287,7 @@ def test_closed_loop_autotuner_records_fallback_when_optuna_unavailable(tmp_path
         validation_runner=_FakeValidationRunner({1: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0}}),
     ).run(_request(tmp_path, (log_path,), sensor, strategy="optuna_tpe"))
     config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
-    if config.get("candidate_generation_strategy") != "random_plus_coordinate_refinement":
+    if config.get("candidate_generation_strategy") != "direct_closed_loop_random":
         raise AssertionError("closed-loop backend did not record fallback strategy when Optuna was unavailable")
     if config.get("optuna_available") is not False:
         raise AssertionError("closed-loop backend did not record Optuna availability")

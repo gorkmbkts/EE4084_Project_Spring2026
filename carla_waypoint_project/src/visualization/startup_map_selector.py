@@ -15,11 +15,15 @@ from src.KalmanLab.filter_base import TRACKING_MODE_ACTIVE, TRACKING_MODE_PASSIV
 from src.KalmanLab.registry import discover_filters
 from src.KalmanLab.tune_advisor import TuneRecommendation, recommend_filter_tune
 from src.evaluation.benchmark_config import (
+    ACTUATOR_REALISM_PRESETS,
+    ACTUATOR_SPECS,
     BEHAVIOR_PRESETS,
     BEHAVIOR_SPECS,
     BenchmarkConfig,
     SENSOR_NOISE_PRESETS,
     SENSOR_NOISE_SPECS,
+    actuator_realism_from_values,
+    actuator_values_from_config,
     behavior_values_from_config,
     driving_behavior_from_values,
     load_available_test_routes,
@@ -189,8 +193,10 @@ class StartupMapSelector:
         self._recommendation_applied_by_filter: dict[str, bool] = {}
         self._sensor_editor: Optional[ParameterEditor] = None
         self._behavior_editor: Optional[ParameterEditor] = None
+        self._actuator_editor: Optional[ParameterEditor] = None
         self._sensor_preset = "Medium Noise"
         self._behavior_preset = "Balanced"
+        self._actuator_preset = "Realistic"
         self._route_items = []
         self._selected_route_indices: set[int] = set()
         self._recording_route_index: Optional[int] = None
@@ -779,6 +785,14 @@ class StartupMapSelector:
                 active_preset="Balanced",
                 title="Vehicle Behavior Settings",
             )
+        if self._actuator_editor is None:
+            self._actuator_editor = ParameterEditor(
+                specs=ACTUATOR_SPECS,
+                values=actuator_values_from_config(DrivingBehaviorConfig()),
+                presets=ACTUATOR_REALISM_PRESETS,
+                active_preset="Realistic",
+                title="Actuator Model Settings",
+            )
 
     def _refresh_recorded_logs(self) -> None:
         self._recorded_logs = list_recorded_logs()
@@ -881,6 +895,13 @@ class StartupMapSelector:
         preset = self._behavior_editor.active_preset if self._behavior_editor is not None else self._behavior_preset
         return driving_behavior_from_values(values, preset_name=preset)
 
+    def _current_actuator_realism_config(self) -> dict[str, object]:
+        editor = getattr(self, "_actuator_editor", None)
+        preset_default = str(getattr(self, "_actuator_preset", "Realistic") or "Realistic")
+        values = editor.values() if editor is not None else ACTUATOR_REALISM_PRESETS["Realistic"]
+        preset = editor.active_preset if editor is not None else preset_default
+        return actuator_realism_from_values(values, preset_name=preset)
+
     def _selected_offline_sensor_noise_config(self) -> object | None:
         if self._selected_recorded_log_index is None or self._selected_recorded_log_index >= len(self._recorded_logs):
             return None
@@ -895,6 +916,7 @@ class StartupMapSelector:
                 tracking_mode=self._tracking_mode,
                 sensor_noise_config=self._current_sensor_noise_config(),
                 vehicle_behavior_config=self._current_vehicle_behavior_config(),
+                actuator_realism_config=self._current_actuator_realism_config(),
             )
         return offline_tune_context(
             filter_id=filter_id,
@@ -1022,6 +1044,13 @@ class StartupMapSelector:
             and self._behavior_editor.handle_event(event)
         ):
             self._behavior_preset = self._behavior_editor.active_preset
+            return _NoSelection
+        if (
+            self._active_closed_loop_subtab == "Vehicle Behavior"
+            and self._actuator_editor is not None
+            and self._actuator_editor.handle_event(event)
+        ):
+            self._actuator_preset = self._actuator_editor.active_preset
             return _NoSelection
 
         if event.type == pygame.MOUSEWHEEL:
@@ -1181,8 +1210,18 @@ class StartupMapSelector:
             if self._sensor_editor is not None:
                 self._sensor_editor.draw(self._surface, work)
         elif self._active_closed_loop_subtab == "Vehicle Behavior":
+            gap = 10
+            if work.width >= 900:
+                left = pygame.Rect(work.left, work.top, (work.width - gap) // 2, work.height)
+                right = pygame.Rect(left.right + gap, work.top, work.right - left.right - gap, work.height)
+            else:
+                top_h = max(170, (work.height - gap) // 2)
+                left = pygame.Rect(work.left, work.top, work.width, top_h)
+                right = pygame.Rect(work.left, left.bottom + gap, work.width, work.bottom - left.bottom - gap)
             if self._behavior_editor is not None:
-                self._behavior_editor.draw(self._surface, work)
+                self._behavior_editor.draw(self._surface, left)
+            if self._actuator_editor is not None:
+                self._actuator_editor.draw(self._surface, right)
         elif self._active_closed_loop_subtab == "Routes":
             self._draw_route_selection(
                 work,
@@ -1628,8 +1667,8 @@ class StartupMapSelector:
         list_top = content.top + 38
         if context == "closed_loop":
             note = (
-                "Only closed-loop configs matching this filter, tracking mode, noise, and behavior are shown. "
-                "Offline and opposite tracking-mode tunes are hidden."
+                "Only closed-loop configs matching this filter, tracking mode, noise, behavior, and actuator are shown. "
+                "Offline and opposite tracking-mode/actuator tunes are hidden."
             )
             self._draw_wrapped_text(
                 note,
@@ -1746,7 +1785,8 @@ class StartupMapSelector:
         map_text = display_map_name(route.map_name) if route is not None else "none"
         return (
             f"Closed-loop | Filter {filter_label} | Tracking {self._tracking_mode} | Route {route_text} | "
-            f"Map {map_text or 'none'} | Sensor {self._sensor_preset} | Behavior {self._behavior_preset}"
+            f"Map {map_text or 'none'} | Sensor {self._sensor_preset} | Behavior {self._behavior_preset} | "
+            f"Actuator {self._actuator_preset}"
         )
 
     def _offline_summary_text(self) -> str:
@@ -1826,9 +1866,9 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_log_scroll = 0
         self._closed_loop_auto_tune_route_scroll = 0
         self._closed_loop_auto_tune_status_lines = [
-            "Closed-loop auto tune uses offline replay for candidate generation.",
-            "Only finalists are driven in CARLA on one selected validation route.",
-            "Sensor noise is locked from the selected profile/signature.",
+            "Closed-loop auto tune runs real CARLA route trials directly.",
+            "Each trial applies one tune and scores closed-loop route performance.",
+            "Sensor noise is locked from selected matching logs; actuator model is kept separate.",
         ]
 
     def _handle_closed_loop_auto_tune_modal_event(self, event: pygame.event.Event, client: object) -> object:
@@ -1941,7 +1981,7 @@ class StartupMapSelector:
 
         self._commit_filter_tune_editor()
         behavior_config = self._current_vehicle_behavior_config()
-        actuator_config = self._current_actuator_realism_config(behavior_config)
+        actuator_config = self._current_actuator_realism_config()
         route_identity = self._closed_loop_validation_route_identity(route)
         pending = PendingClosedLoopAutoTuneSession(
             selected_filter=record.filter_id,
@@ -1983,7 +2023,7 @@ class StartupMapSelector:
             sensor_noise_profile=self._sensor_preset,
             vehicle_behavior_profile=self._behavior_preset,
             actuator_realism_enabled=True,
-            actuator_realism_profile=str(actuator_config.get("preset_name") or self._behavior_preset),
+            actuator_realism_profile=str(actuator_config.get("preset_name") or self._actuator_preset),
             trial_count=max(1, int(self._closed_loop_auto_tune_trials or 30)),
             finalist_count=max(1, int(self._closed_loop_auto_tune_finalists or 3)),
             strategy="optuna_tpe",
@@ -2002,20 +2042,6 @@ class StartupMapSelector:
         return {
             "sensor_noise_preset": info.sensor_noise_preset,
             "sensor_noise_config": config if isinstance(config, dict) else {},
-        }
-
-    def _current_actuator_realism_config(self, behavior_config: Optional[dict[str, object]] = None) -> dict[str, object]:
-        values = dict(behavior_config or self._current_vehicle_behavior_config())
-        actuator_keys = {
-            spec.key
-            for spec in BEHAVIOR_SPECS
-            if str(getattr(spec, "group", "")).lower() == "actuator"
-        }
-        return {
-            "enabled": True,
-            "preset_name": str(values.get("preset_name") or self._behavior_preset),
-            "source": "vehicle_behavior_config",
-            **{key: values[key] for key in sorted(actuator_keys) if key in values},
         }
 
     def _closed_loop_validation_route_identity(self, route: SavedTestRoute) -> str:
@@ -2082,7 +2108,7 @@ class StartupMapSelector:
             content.width,
         )
         self._draw_text(
-            "Sensor noise is locked from the selected profile/signature; only process/model parameters are tuned.",
+            "Direct mode: every trial is driven in CARLA with no rendering; offline logs only lock sensor-noise context.",
             (content.left, content.top + 49),
             self._small_font,
             DASHBOARD.warning_color,
@@ -2187,9 +2213,9 @@ class StartupMapSelector:
         self._draw_button(self._closed_loop_auto_tune_finalists_minus_rect, "-")
         self._draw_button(self._closed_loop_auto_tune_finalists_plus_rect, "+")
         y += 27
-        self._draw_text("Strategy: optuna_tpe when available; fallback random_plus_coordinate_refinement", (content.left, y), self._small_font, DASHBOARD.text_color, content.width)
+        self._draw_text("Strategy: direct optuna_tpe ask/tell; fallback random search", (content.left, y), self._small_font, DASHBOARD.text_color, content.width)
         y += 18
-        self._draw_text("Candidate generation: offline replay only; CARLA validates finalists only.", (content.left, y), self._small_font, DASHBOARD.warning_color, content.width)
+        self._draw_text(f"Actuator: {self._actuator_preset} | Tracking-specific search space", (content.left, y), self._small_font, DASHBOARD.warning_color, content.width)
 
         pygame.draw.rect(self._surface, (14, 18, 24), console, border_radius=6)
         pygame.draw.rect(self._surface, DASHBOARD.panel_border_color, console, width=1, border_radius=6)
@@ -2215,7 +2241,10 @@ class StartupMapSelector:
             route_item = next((item for item in self._route_items if item.index == self._closed_loop_auto_tune_validation_route_index), None)
             if route_item is not None:
                 route_name = f"{route_item.route.name} ({display_map_name(route_item.route.map_name)})"
-        summary = f"Logs: {len(selected_logs)} | Noise: {noise.get('label') or 'n/a'} | Route: {route_name}"
+        summary = (
+            f"Logs: {len(selected_logs)} | Noise: {noise.get('label') or 'n/a'} | "
+            f"Route: {route_name} | Actuator: {self._actuator_preset}"
+        )
         if noise.get("mixed"):
             summary += " | mixed noise selected"
         self._draw_text(summary, (rect.left, rect.top + 13), self._small_font, DASHBOARD.warning_color if noise.get("mixed") else DASHBOARD.muted_text_color, self._closed_loop_auto_tune_start_rect.left - rect.left - 10)
@@ -2659,10 +2688,13 @@ class StartupMapSelector:
             return _NoSelection
         sensor_values = self._sensor_editor.values() if self._sensor_editor is not None else SENSOR_NOISE_PRESETS["Medium Noise"]
         behavior_values = self._behavior_editor.values() if self._behavior_editor is not None else BEHAVIOR_PRESETS["Balanced"]
+        actuator_values = self._actuator_editor.values() if self._actuator_editor is not None else ACTUATOR_REALISM_PRESETS["Realistic"]
         if self._sensor_editor is not None:
             self._sensor_preset = self._sensor_editor.active_preset
         if self._behavior_editor is not None:
             self._behavior_preset = self._behavior_editor.active_preset
+        if self._actuator_editor is not None:
+            self._actuator_preset = self._actuator_editor.active_preset
         selected_filter_tune = self._current_filter_tune_values()
         recommendation_applied = bool(self._recommendation_applied_by_filter.get(self._selected_filter_id, False))
         config = BenchmarkConfig(
@@ -2670,10 +2702,12 @@ class StartupMapSelector:
             selected_routes=tuple(routes),
             sensor_noise_config=sensor_noise_config_from_values(sensor_values, preset_name=self._sensor_preset),
             vehicle_behavior_config=driving_behavior_from_values(behavior_values, preset_name=self._behavior_preset),
+            actuator_realism_config=actuator_realism_from_values(actuator_values, preset_name=self._actuator_preset),
             selected_filter_tune=selected_filter_tune,
             tracking_mode=self._tracking_mode,
             sensor_noise_preset=self._sensor_preset,
             vehicle_behavior_preset=self._behavior_preset,
+            actuator_realism_preset=self._actuator_preset,
             metadata={
                 "startup_mode": "closed_loop_benchmark",
                 "filter_tune_recommendation_applied": recommendation_applied,

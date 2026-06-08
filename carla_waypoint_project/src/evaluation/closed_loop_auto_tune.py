@@ -1,9 +1,9 @@
 """Closed-loop benchmark auto-tuning backend.
 
 This module intentionally has no pygame/UI dependency and does not launch
-CARLA by itself.  Candidate generation is delegated to the offline replay
-auto-tuner, and closed-loop finalist validation is delegated to an injected
-runner so unit tests can exercise the flow without Unreal/CARLA.
+CARLA by itself.  Closed-loop candidates are scored by an injected route
+runner; each candidate score comes from a real controlled CARLA route trial.
+Offline replay auto-tuning remains implemented separately in filter_auto_tuner.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from datetime import datetime
 import json
 import math
 from pathlib import Path
+import random
 from typing import Callable, Optional
 
 from src.KalmanLab.registry import discover_filters
@@ -22,11 +23,12 @@ from src.evaluation.evaluation_artifacts import benchmark_root, read_json, slugi
 from src.evaluation.filter_auto_tuner import (
     AutoTuneRequest,
     AutoTuneResult,
+    AutoTuneTrialResult,
     OfflineBenchmarkAutoTuner,
     noise_profile_summary,
 )
 from src.evaluation.offline_replay_runner import _validate_windows_path_length
-from src.evaluation.sensor_noise_tune_mapper import SensorNoiseTuneMapper, noise_signature
+from src.evaluation.sensor_noise_tune_mapper import SensorNoiseTuneMapper, noise_signature, process_only_auto_tune_profile
 from src.evaluation.tune_config_schema import (
     BENCHMARK_MODE_CLOSED_LOOP,
     SCHEMA_VERSION,
@@ -42,6 +44,19 @@ from src.evaluation.tune_config_schema import (
 
 
 ProgressCallback = Callable[[str, dict[str, object]], None]
+
+ACTIVE_CONTROL_TUNE_KEYS = {
+    "enable_control_input_prediction",
+    "control_accel_gain_mps2",
+    "control_brake_decel_gain_mps2",
+    "control_steer_to_yaw_rate_gain",
+    "control_input_timeout_s",
+    "max_control_accel_delta_mps2",
+    "max_control_yaw_rate_delta_radps",
+    "max_control_speed_delta_mps",
+    "imu_accel_control_stddev_mps2",
+    "command_accel_stddev_mps2",
+}
 
 
 @dataclass(frozen=True)
@@ -303,10 +318,11 @@ class ClosedLoopBenchmarkRunnerAdapter:
 
 
 class ClosedLoopBenchmarkAutoTuner:
-    """Two-stage closed-loop auto tuner backend.
+    """Direct closed-loop auto tuner backend.
 
-    Stage 1 runs offline replay candidate generation. Stage 2 validates only
-    finalists through the injected closed-loop runner.
+    Each search trial applies one candidate tune and delegates a real
+    closed-loop CARLA route trial to the injected runner.  When Optuna is
+    available, the study is told the closed-loop objective after each trial.
     """
 
     def __init__(
@@ -365,40 +381,51 @@ class ClosedLoopBenchmarkAutoTuner:
         write_json(run_folder / "closed_loop_auto_tune_request.json", request.to_dict())
 
         strategy = _resolve_candidate_generation_strategy(request.strategy)
-        offline_request = AutoTuneRequest(
-            filter_id=request.filter_id,
-            sensor_log_paths=tuple(request.offline_log_paths),
-            base_tune=base_tune,
-            auto_tune_profile=dict(request.auto_tune_profile),
-            max_trials=max(1, int(request.trial_count)),
-            output_root=request.output_root,
-            keep_trial_outputs=request.keep_trial_outputs,
-            keep_only_best_trial_output=False,
-            generate_trial_plots=request.generate_trial_plots,
-            allow_mixed_noise_logs=request.allow_mixed_noise_logs,
-            metadata={
-                **dict(request.metadata),
-                "random_seed": int(request.random_seed),
-                "candidate_generation_strategy": request.strategy,
-                "closed_loop_candidate_generation": True,
-                "tracking_mode_for_final_validation": request.tracking_mode,
+        search_profile = _closed_loop_search_profile(request.auto_tune_profile, request.tracking_mode, request.actuator_realism_config)
+        search_params = _closed_loop_search_params(search_profile)
+        total_trials = max(1, int(request.trial_count or 1))
+        _emit(
+            progress_callback,
+            "search_started",
+            {
+                "trial_count": total_trials,
+                "strategy": strategy,
+                "search_param_count": len(search_params),
+                "tracking_mode": request.tracking_mode,
+                "actuator_realism_profile": request.actuator_realism_profile,
+                "actuator_search_policy": _actuator_search_policy(request.actuator_realism_config),
             },
         )
-        _emit(progress_callback, "candidate_generation_started", {"trial_count": offline_request.max_trials, "strategy": strategy})
-        offline_result = self._offline_tuner.run(
-            offline_request,
-            progress_callback=progress_callback,
-            stop_requested=stop_requested,
-        )
-        finalists = _select_finalists(offline_result, request.finalist_count)
-        if not finalists:
-            raise ValueError("Offline candidate generation produced no successful finalist tunes.")
-        _write_finalists_csv(run_folder / "finalists.csv", finalists)
-
         validation_results: list[ClosedLoopValidationResult] = []
-        for finalist in finalists:
+        optuna_study = _create_direct_optuna_study(strategy, request, search_params, base_tune)
+        rng = random.Random(int(request.random_seed))
+        best_score_so_far: Optional[float] = None
+        for trial_index in range(1, total_trials + 1):
             if stop_requested is not None and stop_requested():
                 break
+            optuna_trial = None
+            if optuna_study is not None and search_params:
+                optuna_trial = optuna_study.ask()
+            candidate_tune = _direct_candidate_tune(
+                base_tune=base_tune,
+                params=search_params,
+                optuna_trial=optuna_trial,
+                rng=rng,
+                trial_index=trial_index,
+            )
+            finalist = ClosedLoopFinalist(
+                rank=trial_index,
+                candidate_tune=candidate_tune,
+                offline_score=0.0,
+                offline_metrics={
+                    "candidate_generation_stage": "direct_closed_loop",
+                    "candidate_type": "baseline_current" if trial_index == 1 else strategy,
+                    "tracking_mode": request.tracking_mode,
+                    "actuator_search_policy": _actuator_search_policy(request.actuator_realism_config),
+                },
+                trial_index=trial_index,
+                source_output_folder=None,
+            )
             validation_request = ClosedLoopValidationRequest(
                 filter_id=request.filter_id,
                 tracking_mode=request.tracking_mode,
@@ -407,27 +434,93 @@ class ClosedLoopBenchmarkAutoTuner:
                 sensor_noise_config=dict(request.sensor_noise_config),
                 vehicle_behavior_config=dict(request.vehicle_behavior_config),
                 actuator_realism_config=dict(request.actuator_realism_config),
-                output_folder=run_folder / "v" / f"f{finalist.rank:03d}",
+                output_folder=run_folder / "trials" / f"t{trial_index:03d}",
             )
-            _emit(progress_callback, "finalist_validation_started", {"finalist_rank": finalist.rank})
+            _emit(
+                progress_callback,
+                "trial_started",
+                {
+                    "trial_index": trial_index,
+                    "trial_total": total_trials,
+                    "stage": "closed_loop_search",
+                    "candidate_tune": dict(candidate_tune),
+                    "route_name": validation_route.name,
+                    "tracking_mode": request.tracking_mode,
+                    "actuator_realism_profile": request.actuator_realism_profile,
+                    "best_score": best_score_so_far,
+                },
+            )
             runner_result = self._run_validation(validation_request)
             validation = _validation_result_from_runner(runner_result, validation_request)
             validation_results.append(validation)
+            if optuna_study is not None and optuna_trial is not None:
+                optuna_study.tell(optuna_trial, validation.closed_loop_score)
+            if best_score_so_far is None or validation.closed_loop_score < best_score_so_far:
+                best_score_so_far = float(validation.closed_loop_score)
+                _emit(
+                    progress_callback,
+                    "new_search_best",
+                    {
+                        "trial_index": trial_index,
+                        "score": best_score_so_far,
+                        "metrics": dict(validation.raw_metrics),
+                        "candidate_tune": dict(candidate_tune),
+                    },
+                )
+            write_json(run_folder / f"trial_{trial_index:03d}.json", validation.to_dict())
             _emit(
                 progress_callback,
-                "finalist_validation_finished",
-                {"finalist_rank": finalist.rank, "score": validation.closed_loop_score},
+                "trial_finished",
+                {
+                    "trial_index": trial_index,
+                    "trial_total": total_trials,
+                    "stage": "closed_loop_search",
+                    "score": validation.closed_loop_score,
+                    "best_score": best_score_so_far,
+                    "failed": not validation.route_completion_success,
+                    "failure_reason": validation.abort_reason,
+                    "metrics": dict(validation.raw_metrics),
+                    "route_completion_success": validation.route_completion_success,
+                    "tracking_mode": request.tracking_mode,
+                    "actuator_realism_profile": request.actuator_realism_profile,
+                },
             )
         if not validation_results:
-            raise ValueError("No closed-loop finalist validations completed.")
+            raise ValueError("No closed-loop auto-tune trials completed.")
 
         best_validation = min(validation_results, key=lambda item: item.closed_loop_score)
         best_tune = dict(best_validation.candidate_tune)
         best_score = float(best_validation.closed_loop_score)
         best_metrics = dict(best_validation.raw_metrics)
         best_metrics["closed_loop_score"] = best_score
+        direct_trial_results = _direct_auto_tune_trial_results(validation_results)
+        offline_result = AutoTuneResult(
+            filter_id=request.filter_id,
+            best_tune=best_tune,
+            best_score=best_score,
+            best_metrics=best_metrics,
+            selected_logs=tuple(Path(path) for path in request.offline_log_paths),
+            trial_results=tuple(direct_trial_results),
+            output_folder=run_folder,
+            saved_config_path=None,
+            baseline_score=direct_trial_results[0].score if direct_trial_results else None,
+            final_score=best_score,
+            improved_over_baseline=(
+                bool(direct_trial_results)
+                and direct_trial_results[0].score is not None
+                and best_score < float(direct_trial_results[0].score)
+            ),
+            recommendation_status=(
+                "improved"
+                if direct_trial_results and direct_trial_results[0].score is not None and best_score < float(direct_trial_results[0].score)
+                else "baseline_kept"
+            ),
+            verification_results=(),
+        )
         validation_dicts = [result.to_dict() for result in validation_results]
+        finalists = _direct_finalists_from_validations(validation_results, request.finalist_count)
         finalist_dicts = [finalist.to_dict() for finalist in finalists]
+        _write_finalists_csv(run_folder / "finalists.csv", finalists)
         _write_validations_csv(run_folder / "validations.csv", validation_results)
 
         config = build_closed_loop_schema_v2_config(
@@ -450,7 +543,7 @@ class ClosedLoopBenchmarkAutoTuner:
             optuna_available=offline_auto_tuner_module.optuna is not None,
             optuna_study_path=None,
             finalist_count=len(finalists),
-            offline_candidate_results=finalist_dicts,
+            offline_candidate_results=[],
             closed_loop_validation_results=validation_dicts,
             score=best_score,
             best_metrics=best_metrics,
@@ -458,14 +551,21 @@ class ClosedLoopBenchmarkAutoTuner:
             base_tune=base_tune,
             locked_sensor_noise_values=dict(locked.values),
             output_folder=run_folder,
-            extra=_closed_loop_extra_metadata(request, offline_result, locked.signature, run_folder, locked.sources),
+            extra=_closed_loop_extra_metadata(
+                request,
+                locked.signature,
+                run_folder,
+                locked.sources,
+                search_profile,
+                validation_dicts,
+                finalist_dicts,
+            ),
         )
         _ensure_backend_config_compatible(config, request)
         saved_config_path = save_closed_loop_best_tune(request.output_root, request.filter_id, request.tracking_mode, run_folder, config)
         summary = dict(config)
         summary.update(
             {
-                "offline_auto_tune_output_folder": str(offline_result.output_folder),
                 "saved_config_path": str(saved_config_path),
             }
         )
@@ -550,11 +650,15 @@ def closed_loop_objective_score(metrics: dict[str, object]) -> float:
     rmse = _first_float(metrics, "eval_filtered_rmse_m", "filtered_rmse_m", "mean_filtered_rmse_m")
     mean_cte = _first_float(metrics, "driving_mean_cross_track_error_m", "mean_cross_track_error_m")
     max_cte = _first_float(metrics, "driving_max_cross_track_error_m", "max_cross_track_error_m")
+    speed_rmse = _first_float(metrics, "eval_speed_rmse_mps", "driving_speed_rmse_mps", "speed_rmse_mps")
+    yaw_rmse = _first_float(metrics, "eval_yaw_rmse_deg", "driving_yaw_rmse_deg", "yaw_rmse_deg")
     completion_time = _first_float(metrics, "completion_time_s")
     score = failure_penalty
     score += 5.0 * (rmse if rmse is not None else 1000.0)
     score += 2.0 * (mean_cte if mean_cte is not None else 100.0)
     score += 0.5 * (max_cte if max_cte is not None else 100.0)
+    score += 0.5 * (speed_rmse if speed_rmse is not None else 0.0)
+    score += 0.02 * (yaw_rmse if yaw_rmse is not None else 0.0)
     score += 0.02 * (completion_time if completion_time is not None else 0.0)
 
     nis = _max_nis_type_mean(
@@ -673,32 +777,269 @@ def _select_finalists(offline_result: AutoTuneResult, finalist_count: int) -> li
 
 def _closed_loop_extra_metadata(
     request: ClosedLoopAutoTuneRequest,
-    offline_result: AutoTuneResult,
     noise_sig: str,
     run_folder: Path,
     locked_sensor_noise_sources: dict[str, str],
+    search_profile: dict[str, object],
+    direct_trial_results: list[dict[str, object]],
+    direct_finalists: list[dict[str, object]],
 ) -> dict[str, object]:
-    offline_summary = read_json(Path(offline_result.output_folder) / "auto_tune_summary.json")
-    offline_metadata = offline_summary.get("metadata") if isinstance(offline_summary.get("metadata"), dict) else {}
     return {
         "source": "closed_loop_auto_tune",
         "physical_output_folder": str(run_folder),
         "logical_output_group": _closed_loop_logical_group(request.filter_id, request.tracking_mode, noise_sig),
         "logical_output_root": str(_closed_loop_noise_root(request.output_root, request.filter_id, request.tracking_mode, noise_sig)),
         "logical_index_path": str(_closed_loop_index_path(request.output_root, request.filter_id, request.tracking_mode)),
-        "candidate_generation_stage": "offline_replay_process_only",
-        "closed_loop_validation_stage": "finalists_only",
-        "offline_auto_tune_output_folder": str(offline_result.output_folder),
-        "offline_candidate_staging_folder": str(offline_metadata.get("offline_candidate_staging_folder") or ""),
+        "candidate_generation_stage": "direct_closed_loop_route_trials",
+        "closed_loop_validation_stage": "every_search_trial",
+        "offline_auto_tune_output_folder": "",
+        "offline_candidate_staging_folder": "",
+        "direct_closed_loop_trial_results": direct_trial_results,
+        "direct_closed_loop_finalists": direct_finalists,
+        "direct_closed_loop_trial_count": len(direct_trial_results),
         "locked_sensor_noise_sources": dict(locked_sensor_noise_sources),
         "metadata": dict(request.metadata),
+        "auto_tune_profile_used": dict(search_profile),
+        "actuator_search_policy": _actuator_search_policy(request.actuator_realism_config),
+        "actuator_model_profile": request.actuator_realism_profile,
+        "actuator_model_config": dict(request.actuator_realism_config),
         "active_control_parameter_policy": (
-            "Offline candidate generation uses passive sensor-log replay and does not validate active-control-specific "
-            "parameters. Active tracking finalists are evaluated only during closed-loop validation."
+            "Active tracking tune search includes supported active-control prediction parameters and scores each "
+            "candidate in a real closed-loop CARLA route trial."
             if request.tracking_mode == TRACKING_ACTIVE
-            else "Passive closed-loop finalists are generated from passive offline replay and validated in passive closed-loop mode."
+            else "Passive tracking tune search excludes active-control prediction parameters and scores each candidate in passive closed-loop mode."
         ),
+        "performance_mode": {
+            "no_rendering_mode": True,
+            "fixed_delta_seconds_policy": "CARLA fixed_delta_seconds is not changed by the auto tuner.",
+            "visual_workload_policy": "Direct closed-loop auto tune uses only a lightweight Pygame text progress monitor.",
+        },
     }
+
+
+def _closed_loop_search_profile(
+    profile: dict[str, object],
+    tracking_mode: str,
+    actuator_realism_config: dict[str, object],
+) -> dict[str, object]:
+    result = process_only_auto_tune_profile(dict(profile))
+    for group in ("primary", "secondary"):
+        params = result.get(group)
+        if not isinstance(params, list):
+            result[group] = []
+            continue
+        filtered: list[dict[str, object]] = []
+        for param in params:
+            if not isinstance(param, dict):
+                continue
+            key = str(param.get("key") or "")
+            if tracking_mode != TRACKING_ACTIVE and key in ACTIVE_CONTROL_TUNE_KEYS:
+                continue
+            filtered.append(_actuator_adjusted_param(dict(param), actuator_realism_config, tracking_mode))
+        result[group] = filtered
+    result["closed_loop_direct"] = True
+    result["tracking_mode"] = tracking_mode
+    result["actuator_search_policy"] = _actuator_search_policy(actuator_realism_config)
+    return result
+
+
+def _closed_loop_search_params(profile: dict[str, object]) -> list[dict[str, object]]:
+    params: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for group in ("primary", "secondary"):
+        for param in list(profile.get(group) or []):
+            if not isinstance(param, dict):
+                continue
+            key = str(param.get("key") or "")
+            if not key or key in seen:
+                continue
+            low = _optional_float(param.get("min"))
+            high = _optional_float(param.get("max"))
+            if low is None and high is None:
+                continue
+            if low is not None and high is not None and high <= low:
+                continue
+            seen.add(key)
+            params.append(dict(param))
+    return params
+
+
+def _actuator_adjusted_param(
+    param: dict[str, object],
+    actuator_realism_config: dict[str, object],
+    tracking_mode: str,
+) -> dict[str, object]:
+    key = str(param.get("key") or "")
+    if tracking_mode != TRACKING_ACTIVE or key not in ACTIVE_CONTROL_TUNE_KEYS:
+        return param
+    severity = _actuator_imperfection_score(actuator_realism_config)
+    low = _optional_float(param.get("min"))
+    high = _optional_float(param.get("max"))
+    if high is None:
+        return param
+    if severity <= 0.08:
+        param["search_policy"] = "perfect_actuator_confident"
+        if key in {"control_accel_gain_mps2", "control_brake_decel_gain_mps2", "control_steer_to_yaw_rate_gain"}:
+            param["max"] = high
+        return param
+    param["search_policy"] = "realistic_actuator_conservative"
+    if key in {"control_accel_gain_mps2", "control_brake_decel_gain_mps2", "control_steer_to_yaw_rate_gain"}:
+        param["max"] = max(low if low is not None else 0.0, high * 0.75)
+    elif key in {"max_control_accel_delta_mps2", "max_control_yaw_rate_delta_radps", "max_control_speed_delta_mps"}:
+        param["max"] = max(low if low is not None else 0.0, high * 0.65)
+    elif key == "control_input_timeout_s":
+        param["min"] = max(low if low is not None else 0.02, min(high, 0.08 + 0.20 * severity))
+    return param
+
+
+def _actuator_search_policy(actuator_realism_config: dict[str, object]) -> str:
+    severity = _actuator_imperfection_score(actuator_realism_config)
+    if severity <= 0.08:
+        return "perfect_actuator_confident_active_search"
+    if severity <= 0.35:
+        return "mild_realistic_balanced_active_search"
+    return "delayed_or_noisy_conservative_active_search"
+
+
+def _actuator_imperfection_score(config: dict[str, object]) -> float:
+    profile = str(config.get("preset_name") or "").lower()
+    if "perfect" in profile:
+        return 0.0
+    delay = _optional_float(config.get("actuator_delay_s")) or 0.0
+    noise = _optional_float(config.get("actuator_noise")) or 0.0
+    smoothing = max(
+        _optional_float(config.get("throttle_smoothing")) or 0.0,
+        _optional_float(config.get("brake_smoothing")) or 0.0,
+        _optional_float(config.get("steering_smoothing")) or 0.0,
+    )
+    score = 1.5 * delay + 8.0 * noise + 0.6 * smoothing
+    if "delayed" in profile or "harsh" in profile:
+        score += 0.25
+    return max(0.0, min(1.0, score))
+
+
+def _create_direct_optuna_study(
+    strategy: str,
+    request: ClosedLoopAutoTuneRequest,
+    params: list[dict[str, object]],
+    base_tune: dict[str, object],
+) -> object:
+    optuna_module = offline_auto_tuner_module.optuna
+    if strategy != "direct_closed_loop_optuna_tpe" or optuna_module is None or not params:
+        return None
+    study = optuna_module.create_study(  # type: ignore[union-attr]
+        direction="minimize",
+        sampler=optuna_module.samplers.TPESampler(seed=int(request.random_seed)),  # type: ignore[union-attr]
+    )
+    study.enqueue_trial(
+        {
+            str(param.get("key")): _param_bound_or_base_value(param, base_tune)
+            for param in params
+            if str(param.get("key") or "")
+        }
+    )
+    return study
+
+
+def _direct_candidate_tune(
+    *,
+    base_tune: dict[str, object],
+    params: list[dict[str, object]],
+    optuna_trial: object,
+    rng: random.Random,
+    trial_index: int,
+) -> dict[str, object]:
+    candidate = dict(base_tune)
+    if not params:
+        return candidate
+    if optuna_trial is not None:
+        suggest_float = getattr(optuna_trial, "suggest_float")
+        for param in params:
+            key = str(param.get("key") or "")
+            if not key:
+                continue
+            low, high = _param_bounds(param, base_tune.get(key))
+            log = str(param.get("scale") or "").lower() == "log" and low > 0.0 and high > low
+            candidate[key] = suggest_float(key, low, high, log=log)
+        return candidate
+    if trial_index == 1:
+        return candidate
+    for param in params:
+        key = str(param.get("key") or "")
+        if key:
+            candidate[key] = _sample_param(rng, param, base_tune.get(key))
+    return candidate
+
+
+def _param_bound_or_base_value(param: dict[str, object], base_tune: dict[str, object]) -> float:
+    key = str(param.get("key") or "")
+    low, high = _param_bounds(param, base_tune.get(key))
+    base = _optional_float(base_tune.get(key))
+    if base is None:
+        return low + 0.5 * (high - low)
+    return max(low, min(high, base))
+
+
+def _sample_param(rng: random.Random, param: dict[str, object], base_value: object) -> float:
+    low, high = _param_bounds(param, base_value)
+    if str(param.get("scale") or "").lower() == "log" and low > 0.0 and high > low:
+        return math.exp(rng.uniform(math.log(low), math.log(high)))
+    return rng.uniform(low, high)
+
+
+def _param_bounds(param: dict[str, object], base_value: object) -> tuple[float, float]:
+    low = _optional_float(param.get("min"))
+    high = _optional_float(param.get("max"))
+    base = _optional_float(base_value)
+    if low is None:
+        low = max(1.0e-9, (base or 1.0) * 0.25)
+    if high is None:
+        high = max(low, (base or low) * 4.0)
+    if high <= low:
+        high = low + max(1.0e-6, abs(low) * 0.1)
+    return float(low), float(high)
+
+
+def _direct_auto_tune_trial_results(validations: list[ClosedLoopValidationResult]) -> list[AutoTuneTrialResult]:
+    results: list[AutoTuneTrialResult] = []
+    for validation in validations:
+        metrics = dict(validation.raw_metrics)
+        metrics["closed_loop_score"] = validation.closed_loop_score
+        results.append(
+            AutoTuneTrialResult(
+                trial_index=validation.finalist_rank,
+                candidate_tune=dict(validation.candidate_tune),
+                score=float(validation.closed_loop_score),
+                metrics=metrics,
+                output_folder=validation.output_folder,
+                failed=not validation.route_completion_success,
+                failure_reason=validation.abort_reason,
+                candidate_id=f"direct_trial_{validation.finalist_rank:03d}",
+                candidate_type="direct_closed_loop",
+                stage="closed_loop_search",
+            )
+        )
+    return results
+
+
+def _direct_finalists_from_validations(
+    validations: list[ClosedLoopValidationResult],
+    finalist_count: int,
+) -> list[ClosedLoopFinalist]:
+    ordered = sorted(validations, key=lambda item: item.closed_loop_score)
+    finalists: list[ClosedLoopFinalist] = []
+    for rank, validation in enumerate(ordered[: max(1, int(finalist_count or 1))], start=1):
+        finalists.append(
+            ClosedLoopFinalist(
+                rank=rank,
+                candidate_tune=dict(validation.candidate_tune),
+                offline_score=float(validation.closed_loop_score),
+                offline_metrics=dict(validation.raw_metrics),
+                trial_index=validation.finalist_rank,
+                source_output_folder=validation.output_folder,
+            )
+        )
+    return finalists
 
 
 def _ensure_backend_config_compatible(config: dict[str, object], request: ClosedLoopAutoTuneRequest) -> None:
@@ -876,11 +1217,11 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
 
 def _resolve_candidate_generation_strategy(requested_strategy: str) -> str:
     requested = str(requested_strategy or "").strip().lower()
-    if requested == "random_plus_coordinate_refinement":
-        return "random_plus_coordinate_refinement"
+    if requested in {"random_plus_coordinate_refinement", "random", "direct_closed_loop_random"}:
+        return "direct_closed_loop_random"
     if offline_auto_tuner_module.optuna is not None:
-        return "optuna_tpe"
-    return "random_plus_coordinate_refinement"
+        return "direct_closed_loop_optuna_tpe"
+    return "direct_closed_loop_random"
 
 
 def _run_folder_name() -> str:

@@ -32,11 +32,14 @@ from src.core.simulation import SimulationClock
 from src.core.state_providers import GroundTruthStateProvider
 from src.core.vehicle_state import VehicleState
 from src.evaluation.benchmark_config import (
+    ACTUATOR_REALISM_PRESETS,
     BEHAVIOR_PRESETS,
     BenchmarkConfig,
     SENSOR_NOISE_PRESETS,
     SENSOR_NOISE_SPECS,
     SensorNoiseConfig,
+    actuator_realism_from_values,
+    apply_actuator_values,
     apply_behavior_values,
     default_sensor_noise_values,
     sensor_noise_config_from_values,
@@ -131,6 +134,7 @@ class SimulationApp:
         self._startup_benchmark_config = benchmark_config
         self._startup_offline_recording_config = offline_recording_config
         self._startup_closed_loop_auto_tune_request = closed_loop_auto_tune_request
+        self._lightweight_closed_loop_auto_tune = closed_loop_auto_tune_request is not None
         self._client_manager = CarlaClientManager(requested_map_name=requested_map_name)
         self._clock = SimulationClock()
         self._display: Optional[PygameDisplay] = None
@@ -168,8 +172,10 @@ class SimulationApp:
         )
         if benchmark_config is not None:
             apply_behavior_values(self.driving_behavior_config, benchmark_config.vehicle_behavior_config)
+            apply_actuator_values(self.driving_behavior_config, benchmark_config.actuator_realism_config or {})
         elif closed_loop_auto_tune_request is not None:
             apply_behavior_values(self.driving_behavior_config, closed_loop_auto_tune_request.vehicle_behavior_config)
+            apply_actuator_values(self.driving_behavior_config, closed_loop_auto_tune_request.actuator_realism_config)
         self.autonomous_controller = VehicleController(behavior_config=self.driving_behavior_config)
         self.speed_planner = CurvatureSpeedPlanner(self.driving_behavior_config)
         self.actuator_realism = ActuatorRealism(self.driving_behavior_config)
@@ -221,6 +227,13 @@ class SimulationApp:
         self._offline_recording_start_attempted = False
         self._closed_loop_auto_tune_start_attempted = False
         self._closed_loop_auto_tune_cancel_requested = False
+        self._closed_loop_auto_tune_status_lines: list[str] = []
+        self._closed_loop_auto_tune_live_line = ""
+        self._closed_loop_auto_tune_best_score: Optional[float] = None
+        self._closed_loop_auto_tune_previous_no_rendering: Optional[bool] = None
+        self._closed_loop_auto_tune_trial_wall_start: Optional[float] = None
+        self._closed_loop_auto_tune_trial_sim_start: Optional[float] = None
+        self._closed_loop_auto_tune_trial_tick_count = 0
         self._last_sensor_apply_status = "Sensor noise changes respawn GNSS/IMU safely."
         self._failure_monitor_last_progress_time: Optional[float] = None
         self._failure_monitor_last_position: Optional[tuple[float, float]] = None
@@ -261,7 +274,10 @@ class SimulationApp:
             world=self._client_manager.world,
             blueprint_library=self._client_manager.blueprint_library,
         )
-        self._camera_sensor = self._sensor_manager.create_rgb_camera(attach_to=self._vehicle)
+        if self._lightweight_closed_loop_auto_tune:
+            self._camera_sensor = None
+        else:
+            self._camera_sensor = self._sensor_manager.create_rgb_camera(attach_to=self._vehicle)
         self._gnss_sensor = self._sensor_manager.create_gnss(
             attach_to=self._vehicle,
             config=self.sensor_noise_config,
@@ -270,7 +286,10 @@ class SimulationApp:
             attach_to=self._vehicle,
             config=self.sensor_noise_config,
         )
-        self._lidar_sensor = self._sensor_manager.create_lidar(attach_to=self._vehicle)
+        if self._lightweight_closed_loop_auto_tune:
+            self._lidar_sensor = None
+        else:
+            self._lidar_sensor = self._sensor_manager.create_lidar(attach_to=self._vehicle)
 
         world_map = self._client_manager.world_map
         self._waypoint_manager = WaypointManager(world_map=world_map)
@@ -334,10 +353,8 @@ class SimulationApp:
             "display": self._display,
             "control panel": self._control_panel,
             "vehicle": self._vehicle,
-            "camera sensor": self._camera_sensor,
             "GNSS sensor": self._gnss_sensor,
             "IMU sensor": self._imu_sensor,
-            "LiDAR sensor": self._lidar_sensor,
             "waypoint manager": self._waypoint_manager,
             "manual controller": self._manual_controller,
             "ground-truth provider": self._ground_truth_provider,
@@ -350,6 +367,9 @@ class SimulationApp:
             "test runner": self._test_runner,
             "offline recorder": self._offline_recorder,
         }
+        if not self._lightweight_closed_loop_auto_tune:
+            required["camera sensor"] = self._camera_sensor
+            required["LiDAR sensor"] = self._lidar_sensor
         missing = [name for name, value in required.items() if value is None]
         if missing:
             raise RuntimeError(f"Application is not initialized: {', '.join(missing)}.")
@@ -475,6 +495,7 @@ class SimulationApp:
         self._benchmark_start_attempted = True
         self.sensor_noise_config = config.sensor_noise_config
         apply_behavior_values(self.driving_behavior_config, config.vehicle_behavior_config)
+        apply_actuator_values(self.driving_behavior_config, config.actuator_realism_config or {})
         if self._sensor_noise_panel is not None:
             self._sensor_noise_panel.set_values(
                 {
@@ -540,6 +561,7 @@ class SimulationApp:
             return
         self.sensor_noise_config = SensorNoiseConfig.from_dict(request.sensor_noise_config)
         apply_behavior_values(self.driving_behavior_config, request.vehicle_behavior_config)
+        apply_actuator_values(self.driving_behavior_config, request.actuator_realism_config)
         if self._sensor_noise_panel is not None:
             self._sensor_noise_panel.set_values(
                 {
@@ -563,9 +585,18 @@ class SimulationApp:
         self._map_selection_active = False
         self._drive_mode = DriveMode.AUTONOMOUS
         self._closed_loop_auto_tune_cancel_requested = False
-        self._planner_status = "Closed-loop auto tune: candidate generation starting"
+        self._closed_loop_auto_tune_best_score = None
+        self._closed_loop_auto_tune_live_line = ""
+        self._closed_loop_auto_tune_status_lines = [
+            "Closed-loop auto tune: direct CARLA route trials starting",
+            f"Filter {request.filter_id} | tracking {request.tracking_mode} | actuator {request.actuator_realism_profile}",
+            "CARLA no-rendering mode enabled; fixed_delta_seconds is unchanged.",
+        ]
+        self._closed_loop_auto_tune_previous_no_rendering = self._client_manager.no_rendering_mode
+        self._client_manager.set_no_rendering_mode(True)
+        self._planner_status = "Closed-loop auto tune: direct trial search starting"
         self._control_status_text = self._planner_status
-        self._draw_frame_without_camera()
+        self._draw_closed_loop_auto_tune_progress_frame()
         runner = AppClosedLoopValidationRunner(self)
         try:
             result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(
@@ -576,9 +607,12 @@ class SimulationApp:
         except Exception as exc:
             self._planner_status = f"Closed-loop auto tune failed: {exc}"
             self._control_status_text = self._planner_status
+            self._closed_loop_auto_tune_status_lines.append(self._planner_status)
             self._drive_mode = DriveMode.MANUAL
-            self._draw_frame_without_camera()
+            self._restore_closed_loop_auto_tune_rendering()
+            self._draw_closed_loop_auto_tune_progress_frame()
             return
+        self._restore_closed_loop_auto_tune_rendering()
         if self._filter_manager is not None and result.best_tune:
             self._filter_manager.update_filter_tune(result.filter_id, result.best_tune, reset_active=True)
             self._filter_manager.switch_filter(result.filter_id, skip_current_sensor_frames=True)
@@ -586,36 +620,168 @@ class SimulationApp:
             self._sync_filter_tune_panel()
         self._planner_status = f"Closed-loop auto tune complete: {result.saved_config_path}"
         self._control_status_text = self._planner_status
+        self._closed_loop_auto_tune_status_lines.append(self._planner_status)
         self._drive_mode = DriveMode.MANUAL
-        self._draw_frame_without_camera()
+        self._draw_closed_loop_auto_tune_progress_frame()
 
     def _closed_loop_auto_tune_progress_callback(self, event_name: str, payload: dict[str, object]) -> None:
-        if event_name == "candidate_generation_started":
-            text = f"Closed-loop auto tune: candidate generation started ({payload.get('strategy')})"
-        elif event_name == "trial_started":
-            text = f"Closed-loop auto tune: offline trial {payload.get('trial_index')}/{payload.get('trial_total')}"
-        elif event_name == "trial_finished":
-            text = f"Closed-loop auto tune: offline trial {payload.get('trial_index')} score {payload.get('score')}"
-        elif event_name == "finalist_validation_started":
-            text = f"Closed-loop auto tune: validating finalist {payload.get('finalist_rank')}"
-        elif event_name == "finalist_validation_finished":
+        def number_text(value: object, digits: int = 3) -> str:
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                return f"{float(value):.{digits}f}"
+            return "n/a"
+
+        if event_name == "search_started":
             text = (
-                f"Closed-loop auto tune: finalist {payload.get('finalist_rank')} "
-                f"closed-loop score {payload.get('score')}"
+                f"Direct search started | trials {payload.get('trial_count')} | {payload.get('strategy')} | "
+                f"params {payload.get('search_param_count')} | actuator {payload.get('actuator_realism_profile')}"
+            )
+        elif event_name == "trial_started":
+            text = (
+                f"Trial {payload.get('trial_index')}/{payload.get('trial_total')} started | "
+                f"route {payload.get('route_name')} | best {number_text(payload.get('best_score'))}"
+            )
+        elif event_name == "trial_finished":
+            metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+            self._closed_loop_auto_tune_best_score = (
+                float(payload["best_score"])
+                if isinstance(payload.get("best_score"), (int, float)) and math.isfinite(float(payload["best_score"]))
+                else self._closed_loop_auto_tune_best_score
+            )
+            text = (
+                f"Trial {payload.get('trial_index')}/{payload.get('trial_total')} finished | "
+                f"score {number_text(payload.get('score'))} | best {number_text(self._closed_loop_auto_tune_best_score)} | "
+                f"RMSE {number_text(metrics.get('eval_filtered_rmse_m') or metrics.get('filtered_rmse_m'))} m | "
+                f"CTE {number_text(metrics.get('driving_mean_cross_track_error_m') or metrics.get('mean_cross_track_error_m'))} m | "
+                f"success {'yes' if payload.get('route_completion_success') else 'no'}"
+            )
+            reason = str(payload.get("failure_reason") or "")
+            if reason:
+                text += f" | reason {reason}"
+        elif event_name == "new_search_best":
+            self._closed_loop_auto_tune_best_score = (
+                float(payload["score"])
+                if isinstance(payload.get("score"), (int, float)) and math.isfinite(float(payload["score"]))
+                else self._closed_loop_auto_tune_best_score
+            )
+            text = (
+                f"New best | trial {payload.get('trial_index')} | "
+                f"score {number_text(self._closed_loop_auto_tune_best_score)}"
             )
         elif event_name == "completed":
-            text = f"Closed-loop auto tune complete: {payload.get('saved_config_path')}"
+            text = (
+                f"Closed-loop auto tune complete | best {number_text(payload.get('best_score'))} | "
+                f"saved {payload.get('saved_config_path')}"
+            )
         else:
             text = f"Closed-loop auto tune: {event_name}"
         self._planner_status = text
         self._control_status_text = text
-        self._draw_frame_without_camera()
+        self._closed_loop_auto_tune_status_lines.append(text)
+        self._closed_loop_auto_tune_status_lines = self._closed_loop_auto_tune_status_lines[-80:]
+        self._draw_closed_loop_auto_tune_progress_frame()
+        self._pump_closed_loop_auto_tune_events()
+
+    def _restore_closed_loop_auto_tune_rendering(self) -> None:
+        if self._closed_loop_auto_tune_previous_no_rendering is None:
+            return
+        self._client_manager.set_no_rendering_mode(self._closed_loop_auto_tune_previous_no_rendering)
+        self._closed_loop_auto_tune_previous_no_rendering = None
+
+    def _pump_closed_loop_auto_tune_events(self) -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self._closed_loop_auto_tune_cancel_requested = True
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self._closed_loop_auto_tune_cancel_requested = True
         pygame.event.pump()
+
+    def _draw_closed_loop_auto_tune_progress_frame(self) -> None:
+        if self._display is None:
+            return
+        surface = self._display.surface
+        surface.fill((8, 12, 18))
+        width, height = surface.get_size()
+        modal_w = min(width - 80, 1120)
+        modal_h = min(height - 70, 520)
+        modal = pygame.Rect(0, 0, modal_w, modal_h)
+        modal.center = (width // 2, height // 2)
+        pygame.draw.rect(surface, DASHBOARD.panel_background_color, modal, border_radius=8)
+        pygame.draw.rect(surface, DASHBOARD.success_color, modal, width=1, border_radius=8)
+        content = modal.inflate(-28, -24)
+        title = self._filter_overlay_bold_font.render("Closed-loop Auto Tune", True, DASHBOARD.title_color)
+        surface.blit(title, (content.left, content.top))
+        subtitle = self._filter_overlay_small_font.render(
+            "Direct no-render CARLA route trials | ESC or window close requests stop",
+            True,
+            DASHBOARD.muted_text_color,
+        )
+        surface.blit(subtitle, (content.left, content.top + 26))
+        if self._closed_loop_auto_tune_live_line:
+            live = self._filter_overlay_font.render(
+                self._fit_overlay_text(self._closed_loop_auto_tune_live_line, self._filter_overlay_font, content.width),
+                True,
+                DASHBOARD.success_color,
+            )
+            surface.blit(live, (content.left, content.top + 56))
+        y = content.top + 88
+        line_height = 19
+        max_lines = max(1, (content.bottom - y) // line_height)
+        for line in self._closed_loop_auto_tune_status_lines[-max_lines:]:
+            color = DASHBOARD.warning_color if any(word in line.lower() for word in ("failed", "cancel", "reason", "blocked")) else DASHBOARD.text_color
+            rendered = self._filter_overlay_small_font.render(
+                self._fit_overlay_text(str(line), self._filter_overlay_small_font, content.width),
+                True,
+                color,
+            )
+            surface.blit(rendered, (content.left, y))
+            y += line_height
+        pygame.display.flip()
+
+    def _update_closed_loop_auto_tune_live_line(self) -> None:
+        wall = self._closed_loop_auto_tune_trial_wall_seconds()
+        sim = self._closed_loop_auto_tune_trial_sim_seconds()
+        speedup = sim / wall if wall > 1.0e-9 else 0.0
+        tps = self._closed_loop_auto_tune_trial_tick_count / wall if wall > 1.0e-9 else 0.0
+        progress = self._route_completion_percent()
+        cte = self._latest_tracking.cross_track_error_m
+        rmse = self._active_performance_logger().current_position_error_m
+        nis = None
+        nees = None
+        if self._filter_manager is not None:
+            diagnostics = self._filter_manager.get_diagnostics()
+            nis = diagnostics.get("latest_nis")
+            nees = diagnostics.get("latest_nees")
+        failure = self._last_benchmark_failure_reason or (self._test_runner.last_failure_reason if self._test_runner is not None else "")
+        self._closed_loop_auto_tune_live_line = (
+            f"route {self._format_progress_percent(progress)} | "
+            f"wall {wall:.1f}s | sim {sim:.1f}s | speedup {speedup:.2f}x | {tps:.1f} tick/s | "
+            f"best {self._format_live_number(self._closed_loop_auto_tune_best_score)} | "
+            f"RMSE {self._format_live_number(rmse)}m | NIS {self._format_live_number(nis)} | "
+            f"NEES {self._format_live_number(nees)} | CTE {self._format_live_number(cte)}m | "
+            f"failure {failure or 'none'}"
+        )
+
+    def _closed_loop_auto_tune_trial_wall_seconds(self) -> float:
+        if self._closed_loop_auto_tune_trial_wall_start is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._closed_loop_auto_tune_trial_wall_start)
+
+    def _closed_loop_auto_tune_trial_sim_seconds(self) -> float:
+        if self._latest_ground_truth_state is None or self._closed_loop_auto_tune_trial_sim_start is None:
+            return 0.0
+        return max(0.0, float(self._latest_ground_truth_state.timestamp) - self._closed_loop_auto_tune_trial_sim_start)
+
+    @staticmethod
+    def _format_live_number(value: object) -> str:
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return f"{float(value):.3g}"
+        return "n/a"
+
+    @staticmethod
+    def _format_progress_percent(value: Optional[float]) -> str:
+        if value is None or not math.isfinite(float(value)):
+            return "n/a"
+        return f"{float(value):.1f}%"
 
     def _run_closed_loop_auto_tune_validation(self, request: ClosedLoopValidationRequest) -> dict[str, object]:
         route = self._saved_route_from_validation_request(request)
@@ -639,6 +805,7 @@ class SimulationApp:
         sensor_config = SensorNoiseConfig.from_dict(request.sensor_noise_config)
         self.sensor_noise_config = sensor_config
         apply_behavior_values(self.driving_behavior_config, request.vehicle_behavior_config)
+        apply_actuator_values(self.driving_behavior_config, request.actuator_realism_config)
         try:
             if self._gnss_sensor is not None:
                 self._gnss_sensor.apply_config(sensor_config, respawn=True)
@@ -665,10 +832,12 @@ class SimulationApp:
             selected_routes=(route,),
             sensor_noise_config=sensor_config,
             vehicle_behavior_config=dict(request.vehicle_behavior_config),
+            actuator_realism_config=dict(request.actuator_realism_config),
             selected_filter_tune=dict(self._filter_manager.get_active_filter_tune()),
             tracking_mode=request.tracking_mode,
             sensor_noise_preset=str(request.sensor_noise_config.get("preset_name") or "Custom"),
             vehicle_behavior_preset=str(request.vehicle_behavior_config.get("preset_name") or "Custom"),
+            actuator_realism_preset=str(request.actuator_realism_config.get("preset_name") or "Custom"),
             output_root=str(request.output_folder),
             run_id="v",
             metadata={
@@ -678,7 +847,6 @@ class SimulationApp:
                 "offline_score": request.finalist.offline_score,
                 "offline_trial_index": request.finalist.trial_index,
                 "candidate_tune": dict(request.finalist.candidate_tune),
-                "actuator_realism_config": dict(request.actuator_realism_config),
             },
         )
         self._test_route_authoring_active = False
@@ -694,6 +862,9 @@ class SimulationApp:
             self._test_runner.stop(aborted=True, reason=reason)
             return self._closed_loop_validation_failure_metrics(request, reason)
 
+        self._closed_loop_auto_tune_trial_wall_start = time.monotonic()
+        self._closed_loop_auto_tune_trial_sim_start = None
+        self._closed_loop_auto_tune_trial_tick_count = 0
         while self._test_runner is not None and self._test_runner.is_active:
             if self._closed_loop_auto_tune_cancel_requested:
                 self._test_runner.stop(aborted=True, reason="Closed-loop auto tune cancelled")
@@ -714,30 +885,43 @@ class SimulationApp:
         summary.setdefault("abort_reason", summary.get("last_failure_reason") or summary.get("error") or "")
         summary["output_folder"] = summary.get("route_folder") or str(self._test_runner.benchmark_folder or request.output_folder)
         summary["validation_output_folder"] = str(self._test_runner.benchmark_folder or request.output_folder)
+        wall_time = self._closed_loop_auto_tune_trial_wall_seconds()
+        sim_time = self._closed_loop_auto_tune_trial_sim_seconds()
+        summary["auto_tune_wall_time_s"] = wall_time
+        summary["auto_tune_sim_time_s"] = sim_time
+        summary["auto_tune_speedup"] = sim_time / wall_time if wall_time > 1.0e-9 else None
+        summary["auto_tune_ticks_per_second"] = self._closed_loop_auto_tune_trial_tick_count / wall_time if wall_time > 1.0e-9 else None
+        summary["actuator_realism_config"] = dict(request.actuator_realism_config)
         return summary
 
     def _run_closed_loop_validation_frame(self) -> bool:
-        running = self._process_events()
-        if not running:
+        self._pump_closed_loop_auto_tune_events()
+        if self._closed_loop_auto_tune_cancel_requested:
             return False
         self._client_manager.tick()
+        self._closed_loop_auto_tune_trial_tick_count += 1
         if self._world_reload_in_progress or self._skip_frames_after_world_reload > 0:
             self._skip_frames_after_world_reload = max(0, self._skip_frames_after_world_reload - 1)
-            self._draw_frame_without_camera()
+            self._update_closed_loop_auto_tune_live_line()
+            self._draw_closed_loop_auto_tune_progress_frame()
             self._clock.tick_pygame()
             return True
         if self._ground_truth_provider is None or self._filter_manager is None:
-            self._draw_frame_without_camera()
+            self._update_closed_loop_auto_tune_live_line()
+            self._draw_closed_loop_auto_tune_progress_frame()
             self._clock.tick_pygame()
             return True
         try:
             self._latest_ground_truth_state = self._ground_truth_provider.get_state()
+            if self._closed_loop_auto_tune_trial_sim_start is None:
+                self._closed_loop_auto_tune_trial_sim_start = float(self._latest_ground_truth_state.timestamp)
             self._latest_estimated_state = self._filter_manager.update()
             self._latest_localization_status = self._filter_manager.get_status(self._latest_ground_truth_state)
         except RuntimeError as exc:
             self._planner_status = f"World context unavailable: {exc}"
             self._control_status_text = self._planner_status
-            self._draw_frame_without_camera()
+            self._update_closed_loop_auto_tune_live_line()
+            self._draw_closed_loop_auto_tune_progress_frame()
             self._clock.tick_pygame()
             return True
         self._update_route_activation_state()
@@ -750,23 +934,8 @@ class SimulationApp:
             self._clock.tick_pygame()
             return True
         self._apply_closed_loop_validation_control()
-        if self._display is not None and self._camera_sensor is not None:
-            camera_surface = self._camera_sensor.get_latest_surface()
-            self._display.begin_frame(camera_surface)
-            try:
-                self._draw_camera_waypoints()
-            except RuntimeError as exc:
-                self._planner_status = f"Camera overlay skipped: {exc}"
-                self._control_status_text = self._planner_status
-            self._draw_topdown_map()
-            self._draw_lidar_panel()
-            self._draw_driving_behavior_panels()
-            self._draw_control_panel()
-            self._draw_status_bar()
-            self._display.set_test_mode_titles(self._test_mode_active())
-            self._display.end_frame()
-        else:
-            self._draw_frame_without_camera()
+        self._update_closed_loop_auto_tune_live_line()
+        self._draw_closed_loop_auto_tune_progress_frame()
         self._clock.tick_pygame()
         return True
 
@@ -852,6 +1021,13 @@ class SimulationApp:
         self._offline_recording_start_attempted = True
         self.sensor_noise_config = config.sensor_noise_config
         apply_behavior_values(self.driving_behavior_config, config.vehicle_behavior_config)
+        apply_actuator_values(
+            self.driving_behavior_config,
+            actuator_realism_from_values(
+                ACTUATOR_REALISM_PRESETS["Realistic"],
+                preset_name="Realistic",
+            ),
+        )
         if self._sensor_noise_panel is not None:
             self._sensor_noise_panel.set_values(
                 {

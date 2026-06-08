@@ -461,6 +461,7 @@ class RouteTestRunner:
 
         sensor_config = self._config.sensor_noise_config.to_dict() if self._config is not None else None
         behavior_config = self._config.vehicle_behavior_config if self._config is not None else None
+        actuator_config = self._config.actuator_realism_config if self._config is not None else None
         metadata = build_benchmark_metadata(
             benchmark_id=benchmark_id,
             timestamp=timestamp,
@@ -479,6 +480,7 @@ class RouteTestRunner:
             active_control_input_used=self._active_control_used_callback(),
             sensor_noise_config=sensor_config,
             vehicle_behavior_config=behavior_config,
+            actuator_realism_config=actuator_config,
             random_seed=self._config.random_seed if self._config is not None else None,
             run_id=self._config.run_id if self._config is not None else None,
             route_index=route_index + 1,
@@ -659,7 +661,8 @@ class RouteTestRunner:
             "tracking_mode": config.get("tracking_mode"),
             "active_control_input_used_by_filter": self._active_control_used_callback(),
             "sensor_noise_config": config.get("sensor_noise_config"),
-            "vehicle_behavior_config": config.get("vehicle_behavior_config"),
+                "vehicle_behavior_config": config.get("vehicle_behavior_config"),
+                "actuator_realism_config": config.get("actuator_realism_config"),
             "random_seed": config.get("random_seed"),
             "project_commit": (config.get("metadata") or {}).get("project_commit") if isinstance(config.get("metadata"), dict) else None,
             "primary_metric_source": "eval_preferred",
@@ -889,6 +892,7 @@ class RouteTestRunner:
                 "active_control_input_used_by_filter": self._active_control_used_callback(),
                 "sensor_noise_config": config.sensor_noise_config.to_dict() if config is not None else None,
                 "vehicle_behavior_config": config.vehicle_behavior_config if config is not None else None,
+                "actuator_realism_config": config.actuator_realism_config if config is not None else None,
                 "random_seed": config.random_seed if config is not None else None,
                 "route_folder": str(route_folder),
                 "final_status": final_status,

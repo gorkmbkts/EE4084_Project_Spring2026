@@ -38,6 +38,7 @@ def build_benchmark_metadata(
     active_control_input_used: bool = False,
     sensor_noise_config: Optional[dict[str, object]] = None,
     vehicle_behavior_config: Optional[dict[str, object]] = None,
+    actuator_realism_config: Optional[dict[str, object]] = None,
     random_seed: Optional[int] = None,
     run_id: Optional[str] = None,
     route_index: Optional[int] = None,
@@ -64,6 +65,7 @@ def build_benchmark_metadata(
     normalized_route_map_id = normalize_map_name(route.map_name)
     sensor_config = dict(sensor_noise_config or {})
     behavior_config = dict(vehicle_behavior_config or {})
+    actuator_config = dict(actuator_realism_config or {})
     gnss_config = {
         "sensor_tick": sensor_config.get("gnss_sensor_tick", GNSS.sensor_tick),
         "noise_lat_stddev_deg": sensor_config.get("gnss_noise_lat_stddev_deg", GNSS.noise_lat_stddev_deg),
@@ -193,6 +195,7 @@ def build_benchmark_metadata(
             "raw_config": sensor_config,
         },
         "vehicle_behavior_config": behavior_config,
+        "actuator_realism_config": actuator_config,
         "controller_configuration": {
             "target_speed_mps": AUTONOMOUS_CONTROL.target_speed_mps,
             "turn_speed_mps": AUTONOMOUS_CONTROL.turn_speed_mps,

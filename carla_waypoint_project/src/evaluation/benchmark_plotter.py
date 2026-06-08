@@ -1093,11 +1093,13 @@ def _add_metadata_box(ax, metadata: dict[str, object]) -> None:
     general = metadata.get("general", {}) if isinstance(metadata.get("general"), dict) else {}
     sensors = metadata.get("sensor_configuration", {}) if isinstance(metadata.get("sensor_configuration"), dict) else {}
     behavior = metadata.get("vehicle_behavior_config", {}) if isinstance(metadata.get("vehicle_behavior_config"), dict) else {}
+    actuator = metadata.get("actuator_realism_config", {}) if isinstance(metadata.get("actuator_realism_config"), dict) else {}
     gnss = sensors.get("gnss", {}) if isinstance(sensors.get("gnss"), dict) else {}
     text = (
         f"run: {general.get('benchmark_id') or metadata.get('run_id', 'n/a')}\n"
         f"GNSS std: {_fmt(gnss.get('noise_lat_stddev_deg'))}/{_fmt(gnss.get('noise_lon_stddev_deg'))} deg\n"
-        f"max/min speed: {_fmt(behavior.get('max_speed_mps'))}/{_fmt(behavior.get('min_curve_speed_mps'))} m/s"
+        f"max/min speed: {_fmt(behavior.get('max_speed_mps'))}/{_fmt(behavior.get('min_curve_speed_mps'))} m/s\n"
+        f"actuator: {actuator.get('preset_name') or 'n/a'}"
     )
     ax.text(
         0.99,

@@ -169,6 +169,26 @@ class CarlaClientManager:
             self._sync_error = f"CARLA sync tick failed: {exc}"
             return None
 
+    def set_no_rendering_mode(self, enabled: bool) -> None:
+        """Toggle CARLA no-rendering mode without changing physics timing."""
+        if self._world is None:
+            return
+        try:
+            settings = self._world.get_settings()
+            settings.no_rendering_mode = bool(enabled)
+            self._world.apply_settings(settings)
+        except RuntimeError as exc:
+            self._sync_error = f"CARLA no-rendering mode unavailable: {exc}"
+
+    @property
+    def no_rendering_mode(self) -> bool:
+        if self._world is None:
+            return False
+        try:
+            return bool(getattr(self._world.get_settings(), "no_rendering_mode", False))
+        except RuntimeError:
+            return False
+
     def restore_world_settings(self) -> None:
         """Restore CARLA world settings captured before enabling sync mode."""
         if self._world is None or self._previous_world_settings is None:
