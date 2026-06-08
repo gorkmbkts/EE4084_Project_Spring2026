@@ -107,14 +107,14 @@ flowchart LR
 
 | Area | Capabilities |
 | --- | --- |
-| 🛰️ **Sensor simulation** | CARLA GNSS and IMU noise/bias configuration, sensor tick control, GNSS local projection diagnostics |
-| 🧭 **Localization filters** | Plugin-discovered KF, EKF, UKF, and raw GNSS baseline filters |
-| 🚗 **Closed-loop driving** | Saved A/B routes, Pure Pursuit route tracking, curvature-aware speed planning, actuator realism |
-| 📊 **Evaluation** | Per-route CSV/JSON summaries, trajectory plots, raw-vs-filtered errors, NIS, NEES, ±2σ bounds |
-| 🔁 **Offline replay** | Replays identical recorded sensor logs through selected filters for fair filter-only comparison |
-| 🧪 **Auto-tuning** | Offline tune search, closed-loop tune validation, saved tune config indexes |
-| 🖥️ **Dashboard UI** | Multi-panel pygame dashboard with Route, Filters, Benchmark, Sensors, and Debug tabs |
-| 🧩 **Extensibility** | Filter plugin template and metadata-based filter discovery |
+|  **Sensor simulation** | CARLA GNSS and IMU noise/bias configuration, sensor tick control, GNSS local projection diagnostics |
+|  **Localization filters** | Plugin-discovered KF, EKF, UKF, and raw GNSS baseline filters |
+|  **Closed-loop driving** | Saved A/B routes, Pure Pursuit route tracking, curvature-aware speed planning, actuator realism |
+|  **Evaluation** | Per-route CSV/JSON summaries, trajectory plots, raw-vs-filtered errors, NIS, NEES, ±2σ bounds |
+|  **Offline replay** | Replays identical recorded sensor logs through selected filters for fair filter-only comparison |
+|  **Auto-tuning** | Offline tune search, closed-loop tune validation, saved tune config indexes |
+|  **Dashboard UI** | Multi-panel pygame dashboard with Route, Filters, Benchmark, Sensors, and Debug tabs |
+|  **Extensibility** | Filter plugin template and metadata-based filter discovery |
 
 ---
 
