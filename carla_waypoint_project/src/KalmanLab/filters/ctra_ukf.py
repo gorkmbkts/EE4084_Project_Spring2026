@@ -97,11 +97,12 @@ TUNE = {
     "ukf_kappa": 0.0,
     "min_covariance_diagonal": 1.0e-9,
     "enable_control_input_prediction": 1.0,
-    "control_accel_gain_mps2": 1.2,
-    "control_brake_decel_gain_mps2": 2.4,
+    "control_accel_gain_mps2": 4.5,
+    "control_brake_decel_gain_mps2": 6.0,
+    "control_coast_decel_mps2": 0.0,
     "control_steer_to_yaw_rate_gain": 0.25,
     "control_input_timeout_s": 0.35,
-    "max_control_accel_delta_mps2": 0.35,
+    "max_control_accel_delta_mps2": 0.10,
     "max_control_yaw_rate_delta_radps": 0.12,
 }
 
@@ -146,6 +147,7 @@ TUNE_SPECS = (
     ParameterSpec("enable_control_input_prediction", "Use control input", 0.0, 1.0, "", 0, "Active tracking"),
     ParameterSpec("control_accel_gain_mps2", "Control accel", 0.0, 5.0, "m/s2", 2, "Active tracking"),
     ParameterSpec("control_brake_decel_gain_mps2", "Control brake", 0.0, 8.0, "m/s2", 2, "Active tracking"),
+    ParameterSpec("control_coast_decel_mps2", "Control coast", 0.0, 3.0, "m/s2", 2, "Active tracking"),
     ParameterSpec("control_steer_to_yaw_rate_gain", "Steer yaw gain", 0.0, 1.0, "x", 2, "Active tracking"),
     ParameterSpec("control_input_timeout_s", "Control timeout", 0.02, 1.0, "s", 2, "Active tracking"),
     ParameterSpec("max_control_accel_delta_mps2", "Control accel delta", 0.0, 2.0, "m/s2", 2, "Active tracking"),
@@ -711,6 +713,7 @@ class Filter(_ctra_shared.Filter):
         self._control_timeout_s = float(self._tune["control_input_timeout_s"])
         self._control_accel_gain = float(self._tune["control_accel_gain_mps2"])
         self._control_brake_decel_gain = float(self._tune["control_brake_decel_gain_mps2"])
+        self._control_coast_decel = float(self._tune["control_coast_decel_mps2"])
         self._control_steer_yaw_gain = float(self._tune["control_steer_to_yaw_rate_gain"])
         self._max_control_accel_delta = float(self._tune["max_control_accel_delta_mps2"])
         self._max_control_yaw_rate_delta = float(self._tune["max_control_yaw_rate_delta_radps"])

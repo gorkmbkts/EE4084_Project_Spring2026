@@ -11,7 +11,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.KalmanLab.filters import ca_kf, ctra_ekf, ctra_ukf, ctrv_ekf
+from src.KalmanLab.filters import ca_kf, ctra_ekf, ctra_ukf, ctrv_ekf, cv_kf
+from src.KalmanLab.filter_base import FilterControlInput
+from src.KalmanLab.control_model import estimate_command_motion
 from src.KalmanLab.registry import discover_filters
 from src.evaluation.benchmark_config import SensorNoiseConfig
 from src.evaluation.filter_auto_tuner import AutoTuneRequest, FilterAutoTuner
@@ -146,6 +148,102 @@ def test_filter_wrappers_initialize_from_gnss_and_imu() -> None:
             raise AssertionError(f"{module.__name__} did not expose longitudinal acceleration")
         if module is ctra_ukf and state.source_filter_id != "ctra_ukf":
             raise AssertionError("CTRA UKF state did not use the plugin filter id")
+
+
+def test_active_command_affects_immediate_motion_prediction() -> None:
+    class Projector:
+        pass
+
+    command = FilterControlInput(
+        timestamp=0.0,
+        throttle=1.0,
+        steer=0.0,
+        brake=0.0,
+        hand_brake=False,
+        reverse=False,
+        source="test",
+        speed_mps=0.0,
+        yaw_deg=0.0,
+    )
+    for module in (ctra_ekf, ctra_ukf, ctrv_ekf):
+        active = module.Filter(Projector(), tracking_mode="active")
+        disabled = module.Filter(
+            Projector(),
+            tune={"enable_control_input_prediction": 0.0},
+            tracking_mode="active",
+        )
+        if module is ctrv_ekf:
+            active._filter.initialize((0.0, 0.0), 0.0, 0.0, 0.0, 0.0)
+            disabled._filter.initialize((0.0, 0.0), 0.0, 0.0, 0.0, 0.0)
+        else:
+            active._filter.initialize((0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0)
+            disabled._filter.initialize((0.0, 0.0), 0.0, 0.0, 0.0, 0.0, 0.0)
+        if not active.process_control(command):
+            raise AssertionError(f"{module.__name__} rejected enabled active input")
+        if disabled.process_control(command):
+            raise AssertionError(f"{module.__name__} accepted disabled active input")
+
+        active._predict_to(0.1)
+        disabled._predict_to(0.1)
+        active_snapshot = active._filter.snapshot()
+        disabled_snapshot = disabled._filter.snapshot()
+        if active_snapshot is None or disabled_snapshot is None:
+            raise AssertionError(f"{module.__name__} did not produce prediction snapshots")
+        if active_snapshot.px <= disabled_snapshot.px + 1.0e-6:
+            raise AssertionError(
+                f"{module.__name__} command did not affect position in the immediate prediction interval"
+            )
+
+
+def test_linear_filters_honor_disabled_active_prediction_switch() -> None:
+    class Projector:
+        pass
+
+    command = FilterControlInput(
+        timestamp=0.0,
+        throttle=1.0,
+        steer=0.0,
+        brake=0.0,
+        hand_brake=False,
+        reverse=False,
+        source="test",
+    )
+    for module in (ca_kf, cv_kf):
+        active = module.Filter(Projector(), tracking_mode="active")
+        disabled = module.Filter(
+            Projector(),
+            tune={"enable_control_input_prediction": 0.0},
+            tracking_mode="active",
+        )
+        if not active.process_control(command) or disabled.process_control(command):
+            raise AssertionError(f"{module.__name__} did not honor the active prediction switch")
+
+
+def test_zero_command_yaw_cap_disables_steering_component() -> None:
+    command = FilterControlInput(
+        timestamp=0.0,
+        throttle=1.0,
+        steer=1.0,
+        brake=0.0,
+        hand_brake=False,
+        reverse=False,
+        source="test",
+    )
+    estimate = estimate_command_motion(
+        command,
+        speed_mps=10.0,
+        yaw_deg=0.0,
+        tune={
+            "command_throttle_accel_gain_mps2": 3.0,
+            "command_brake_decel_gain_mps2": 6.0,
+            "command_max_accel_mps2": 8.0,
+            "command_max_yaw_rate_dps": 0.0,
+        },
+        dt_s=0.1,
+    )
+    assert_close(estimate.yaw_rate_dps, 0.0)
+    assert_close(estimate.lateral_accel_mps2, 0.0)
+    assert_close(estimate.acceleration_xy[1], 0.0)
 
 
 def test_ca_kf_ignores_startup_imu_acceleration_spike() -> None:

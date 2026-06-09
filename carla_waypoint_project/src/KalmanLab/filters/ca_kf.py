@@ -67,6 +67,7 @@ TUNE = {
     "yaw_from_velocity_min_speed_mps": 0.35,
     "min_prediction_dt_s": 1.0e-4,
     "max_prediction_dt_s": 0.20,
+    "enable_control_input_prediction": 1.0,
     "command_accel_stddev_mps2": 1.25,
     "command_throttle_accel_gain_mps2": 3.0,
     "command_brake_decel_gain_mps2": 6.0,
@@ -93,6 +94,7 @@ TUNE_SPECS = (
     ParameterSpec("yaw_from_velocity_min_speed_mps", "Yaw min speed", 0.05, 3.0, "m/s", 2, "Yaw"),
     ParameterSpec("min_prediction_dt_s", "Min dt", 0.00001, 0.02, "s", 5, "Prediction"),
     ParameterSpec("max_prediction_dt_s", "Max dt", 0.02, 0.60, "s", 2, "Prediction"),
+    ParameterSpec("enable_control_input_prediction", "Use control input", 0.0, 1.0, "", 0, "Active tracking"),
     ParameterSpec("command_accel_stddev_mps2", "Command accel", 0.10, 6.0, "m/s2", 2, "Active tracking"),
     ParameterSpec("command_throttle_accel_gain_mps2", "Throttle accel", 0.2, 8.0, "m/s2", 2, "Active tracking"),
     ParameterSpec("command_brake_decel_gain_mps2", "Brake decel", 0.5, 12.0, "m/s2", 2, "Active tracking"),
@@ -357,6 +359,7 @@ class Filter:
         self._yaw_speed_threshold = float(self._tune["yaw_from_velocity_min_speed_mps"])
         self._min_prediction_dt_s = float(self._tune["min_prediction_dt_s"])
         self._max_prediction_dt_s = float(self._tune["max_prediction_dt_s"])
+        self._enable_control_input_prediction = bool(float(self._tune["enable_control_input_prediction"]) >= 0.5)
         self._command_accel_stddev = float(self._tune["command_accel_stddev_mps2"])
         self._initialize_acceleration_from_imu = bool(self._tune.get("initialize_acceleration_from_imu", False))
         self._max_valid_imu_accel_mps2 = float(self._tune.get("max_valid_imu_accel_mps2", BENCHMARK.max_valid_imu_accel_mps2))
@@ -408,7 +411,7 @@ class Filter:
 
     def process_control(self, control_input: FilterControlInput) -> bool:
         self._latest_control_input = control_input
-        return self._tracking_mode == TRACKING_MODE_ACTIVE
+        return self._tracking_mode == TRACKING_MODE_ACTIVE and self._enable_control_input_prediction
 
     def process_imu(self, imu: "ImuMeasurement") -> Optional[VehicleState]:
         yaw_deg = self._yaw_deg_from_compass(imu.compass)
@@ -543,7 +546,11 @@ class Filter:
 
     def _update_from_command_control(self, dt: float) -> None:
         self._active_command_used_latest_prediction = False
-        if self._tracking_mode != TRACKING_MODE_ACTIVE or self._latest_control_input is None:
+        if (
+            self._tracking_mode != TRACKING_MODE_ACTIVE
+            or not self._enable_control_input_prediction
+            or self._latest_control_input is None
+        ):
             return
         snapshot = self._filter.snapshot()
         if snapshot is None:

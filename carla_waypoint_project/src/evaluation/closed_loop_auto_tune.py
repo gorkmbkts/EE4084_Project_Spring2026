@@ -50,6 +50,7 @@ ACTIVE_CONTROL_TUNE_KEYS = {
     "enable_control_input_prediction",
     "control_accel_gain_mps2",
     "control_brake_decel_gain_mps2",
+    "control_coast_decel_mps2",
     "control_steer_to_yaw_rate_gain",
     "control_input_timeout_s",
     "max_control_accel_delta_mps2",
@@ -567,6 +568,8 @@ class ClosedLoopBenchmarkAutoTuner:
             params: list[dict[str, object]],
             evaluate_baseline_first: bool,
             protected_result: Optional[ClosedLoopValidationResult] = None,
+            baseline_candidate_type: str = "adaptive_family_local",
+            baseline_rationale: str = "protected context baseline",
         ) -> list[ClosedLoopValidationResult]:
             nonlocal best_score_so_far, global_trial_index
             if stage_trial_count <= 0:
@@ -606,6 +609,8 @@ class ClosedLoopBenchmarkAutoTuner:
                     baseline_trial=baseline_trial,
                     failure_counts=failure_counts,
                 )
+                if baseline_trial:
+                    plan = replace(plan, candidate_rationale=baseline_rationale)
                 candidate_tune = _ensure_unique_candidate(
                     plan.tune,
                     plan.anchor_tune,
@@ -623,7 +628,13 @@ class ClosedLoopBenchmarkAutoTuner:
                     plan = replace(plan, tune=candidate_tune)
                 changed_parameters = _changed_parameters(plan.anchor_tune, candidate_tune, adaptive_state.family_by_key)
                 changed_summary = _changed_parameters_summary(changed_parameters)
-                candidate_type = "context_baseline" if stage == CONTEXT_BASELINE_STAGE else "adaptive_family_local"
+                candidate_type = (
+                    "context_baseline"
+                    if stage == CONTEXT_BASELINE_STAGE
+                    else baseline_candidate_type
+                    if baseline_trial
+                    else "adaptive_family_local"
+                )
                 finalist = ClosedLoopFinalist(
                     rank=global_trial_index,
                     candidate_tune=candidate_tune,
@@ -832,16 +843,49 @@ class ClosedLoopBenchmarkAutoTuner:
                 context_baseline,
                 tuple(record.tune_specs),
             )
-            active_results = run_stage(
-                stage=ACTIVE_CONTROL_STAGE,
-                stage_label="Active-control",
-                stage_trial_count=stage_budgets.active_control_trials,
-                stage_tracking_mode=TRACKING_ACTIVE,
-                stage_baseline=active_baseline,
-                params=active_params,
-                evaluate_baseline_first=True,
-                protected_result=None,
+            ablations = _active_control_ablation_tunes(active_baseline)
+            ablation_budget = min(stage_budgets.active_control_trials, len(ablations))
+            enabled_ablation_results: list[ClosedLoopValidationResult] = []
+            for name, ablation_tune, control_enabled in ablations[:ablation_budget]:
+                ablation_results = run_stage(
+                    stage=ACTIVE_CONTROL_STAGE,
+                    stage_label=f"Active-control ablation: {name}",
+                    stage_trial_count=1,
+                    stage_tracking_mode=TRACKING_ACTIVE,
+                    stage_baseline=ablation_tune,
+                    params=[],
+                    evaluate_baseline_first=True,
+                    protected_result=None,
+                    baseline_candidate_type=f"active_ablation_{name}",
+                    baseline_rationale=f"active-control ablation: {name}",
+                )
+                active_results.extend(ablation_results)
+                if control_enabled:
+                    enabled_ablation_results.extend(ablation_results)
+
+            remaining_active_trials = max(0, stage_budgets.active_control_trials - ablation_budget)
+            active_search_anchor = (
+                min(enabled_ablation_results, key=lambda item: item.closed_loop_score)
+                if enabled_ablation_results
+                else None
             )
+            if remaining_active_trials > 0:
+                active_results.extend(
+                    run_stage(
+                        stage=ACTIVE_CONTROL_STAGE,
+                        stage_label="Active-control adaptive search",
+                        stage_trial_count=remaining_active_trials,
+                        stage_tracking_mode=TRACKING_ACTIVE,
+                        stage_baseline=(
+                            active_search_anchor.candidate_tune
+                            if active_search_anchor is not None
+                            else active_baseline
+                        ),
+                        params=active_params,
+                        evaluate_baseline_first=active_search_anchor is None,
+                        protected_result=active_search_anchor,
+                    )
+                )
             if active_results:
                 best_active = min(active_results, key=lambda item: item.closed_loop_score)
 
@@ -862,16 +906,20 @@ class ClosedLoopBenchmarkAutoTuner:
                 stage_tracking_mode=request.tracking_mode,
                 stage_baseline=stage3_baseline_result.candidate_tune,
                 params=joint_params,
-                evaluate_baseline_first=False,
-                protected_result=stage3_baseline_result,
+                evaluate_baseline_first=True,
+                protected_result=None,
+                baseline_candidate_type="final_phase_protected_baseline",
+                baseline_rationale="revalidated protected baseline in final tuning phase",
             )
         if not validation_results:
             raise ValueError("No closed-loop auto-tune trials completed.")
 
         final_candidates = (
-            active_results + joint_results
+            joint_results
+            if joint_results
+            else active_results
             if request.tracking_mode == TRACKING_ACTIVE
-            else passive_results + joint_results
+            else passive_results
         )
         if not final_candidates:
             final_candidates = validation_results
@@ -880,6 +928,16 @@ class ClosedLoopBenchmarkAutoTuner:
         best_score = float(best_validation.closed_loop_score)
         best_metrics = dict(best_validation.raw_metrics)
         best_metrics["closed_loop_score"] = best_score
+        selection_baseline = (
+            best_passive
+            if request.tracking_mode == TRACKING_ACTIVE and best_passive is not None
+            else context_results[0] if context_results else None
+        )
+        selection_baseline_score = (
+            float(selection_baseline.closed_loop_score)
+            if selection_baseline is not None
+            else None
+        )
         direct_trial_results = _direct_auto_tune_trial_results(validation_results)
         offline_result = AutoTuneResult(
             filter_id=request.filter_id,
@@ -890,16 +948,15 @@ class ClosedLoopBenchmarkAutoTuner:
             trial_results=tuple(direct_trial_results),
             output_folder=run_folder,
             saved_config_path=None,
-            baseline_score=direct_trial_results[0].score if direct_trial_results else None,
+            baseline_score=selection_baseline_score,
             final_score=best_score,
             improved_over_baseline=(
-                bool(direct_trial_results)
-                and direct_trial_results[0].score is not None
-                and best_score < float(direct_trial_results[0].score)
+                selection_baseline_score is not None
+                and best_score < selection_baseline_score
             ),
             recommendation_status=(
                 "improved"
-                if direct_trial_results and direct_trial_results[0].score is not None and best_score < float(direct_trial_results[0].score)
+                if selection_baseline_score is not None and best_score < selection_baseline_score
                 else "baseline_kept"
             ),
             verification_results=(),
@@ -953,7 +1010,8 @@ class ClosedLoopBenchmarkAutoTuner:
                 best_active=best_active,
                 final_validation=best_validation,
                 adaptive_stage_states=adaptive_stage_states,
-                baseline_validation=context_results[0] if context_results else None,
+                baseline_validation=selection_baseline,
+                final_phase_candidate_count=len(final_candidates),
             ),
         )
         _ensure_backend_config_compatible(config, request)
@@ -1789,7 +1847,7 @@ def _parameter_family(key: str) -> str:
             return "active_delta_limits"
         if any(token in text for token in ("yaw", "steer", "turn")):
             return "active_yaw_steer_control"
-        if any(token in text for token in ("accel", "brake", "throttle")):
+        if any(token in text for token in ("accel", "brake", "throttle", "coast")):
             return "active_acceleration_control"
         return "active_control_other"
     if any(token in text for token in ("sigma", "alpha", "beta", "kappa", "lambda")) and "imu" not in text:
@@ -1938,6 +1996,7 @@ def _active_control_search_params(
                     "scale": "log" if base_value > 0.0 and ("stddev" in key or key.endswith("_gain_mps2")) else "linear",
                     "min": low,
                     "max": high,
+                    "center": base_value,
                 },
                 actuator_realism_config,
                 TRACKING_ACTIVE,
@@ -1953,7 +2012,12 @@ def _joint_local_search_params(
     tracking_mode: str,
     actuator_realism_config: dict[str, object],
 ) -> list[dict[str, object]]:
-    candidates = passive_params + (active_params if tracking_mode == TRACKING_ACTIVE else [])
+    active_prediction_enabled = float(baseline.get("enable_control_input_prediction", 1.0)) >= 0.5
+    candidates = passive_params + (
+        active_params
+        if tracking_mode == TRACKING_ACTIVE and active_prediction_enabled
+        else []
+    )
     result: list[dict[str, object]] = []
     seen: set[str] = set()
     for param in candidates:
@@ -2012,6 +2076,63 @@ def _active_control_baseline(
     if "enable_control_input_prediction" in context_baseline:
         tune["enable_control_input_prediction"] = 1.0
     return _clamp_tune_to_specs(tune, tune_specs)
+
+
+def _active_control_ablation_tunes(
+    active_baseline: dict[str, object],
+) -> list[tuple[str, dict[str, object], bool]]:
+    candidates: list[tuple[str, dict[str, object], bool]] = []
+
+    disabled = dict(active_baseline)
+    disabled["enable_control_input_prediction"] = 0.0
+    candidates.append(("disabled", disabled, False))
+
+    yaw_keys = {
+        "control_steer_to_yaw_rate_gain",
+        "max_control_yaw_rate_delta_radps",
+        "command_yaw_rate_stddev_dps",
+        "command_max_yaw_rate_dps",
+    }
+    acceleration_keys = {
+        "control_accel_gain_mps2",
+        "control_brake_decel_gain_mps2",
+        "control_coast_decel_mps2",
+        "max_control_accel_delta_mps2",
+        "max_control_speed_delta_mps",
+        "command_throttle_accel_gain_mps2",
+        "command_brake_decel_gain_mps2",
+    }
+    has_yaw_control = any(key in active_baseline for key in yaw_keys)
+    has_acceleration_control = any(key in active_baseline for key in acceleration_keys)
+
+    if has_acceleration_control and has_yaw_control:
+        accel_only = dict(active_baseline)
+        accel_only["enable_control_input_prediction"] = 1.0
+        for key in yaw_keys:
+            if key in accel_only:
+                accel_only[key] = 0.0
+        candidates.append(("accel_only", accel_only, True))
+
+        yaw_only = dict(active_baseline)
+        yaw_only["enable_control_input_prediction"] = 1.0
+        for key in acceleration_keys:
+            if key in yaw_only:
+                yaw_only[key] = 0.0
+        candidates.append(("yaw_only", yaw_only, True))
+
+    combined = dict(active_baseline)
+    combined["enable_control_input_prediction"] = 1.0
+    candidates.append(("default_combined", combined, True))
+
+    result: list[tuple[str, dict[str, object], bool]] = []
+    seen: set[str] = set()
+    for name, tune, enabled in candidates:
+        signature = json.dumps(tune, sort_keys=True, separators=(",", ":"), default=str)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        result.append((name, tune, enabled))
+    return result
 
 
 def _failure_aware_candidate(
@@ -2321,6 +2442,7 @@ def _closed_loop_extra_metadata(
     final_validation: ClosedLoopValidationResult,
     adaptive_stage_states: list[AdaptiveStageState],
     baseline_validation: Optional[ClosedLoopValidationResult],
+    final_phase_candidate_count: int,
 ) -> dict[str, object]:
     family_diagnostics = _aggregate_parameter_family_diagnostics(adaptive_stage_states)
     adaptation_history = [
@@ -2349,9 +2471,30 @@ def _closed_loop_extra_metadata(
         "best_passive_score": best_passive.closed_loop_score if best_passive is not None else None,
         "best_active_control_tune": dict(best_active.candidate_tune) if best_active is not None else {},
         "best_active_control_score": best_active.closed_loop_score if best_active is not None else None,
+        "best_active_candidate_uses_control": (
+            float(best_active.candidate_tune.get("enable_control_input_prediction", 1.0)) >= 0.5
+            if best_active is not None
+            else None
+        ),
+        "active_vs_passive_improvement": (
+            best_passive.closed_loop_score - final_validation.closed_loop_score
+            if request.tracking_mode == TRACKING_ACTIVE and best_passive is not None
+            else None
+        ),
         "final_tune": dict(final_validation.candidate_tune),
+        "final_tune_uses_control": (
+            float(final_validation.candidate_tune.get("enable_control_input_prediction", 1.0)) >= 0.5
+            if request.tracking_mode == TRACKING_ACTIVE
+            else False
+        ),
         "final_objective_score": final_validation.closed_loop_score,
         "final_tuning_stage": final_validation.stage,
+        "final_phase_candidate_count": int(final_phase_candidate_count),
+        "final_selection_policy": (
+            "minimum objective among candidates revalidated in the final joint phase"
+            if final_validation.stage == JOINT_FINE_TUNE_STAGE
+            else "minimum objective in the latest completed tuning phase"
+        ),
         "baseline_objective_score": (
             baseline_validation.closed_loop_score if baseline_validation is not None else None
         ),
@@ -2388,8 +2531,8 @@ def _closed_loop_extra_metadata(
         "max_route_attempts_per_trial": 1,
         "active_control_parameter_policy": (
             "Active tracking tune search includes supported active-control prediction parameters. "
-            "The staged tuner first builds a passive Q/model baseline, then uses actuator-aware bounds "
-            "before a narrow joint local fine-tune."
+            "It validates disabled, acceleration-only, yaw-only, and combined ablations when supported, "
+            "then uses actuator-aware bounds before a narrow joint local fine-tune."
             if request.tracking_mode == TRACKING_ACTIVE
             else "Passive mode builds and locally refines only the passive Q/model baseline; active-control tuning is skipped."
         ),
@@ -2463,17 +2606,44 @@ def _actuator_adjusted_param(
         return param
     if severity <= 0.08:
         param["search_policy"] = "perfect_actuator_confident"
-        if key in {"control_accel_gain_mps2", "control_brake_decel_gain_mps2", "control_steer_to_yaw_rate_gain"}:
+        if key in {
+            "control_accel_gain_mps2",
+            "control_brake_decel_gain_mps2",
+            "control_coast_decel_mps2",
+            "control_steer_to_yaw_rate_gain",
+        }:
             param["max"] = high
         return param
     param["search_policy"] = "realistic_actuator_conservative"
-    if key in {"control_accel_gain_mps2", "control_brake_decel_gain_mps2", "control_steer_to_yaw_rate_gain"}:
-        param["max"] = max(low if low is not None else 0.0, high * 0.75)
+    if key in {
+        "control_accel_gain_mps2",
+        "control_brake_decel_gain_mps2",
+        "control_coast_decel_mps2",
+        "control_steer_to_yaw_rate_gain",
+    }:
+        _contract_param_bounds(param, low, high, 0.75)
     elif key in {"max_control_accel_delta_mps2", "max_control_yaw_rate_delta_radps", "max_control_speed_delta_mps"}:
-        param["max"] = max(low if low is not None else 0.0, high * 0.65)
+        _contract_param_bounds(param, low, high, 0.65)
     elif key == "control_input_timeout_s":
         param["min"] = max(low if low is not None else 0.02, min(high, 0.08 + 0.20 * severity))
     return param
+
+
+def _contract_param_bounds(
+    param: dict[str, object],
+    low: Optional[float],
+    high: float,
+    factor: float,
+) -> None:
+    if low is None or high <= low:
+        return
+    center = _optional_float(param.get("center"))
+    if center is None:
+        center = 0.5 * (low + high)
+    center = max(low, min(high, center))
+    half_width = 0.5 * (high - low) * max(0.0, min(1.0, factor))
+    param["min"] = max(low, center - half_width)
+    param["max"] = min(high, center + half_width)
 
 
 def _actuator_search_policy(actuator_realism_config: dict[str, object]) -> str:

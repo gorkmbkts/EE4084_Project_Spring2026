@@ -35,7 +35,7 @@ def estimate_command_motion(
     throttle_gain = _float_tune(tune, "command_throttle_accel_gain_mps2", 3.0)
     brake_gain = _float_tune(tune, "command_brake_decel_gain_mps2", 6.0)
     max_accel = max(0.1, _float_tune(tune, "command_max_accel_mps2", 8.0))
-    max_yaw_rate_dps = max(1.0, _float_tune(tune, "command_max_yaw_rate_dps", 90.0))
+    max_yaw_rate_dps = max(0.0, _float_tune(tune, "command_max_yaw_rate_dps", 90.0))
 
     longitudinal = throttle * max(0.0, throttle_gain) - brake * max(0.0, brake_gain)
     if control_input.reverse:

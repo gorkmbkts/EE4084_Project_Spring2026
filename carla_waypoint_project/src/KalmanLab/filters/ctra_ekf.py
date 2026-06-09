@@ -85,11 +85,12 @@ TUNE = {
     "max_abs_accel_mps2": 12.0,
     "max_speed_mps": 50.0,
     "enable_control_input_prediction": 1.0,
-    "control_accel_gain_mps2": 1.2,
-    "control_brake_decel_gain_mps2": 2.4,
+    "control_accel_gain_mps2": 4.5,
+    "control_brake_decel_gain_mps2": 6.0,
+    "control_coast_decel_mps2": 0.0,
     "control_steer_to_yaw_rate_gain": 0.25,
     "control_input_timeout_s": 0.35,
-    "max_control_accel_delta_mps2": 0.35,
+    "max_control_accel_delta_mps2": 0.10,
     "max_control_yaw_rate_delta_radps": 0.12,
 }
 
@@ -127,6 +128,7 @@ TUNE_SPECS = (
     ParameterSpec("enable_control_input_prediction", "Use control input", 0.0, 1.0, "", 0, "Active tracking"),
     ParameterSpec("control_accel_gain_mps2", "Control accel", 0.0, 5.0, "m/s2", 2, "Active tracking"),
     ParameterSpec("control_brake_decel_gain_mps2", "Control brake", 0.0, 8.0, "m/s2", 2, "Active tracking"),
+    ParameterSpec("control_coast_decel_mps2", "Control coast", 0.0, 3.0, "m/s2", 2, "Active tracking"),
     ParameterSpec("control_steer_to_yaw_rate_gain", "Steer yaw gain", 0.0, 1.0, "x", 2, "Active tracking"),
     ParameterSpec("control_input_timeout_s", "Control timeout", 0.02, 1.0, "s", 2, "Active tracking"),
     ParameterSpec("max_control_accel_delta_mps2", "Control accel delta", 0.0, 2.0, "m/s2", 2, "Active tracking"),
@@ -632,6 +634,7 @@ class Filter:
         self._control_timeout_s = float(self._tune["control_input_timeout_s"])
         self._control_accel_gain = float(self._tune["control_accel_gain_mps2"])
         self._control_brake_decel_gain = float(self._tune["control_brake_decel_gain_mps2"])
+        self._control_coast_decel = float(self._tune["control_coast_decel_mps2"])
         self._control_steer_yaw_gain = float(self._tune["control_steer_to_yaw_rate_gain"])
         self._max_control_accel_delta = float(self._tune["max_control_accel_delta_mps2"])
         self._max_control_yaw_rate_delta = float(self._tune["max_control_yaw_rate_delta_radps"])
@@ -833,8 +836,8 @@ class Filter:
             return
 
         clipped_dt = min(dt, self._max_prediction_dt_s)
-        self._filter.predict(dt=clipped_dt, timestamp=timestamp)
         self._apply_control_prediction(clipped_dt, timestamp)
+        self._filter.predict(dt=clipped_dt, timestamp=timestamp)
 
     def _apply_control_prediction(self, dt: float, timestamp: float) -> None:
         self._active_command_used_latest_prediction = False
@@ -865,7 +868,12 @@ class Filter:
         throttle = self._clamp(float(self._latest_control_input.throttle), 0.0, 1.0)
         brake = self._clamp(float(self._latest_control_input.brake), 0.0, 1.0)
         steer = self._clamp(float(self._latest_control_input.steer), -1.0, 1.0)
-        accel_target = throttle * max(0.0, self._control_accel_gain) - brake * max(0.0, self._control_brake_decel_gain)
+        coast_decel = max(0.0, self._control_coast_decel) if snapshot.speed > 0.25 else 0.0
+        accel_target = (
+            throttle * max(0.0, self._control_accel_gain)
+            - brake * max(0.0, self._control_brake_decel_gain)
+            - coast_decel
+        )
         if self._latest_control_input.reverse:
             accel_target = -accel_target
         accel_delta = self._clamp(
@@ -889,7 +897,7 @@ class Filter:
             self._active_command_used_latest_prediction = True
             self._control_predicted_accel_mps2 = snapshot.acceleration_mps2 + accel_delta
             self._control_predicted_yaw_rate_radps = snapshot.yaw_rate_radps + yaw_rate_delta
-            self._control_prediction_reason = "control prediction applied"
+            self._control_prediction_reason = "control prior applied before process prediction"
         else:
             self._control_prediction_reason = "control prediction rejected by filter core"
 

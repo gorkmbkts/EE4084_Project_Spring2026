@@ -323,6 +323,128 @@ def test_closed_loop_autotuner_active_mode_includes_active_control_stage(tmp_pat
         raise AssertionError("active saved config did not store best active-control tune metadata")
 
 
+def test_active_ctra_search_runs_explicit_control_ablations(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    runner = _FakeValidationRunner(
+        {
+            1: {"route_completion_success": True, "eval_filtered_rmse_m": 2.0},
+            2: {"route_completion_success": True, "eval_filtered_rmse_m": 0.5},
+            3: {"route_completion_success": True, "eval_filtered_rmse_m": 1.5},
+            4: {"route_completion_success": True, "eval_filtered_rmse_m": 1.6},
+            5: {"route_completion_success": True, "eval_filtered_rmse_m": 1.7},
+        }
+    )
+    base_request = _request(
+        tmp_path,
+        (log_path,),
+        sensor,
+        tracking_mode=TRACKING_ACTIVE,
+        filter_id="ctra_ukf",
+    )
+    request = _with_stage_budgets(base_request, passive=1, active=4, joint=0)
+
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+    active_results = [
+        item for item in result.validation_results if item.stage == "stage2_active_control"
+    ]
+    if [item.raw_metrics.get("candidate_type") for item in active_results] != [
+        "active_ablation_disabled",
+        "active_ablation_accel_only",
+        "active_ablation_yaw_only",
+        "active_ablation_default_combined",
+    ]:
+        raise AssertionError("CTRA active search did not run the four explicit control ablations")
+    disabled, accel_only, yaw_only, combined = [item.candidate_tune for item in active_results]
+    if float(disabled.get("enable_control_input_prediction", 1.0)) != 0.0:
+        raise AssertionError("disabled ablation left active prediction enabled")
+    if float(accel_only.get("control_steer_to_yaw_rate_gain", 1.0)) != 0.0:
+        raise AssertionError("acceleration-only ablation left yaw control enabled")
+    if float(yaw_only.get("control_accel_gain_mps2", 1.0)) != 0.0:
+        raise AssertionError("yaw-only ablation left acceleration control enabled")
+    if float(combined.get("enable_control_input_prediction", 0.0)) != 1.0:
+        raise AssertionError("combined ablation did not enable active prediction")
+    if float(result.best_tune.get("enable_control_input_prediction", 1.0)) != 0.0:
+        raise AssertionError("disabled ablation was best but was not selected")
+
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    if config.get("best_active_candidate_uses_control") is not False:
+        raise AssertionError("saved metadata did not identify the disabled active winner")
+
+
+def test_joint_phase_selects_only_final_phase_validations(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    runner = _FakeValidationRunner(
+        {
+            1: {"route_completion_success": True, "eval_filtered_rmse_m": 5.0},
+            2: {"route_completion_success": True, "eval_filtered_rmse_m": 0.1},
+            3: {"route_completion_success": True, "eval_filtered_rmse_m": 3.0},
+            4: {"route_completion_success": True, "eval_filtered_rmse_m": 2.0},
+            5: {"route_completion_success": True, "eval_filtered_rmse_m": 2.5},
+        }
+    )
+    request = _with_stage_budgets(
+        _request(
+            tmp_path,
+            (log_path,),
+            sensor,
+            tracking_mode=TRACKING_PASSIVE,
+            strategy="random_plus_coordinate_refinement",
+        ),
+        passive=2,
+        active=0,
+        joint=3,
+    )
+
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+    if result.validation_results[1].closed_loop_score >= result.best_score:
+        raise AssertionError("test setup did not make an earlier-stage candidate look better")
+    selected = next(
+        item
+        for item in result.validation_results
+        if item.closed_loop_score == result.best_score and item.stage == "stage3_joint_local"
+    )
+    if selected.finalist_rank != 4:
+        raise AssertionError("final tune was not the best candidate validated in the final phase")
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    if config.get("final_phase_candidate_count") != 3:
+        raise AssertionError("saved config did not record the final-phase candidate count")
+    if config.get("final_tuning_stage") != "stage3_joint_local":
+        raise AssertionError("saved final tune did not come from the joint phase")
+    if config.get("active_vs_passive_improvement") is not None:
+        raise AssertionError("passive run should not report active-versus-passive improvement")
+
+
+def test_disabled_active_winner_stays_disabled_in_joint_phase(tmp_path: Path) -> None:
+    log_path, sensor = _recorded_log(tmp_path, "route_001")
+    runner = _FakeValidationRunner(
+        {
+            1: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0},
+            2: {"route_completion_success": True, "eval_filtered_rmse_m": 0.4},
+            3: {"route_completion_success": True, "eval_filtered_rmse_m": 2.0},
+            4: {"route_completion_success": True, "eval_filtered_rmse_m": 0.5},
+        }
+    )
+    request = _with_stage_budgets(
+        _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_ACTIVE),
+        passive=1,
+        active=2,
+        joint=1,
+    )
+
+    result = ClosedLoopBenchmarkAutoTuner(validation_runner=runner).run(request)
+    final_request = runner.requests[-1]
+    if float(final_request.finalist.candidate_tune.get("enable_control_input_prediction", 1.0)) != 0.0:
+        raise AssertionError("joint phase re-enabled a disabled active winner")
+    if float(result.best_tune.get("enable_control_input_prediction", 1.0)) != 0.0:
+        raise AssertionError("final saved tune did not preserve the disabled winner")
+    config = json.loads(result.saved_config_path.read_text(encoding="utf-8"))
+    if config.get("final_tune_uses_control") is not False:
+        raise AssertionError("saved metadata did not preserve the disabled final tune")
+    expected_improvement = float(config["best_passive_score"]) - float(config["final_objective_score"])
+    if float(config.get("active_vs_passive_improvement") or 0.0) != pytest.approx(expected_improvement):
+        raise AssertionError("active-versus-passive improvement did not use the final saved tune")
+
+
 def test_closed_loop_autotuner_stores_failure_classes_in_trial_results(tmp_path: Path) -> None:
     log_path, sensor = _recorded_log(tmp_path, "route_001")
     runner = _FakeValidationRunner(
@@ -447,19 +569,21 @@ def test_control_instability_shrinks_active_parameter_families(tmp_path: Path) -
         {
             1: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0},
             2: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0},
-            3: {
+            3: {"route_completion_success": True, "eval_filtered_rmse_m": 1.1},
+            4: {"route_completion_success": True, "eval_filtered_rmse_m": 1.15},
+            5: {"route_completion_success": True, "eval_filtered_rmse_m": 1.2},
+            6: {
                 "route_completion_success": False,
                 "route_aborted": True,
                 "abort_reason": "Control instability and steering oscillation",
                 "control_instability_score": 5.0,
             },
-            4: {"route_completion_success": True, "eval_filtered_rmse_m": 1.2},
         }
     )
     request = _with_stage_budgets(
         _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_ACTIVE, strategy="random_plus_coordinate_refinement"),
         passive=1,
-        active=3,
+        active=5,
         joint=0,
     )
 
@@ -740,9 +864,10 @@ def _request(
     strategy: str = "optuna_tpe",
     behavior: dict[str, object] | None = None,
     actuator: dict[str, object] | None = None,
+    filter_id: str = "ca_kf",
 ) -> ClosedLoopAutoTuneRequest:
     return ClosedLoopAutoTuneRequest(
-        filter_id="ca_kf",
+        filter_id=filter_id,
         tracking_mode=tracking_mode,
         offline_log_paths=log_paths,
         validation_routes=validation_routes if validation_routes is not None else (ClosedLoopValidationRoute("route_1", "Town01", "route_1"),),

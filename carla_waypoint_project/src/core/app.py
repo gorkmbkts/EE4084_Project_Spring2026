@@ -2294,8 +2294,8 @@ class SimulationApp:
                         self._clock.tick_pygame()
                         continue
                     self._set_latest_control(control, control)
-                    if not self._offline_recording_active():
-                        self._feed_filter_control_input(control, source="route_initialization_brake")
+                    # Keep active prediction dormant until route activation so
+                    # the stationary hold brake cannot bias filter startup.
                     self.actuator_realism.reset(control)
                 elif self._drive_mode == DriveMode.AUTONOMOUS:
                     if self._offline_recording_warmup_active():
