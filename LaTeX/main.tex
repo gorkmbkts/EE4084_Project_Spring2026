@@ -1,0 +1,420 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Closed-Loop Validated Auto-Tuning of a CTRA-UKF Localization Filter in CARLA}
+
+\author{
+\IEEEauthorblockN{Gorkem Bektas}
+\IEEEauthorblockA{
+Department of Electrical and Electronics Engineering, Marmara University, Istanbul, Turkiye\\
+Email: gorkembektas@marun.edu.tr}
+}
+
+\maketitle
+
+\begin{abstract}
+This paper presents a CARLA-based benchmarking and auto-tuning framework for evaluating Kalman-based vehicle localization filters under closed-loop autonomous driving conditions. The framework supports offline sensor replay, active and passive tracking modes, separate tune configuration management, and route-level validation feedback. Although the architecture includes CV, CA, EKF, and UKF filters, this study focuses on the CTRA-UKF as a nonlinear localization baseline for autonomous vehicle control. The filter is formulated with explicit state-transition and sensor models using GNSS position, inertial yaw-rate, and acceleration measurements. A closed-loop utility score combines localization accuracy, route completion, tracking quality, yaw error, consistency diagnostics, and scenario difficulty. Experiments under medium and high sensor noise, perfect and realistic actuator settings, and active and passive tracking modes complete all eight route validations without divergence. The tuned CTRA-UKF reduces position error by 60.7 percent on average relative to raw GNSS, while the results indicate that active tracking improves estimator RMSE and passive tracking can provide more stable route-following behavior.
+\end{abstract}
+
+
+\begin{IEEEkeywords}
+Autonomous vehicle localization, unscented Kalman filter, CTRA model, CARLA, auto-tuning, closed-loop benchmarking
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{sec:introduction}
+
+Reliable localization is a central requirement for autonomous vehicle navigation because perception, planning, and control modules all depend on a consistent estimate of the vehicle state. Kalman-based estimators remain attractive for this task due to their recursive structure, low computational cost, and explicit uncertainty representation \cite{kalman1960new,simon2006optimal,barshalom2001estimation}. However, their practical performance strongly depends on the selection of process and measurement noise parameters. A configuration that is too conservative may lag behind the vehicle motion, while an overconfident configuration may become inconsistent or unstable under noisy measurements, sharp turns, or imperfect actuation.
+
+A common way to evaluate localization filters is to replay recorded sensor data and compare the estimated trajectory against ground truth. Although offline replay is useful for isolating estimator behavior, it does not fully capture the effect of localization on closed-loop driving. In an autonomous vehicle stack, the controller consumes the estimated state rather than the ground truth state. Therefore, a filter that reduces position root mean square error (RMSE) in offline evaluation may still degrade route tracking if it introduces yaw lag, transient errors, inconsistent covariance, or unstable behavior during controller feedback. This gap becomes more visible when the same localization filter is tested under different tracking modes, sensor noise profiles, and actuator assumptions.
+
+Simulation environments such as CARLA provide a practical platform for studying this interaction under repeatable and configurable driving conditions \cite{dosovitskiy2017carla}. In this work, CARLA is used to build a modular benchmark framework for Kalman-based vehicle localization filters. The framework supports sensor logging, offline replay, closed-loop route validation, multiple noise profiles, and configurable actuator realism. In addition, it distinguishes between passive tracking, where the filter follows sensor observations and the motion model, and active tracking, where control-related priors are used during prediction. This distinction is important because active and passive tracking can require different tuning configurations even when the same filter model is used.
+
+This paper proposes a closed-loop validated auto-tuning workflow for Kalman-based localization filters in CARLA. The tuning process treats each candidate configuration as a black-box evaluation and searches for parameters that improve route-level behavior rather than only offline estimation error. A Bayesian-style search strategy based on Optuna is used to explore filter parameters within predefined bounds \cite{bergstra2011algorithms,akiba2019optuna}. The selected configurations are saved separately for active and passive tracking so that tuning results are not mixed across different estimator-controller interaction modes.
+
+To evaluate closed-loop behavior more directly, this work introduces a closed-loop utility score that combines localization improvement, route completion, number of attempts, completion time, cross-track error, yaw error, consistency diagnostics, divergence events, and scenario difficulty. The purpose of this score is not to replace standard estimation metrics such as RMSE, normalized innovation squared (NIS), or normalized estimation error squared (NEES). Instead, it complements them by measuring whether a tuned localization filter is useful for completing a route accurately and efficiently in closed-loop operation.
+
+The main contributions of this work are summarized as follows:
+\begin{itemize}
+\item A modular CARLA-based benchmark framework for evaluating Kalman-based vehicle localization filters using both offline replay and closed-loop route validation.
+\item A closed-loop auto-tuning pipeline that searches for localization filter parameters using route-level feedback instead of relying only on offline localization error.
+\item A mathematical formulation of the CTRA-UKF state transition, sigma-point prediction, GNSS measurement model, and inertial sensor model used by the localization pipeline.
+\item Separate active and passive tracking tune configuration management to prevent parameter sets from being reused across incompatible tracking modes.
+\item A closed-loop utility score that combines estimation accuracy, route tracking quality, completion efficiency, consistency behavior, and scenario difficulty.
+\end{itemize}
+
+\section{Framework Overview}
+\label{sec:framework}
+
+The proposed framework evaluates localization filters at two complementary levels. First, recorded sensor streams can be replayed offline to measure estimator accuracy and consistency without modifying the vehicle trajectory. Second, the same filter configuration can be validated in a closed-loop CARLA benchmark where the estimated vehicle state is used by the controller during route following. This separation makes it possible to distinguish estimator-level improvements from route-level driving utility.
+
+The implementation is designed as a filter-agnostic framework rather than a single-filter script. It contains constant-velocity (CV), constant-acceleration (CA), extended Kalman filter (EKF), and unscented Kalman filter (UKF) options under the same benchmark interface. The present paper reports the CTRA-UKF experiments because the UKF is a representative and widely used nonlinear filtering choice for nonlinear state estimation, especially when the motion model contains turn-rate and acceleration dynamics \cite{julier2004unscented,wan2000unscented}. Therefore, the results should be read as a UKF-focused evaluation produced inside a broader multi-filter framework, not as a claim that the framework is limited to UKF-only operation.
+
+\subsection{CARLA Benchmark Pipeline}
+
+The benchmark pipeline consists of four main stages: sensor logging, candidate tuning, closed-loop validation, and result export. During sensor logging, ground truth vehicle state, GNSS measurements, inertial measurements, control commands, and route metadata are recorded. During tuning, candidate filter parameters are generated and evaluated. During closed-loop validation, the filter estimate is fed back into the driving stack while the ego vehicle attempts to complete a predefined route. Finally, route summaries, aggregate metrics, paper-ready tables, and diagnostic plots are exported.
+
+The closed-loop benchmark records both localization and driving metrics. Localization metrics include filtered position RMSE, raw GNSS position RMSE, yaw RMSE, NIS, and NEES when available. Driving metrics include route completion, number of attempts, completion time, mean cross-track error, 95th percentile cross-track error, maximum cross-track error, and divergence events. This combined output is important because a localization filter can improve position accuracy while still degrading route tracking through delayed yaw or inconsistent uncertainty estimates.
+
+\subsection{Active and Passive Tracking Modes}
+
+Two tracking modes are evaluated. In passive tracking, the localization filter is driven by the motion model and sensor observations. This setting is useful for measuring how well the estimator reconstructs the vehicle state without direct control-prior assistance. In active tracking, the filter prediction also uses control-related priors, allowing the estimator to anticipate the effect of vehicle actuation during the prediction interval. Active tracking can reduce transient estimation error when the control model is accurate, but it may also introduce bias if actuator behavior, command delay, or vehicle response is mismatched.
+
+For this reason, the framework maintains separate tune configurations for active and passive tracking. A parameter set optimized for passive tracking is not assumed to be valid for active tracking, and vice versa. The experiments in this paper use this separation to analyze whether active priors improve closed-loop localization utility under different noise and actuator conditions.
+
+\section{CTRA-UKF State and Sensor Models}
+\label{sec:ukf_model}
+
+The main evaluated estimator is a constant turn-rate and acceleration unscented Kalman filter, denoted as CTRA-UKF. The unscented Kalman filter is used because it can propagate nonlinear vehicle dynamics without requiring an explicit Jacobian at each prediction step \cite{julier2004unscented,wan2000unscented}. The filter estimates the planar vehicle state and uses GNSS and inertial information for correction. Raw GNSS is used as a measurement-level baseline to quantify the localization improvement obtained by the tuned filter.
+
+\subsection{State Vector}
+
+The CTRA-UKF state at discrete time $k$ is defined as
+\begin{equation}
+\mathbf{x}_k =
+\begin{bmatrix}
+p_{x,k} & p_{y,k} & v_k & \psi_k & \omega_k & a_k
+\end{bmatrix}^{\mathrm{T}},
+\label{eq:state_vector}
+\end{equation}
+where $p_x$ and $p_y$ are the vehicle position coordinates in the local map frame, $v$ is the longitudinal speed, $\psi$ is the yaw angle, $\omega$ is the yaw rate, and $a$ is the longitudinal acceleration. This state is sufficient for a planar road-driving localization problem because the controller mainly requires position, heading, and speed. Height, roll, and pitch are not included in the filter state because the evaluated route-following task is expressed on the horizontal CARLA map plane.
+
+The state-space model is written as
+\begin{align}
+\mathbf{x}_k &= f(\mathbf{x}_{k-1},\mathbf{u}_{k-1},\Delta t_k) + \mathbf{w}_{k-1},
+\label{eq:state_model}\\
+\mathbf{z}_k^{(s)} &= h_s(\mathbf{x}_k) + \mathbf{v}_k^{(s)},
+\label{eq:measurement_model}
+\end{align}
+where $\Delta t_k$ is the prediction interval, $\mathbf{u}_{k-1}$ is an optional control-prior vector, $\mathbf{w}_{k-1}\sim\mathcal{N}(\mathbf{0},\mathbf{Q}_{k-1})$ is the process noise, $\mathbf{z}_k^{(s)}$ is the measurement from sensor $s$, and $\mathbf{v}_k^{(s)}\sim\mathcal{N}(\mathbf{0},\mathbf{R}_s)$ is the corresponding measurement noise. The sensor-specific measurement function $h_s(\cdot)$ allows the same UKF update rule to be used for GNSS, inertial, or pseudo-heading measurements.
+
+\subsection{CTRA Prediction Model}
+
+The CTRA model assumes that acceleration and yaw rate remain approximately constant over a short prediction interval. To express both passive and active tracking with a single notation, the acceleration and yaw-rate terms used in prediction are written as
+\begin{align}
+\bar{a}_{k-1} &= a_{k-1} + \gamma_a(a^{u}_{k-1}-a_{k-1}),
+\label{eq:active_accel}\\
+\bar{\omega}_{k-1} &= \omega_{k-1} + \gamma_\omega(\omega^{u}_{k-1}-\omega_{k-1}),
+\label{eq:active_yaw_rate}
+\end{align}
+where $a^{u}$ and $\omega^{u}$ denote control-derived acceleration and yaw-rate priors. The gains $\gamma_a,\gamma_\omega\in[0,1]$ determine how strongly the prediction follows these priors. In passive tracking, $\gamma_a=\gamma_\omega=0$, so the prediction uses the state itself. In active tracking, nonzero gains inject control-aware motion information before the measurement update.
+
+For $|\bar{\omega}_{k-1}|>\epsilon_\omega$, the nonlinear CTRA propagation is obtained by integrating the body-frame forward velocity along a rotating heading:
+\begin{align}
+p_{x,k}^{-} &= p_{x,k-1} + \Delta p_x,
+& p_{y,k}^{-} &= p_{y,k-1} + \Delta p_y,
+\label{eq:pos_predict_compact}\\
+v_k^{-} &= v_{k-1} + \bar{a}_{k-1}\Delta t_k,
+& \psi_k^{-} &= \operatorname{wrap}(\psi_{k-1}+\bar{\omega}_{k-1}\Delta t_k),
+\label{eq:vel_yaw_predict}\\
+\omega_k^{-} &= \bar{\omega}_{k-1},
+& a_k^{-} &= \bar{a}_{k-1}.
+\label{eq:omega_accel_predict}
+\end{align}
+The position increments are
+\begin{align}
+\Delta p_x &= \frac{v}{\bar{\omega}}\left[\sin(\psi+\bar{\omega}\Delta t)-\sin\psi\right]
+\nonumber\\
+&\quad + \bar{a}\left(\frac{\Delta t\sin(\psi+\bar{\omega}\Delta t)}{\bar{\omega}}\right.
+\nonumber\\
+&\qquad\left.+\frac{\cos(\psi+\bar{\omega}\Delta t)-\cos\psi}{\bar{\omega}^{2}}\right),
+\label{eq:delta_px}\\
+\Delta p_y &= \frac{v}{\bar{\omega}}\left[-\cos(\psi+\bar{\omega}\Delta t)+\cos\psi\right]
+\nonumber\\
+&\quad + \bar{a}\left(-\frac{\Delta t\cos(\psi+\bar{\omega}\Delta t)}{\bar{\omega}}\right.
+\nonumber\\
+&\qquad\left.+\frac{\sin(\psi+\bar{\omega}\Delta t)-\sin\psi}{\bar{\omega}^{2}}\right),
+\label{eq:delta_py}
+\end{align}
+where the time index $k-1$ is omitted on the right-hand side for readability. When the yaw rate is close to zero, the model switches to the numerically stable straight-motion limit
+\begin{align}
+p_{x,k}^{-} &= p_{x,k-1} + v_{k-1}\Delta t_k\cos\psi_{k-1}
++ \frac{1}{2}\bar{a}_{k-1}\Delta t_k^2\cos\psi_{k-1},
+\label{eq:straight_px}\\
+p_{y,k}^{-} &= p_{y,k-1} + v_{k-1}\Delta t_k\sin\psi_{k-1}
++ \frac{1}{2}\bar{a}_{k-1}\Delta t_k^2\sin\psi_{k-1}.
+\label{eq:straight_py}
+\end{align}
+This fallback prevents division by a small yaw rate and makes the same filter usable on both straight and curved route segments. The process covariance $\mathbf{Q}_k$ controls how much uncertainty is injected into the model. Larger acceleration or yaw-rate process noise allows the filter to react more quickly to maneuvers, while smaller values make the prediction smoother but more lag-prone.
+
+\subsection{Unscented Transform}
+
+Let $n=6$ be the state dimension, $\hat{\mathbf{x}}_{k-1}^{+}$ be the posterior state estimate, and $\mathbf{P}_{k-1}^{+}$ be the posterior covariance. The UKF forms $2n+1$ sigma points as
+\begin{align}
+\boldsymbol{\chi}_{0,k-1}^{+} &= \hat{\mathbf{x}}_{k-1}^{+},
+\label{eq:sigma0}\\
+\boldsymbol{\chi}_{i,k-1}^{+} &= \hat{\mathbf{x}}_{k-1}^{+}
++ \left[\sqrt{(n+\lambda)\mathbf{P}_{k-1}^{+}}\right]_i,
+\label{eq:sigmaplus}\\
+\boldsymbol{\chi}_{i+n,k-1}^{+} &= \hat{\mathbf{x}}_{k-1}^{+}
+- \left[\sqrt{(n+\lambda)\mathbf{P}_{k-1}^{+}}\right]_i,
+\label{eq:sigmaminus}
+\end{align}
+for $i=1,\ldots,n$, where $\lambda=\alpha^2(n+\kappa)-n$. The predicted sigma points are propagated through the nonlinear process model:
+\begin{equation}
+\boldsymbol{\chi}_{i,k}^{-}=f(\boldsymbol{\chi}_{i,k-1}^{+},\mathbf{u}_{k-1},\Delta t_k).
+\label{eq:sigma_predict}
+\end{equation}
+The predicted mean and covariance are then computed as
+\begin{align}
+\hat{\mathbf{x}}_k^{-} &= \sum_{i=0}^{2n} W_i^{(m)}\boldsymbol{\chi}_{i,k}^{-},
+\label{eq:ukf_pred_mean}\\
+\mathbf{P}_k^{-} &= \sum_{i=0}^{2n} W_i^{(c)}
+\mathbf{e}_{i,k}^{-}(\mathbf{e}_{i,k}^{-})^{\mathrm{T}} + \mathbf{Q}_k,
+\label{eq:ukf_pred_cov}
+\end{align}
+where $\mathbf{e}_{i,k}^{-}=\boldsymbol{\chi}_{i,k}^{-}-\hat{\mathbf{x}}_k^{-}$. Angle components are wrapped during subtraction so that yaw innovations remain within a continuous interval. This detail is important in vehicle localization because a yaw angle close to $\pi$ and another close to $-\pi$ represent nearly the same physical heading.
+
+\subsection{GNSS and Inertial Sensor Models}
+
+GNSS is modeled as a direct position measurement in the local CARLA map frame:
+\begin{equation}
+\mathbf{z}_k^{\mathrm{gnss}}=
+\begin{bmatrix}p_{x,k}^{\mathrm{gnss}}\\p_{y,k}^{\mathrm{gnss}}\end{bmatrix}
+=
+\underbrace{\begin{bmatrix}1&0&0&0&0&0\\0&1&0&0&0&0\end{bmatrix}}_{\mathbf{H}_{\mathrm{gnss}}}
+\mathbf{x}_k+
+\mathbf{v}_k^{\mathrm{gnss}},
+\label{eq:gnss_model}
+\end{equation}
+with
+\begin{equation}
+\mathbf{R}_{\mathrm{gnss}}=
+\begin{bmatrix}
+\sigma_x^2 & 0\\
+0 & \sigma_y^2
+\end{bmatrix}.
+\label{eq:gnss_noise}
+\end{equation}
+Although GNSS latitude and longitude are the raw simulator outputs, they are converted to local planar coordinates before filtering. This makes the measurement model linear with respect to the position components of the state.
+
+The inertial measurements are expressed as a yaw-rate and longitudinal-acceleration observation:
+\begin{equation}
+\mathbf{z}_k^{\mathrm{imu}}=
+\begin{bmatrix}a_k^{\mathrm{imu}}\\\omega_k^{\mathrm{imu}}\end{bmatrix}
+=
+\underbrace{\begin{bmatrix}0&0&0&0&0&1\\0&0&0&0&1&0\end{bmatrix}}_{\mathbf{H}_{\mathrm{imu}}}
+\mathbf{x}_k+
+\mathbf{v}_k^{\mathrm{imu}},
+\label{eq:imu_model}
+\end{equation}
+where
+\begin{equation}
+\mathbf{R}_{\mathrm{imu}}=
+\begin{bmatrix}
+\sigma_a^2 & 0\\
+0 & \sigma_\omega^2
+\end{bmatrix}.
+\label{eq:imu_noise}
+\end{equation}
+In active tracking, the same physical quantities can also enter the prediction step as control-related priors through (\ref{eq:active_accel}) and (\ref{eq:active_yaw_rate}). This means that the framework can compare two estimator-controller interaction modes without changing the state definition. Passive tracking relies more heavily on measurement correction, while active tracking attempts to reduce prediction error before correction.
+
+When a heading pseudo-measurement is available from a velocity direction or route-aligned reference, it can be represented as
+\begin{equation}
+z_k^{\psi}=\operatorname{wrap}(\psi_k)+v_k^{\psi},
+\qquad R_{\psi}=\sigma_{\psi}^{2}.
+\label{eq:yaw_measurement}
+\end{equation}
+This update is applied only when the corresponding heading estimate is reliable, for example above a minimum speed threshold. Otherwise, low-speed heading observations can inject arbitrary yaw noise and degrade closed-loop control.
+
+For a generic sensor $s$, the UKF measurement prediction is obtained by passing each predicted sigma point through the sensor model:
+\begin{align}
+\mathbf{y}_{i,k}^{(s)} &= h_s(\boldsymbol{\chi}_{i,k}^{-}),
+\label{eq:measurement_sigma}\\
+\hat{\mathbf{z}}_k^{(s)} &= \sum_{i=0}^{2n} W_i^{(m)}\mathbf{y}_{i,k}^{(s)},
+\label{eq:measurement_mean}\\
+\mathbf{S}_k^{(s)} &= \sum_{i=0}^{2n} W_i^{(c)}\mathbf{d}_{i,k}^{(s)}
+(\mathbf{d}_{i,k}^{(s)})^{\mathrm{T}} + \mathbf{R}_s,
+\label{eq:innovation_cov}\\
+\mathbf{P}_{xz,k}^{(s)} &= \sum_{i=0}^{2n} W_i^{(c)}\mathbf{e}_{i,k}^{-}
+(\mathbf{d}_{i,k}^{(s)})^{\mathrm{T}},
+\label{eq:cross_covariance}
+\end{align}
+where $\mathbf{d}_{i,k}^{(s)}=\mathbf{y}_{i,k}^{(s)}-\hat{\mathbf{z}}_k^{(s)}$. The Kalman gain, state update, and covariance update are
+\begin{align}
+\mathbf{K}_k^{(s)} &= \mathbf{P}_{xz,k}^{(s)}(\mathbf{S}_k^{(s)})^{-1},
+\label{eq:kalman_gain}\\
+\hat{\mathbf{x}}_k^{+} &= \hat{\mathbf{x}}_k^{-}
++ \mathbf{K}_k^{(s)}\left(\mathbf{z}_k^{(s)}-\hat{\mathbf{z}}_k^{(s)}\right),
+\label{eq:state_update}\\
+\mathbf{P}_k^{+} &= \mathbf{P}_k^{-}
+- \mathbf{K}_k^{(s)}\mathbf{S}_k^{(s)}(\mathbf{K}_k^{(s)})^{\mathrm{T}}.
+\label{eq:cov_update}
+\end{align}
+The filter may process multiple sensors sequentially within the same time step. This representation is useful in the implementation because missing measurements can simply be skipped, while available measurements reuse the same update equations with different $h_s(\cdot)$ and $\mathbf{R}_s$.
+
+\subsection{Consistency Diagnostics}
+
+The benchmark evaluates statistical consistency using innovation and estimation-error diagnostics. For a measurement innovation $\boldsymbol{\nu}_k=\mathbf{z}_k-\hat{\mathbf{z}}_k$, the NIS is
+\begin{equation}
+\epsilon_k^{\mathrm{NIS}}=\boldsymbol{\nu}_k^{\mathrm{T}}\mathbf{S}_k^{-1}\boldsymbol{\nu}_k.
+\label{eq:nis}
+\end{equation}
+When ground truth is available from the simulator, the NEES is computed as
+\begin{equation}
+\epsilon_k^{\mathrm{NEES}}=(\mathbf{x}_k^{\mathrm{gt}}-\hat{\mathbf{x}}_k)^{\mathrm{T}}
+\mathbf{P}_k^{-1}(\mathbf{x}_k^{\mathrm{gt}}-\hat{\mathbf{x}}_k).
+\label{eq:nees}
+\end{equation}
+These diagnostics are not only used to judge whether the estimate is accurate, but also whether the covariance is credible. A filter that gives a small RMSE with unrealistically small covariance may still be risky in a closed-loop driving stack because the controller and any downstream fusion module may treat uncertain states as if they were certain.
+
+\section{Closed-Loop Auto-Tuning and Metrics}
+\label{sec:tuning_metrics}
+
+\subsection{Bayesian-Style Closed-Loop Auto-Tuning}
+
+The auto-tuning procedure treats the closed-loop benchmark as a black-box objective. For each candidate parameter set, the benchmark runs the vehicle on a validation route and returns route-level metrics. The optimizer then proposes new parameter values within predefined bounds. In the final tuning workflow, Optuna is used as the search backend because it provides a practical implementation of sequential hyperparameter optimization and tree-structured Parzen estimator sampling \cite{bergstra2011algorithms,akiba2019optuna}.
+
+The tuned parameters include process-noise and uncertainty-related parameters that affect the prediction and update behavior of the filter. For active tracking, control-related parameters are also considered when they are part of the selected filter configuration. The tuning goal is not only to minimize position RMSE, but also to avoid route failure, large cross-track error, excessive completion time, and inconsistent closed-loop behavior. This is why the validation objective is based on route-level feedback rather than an offline replay score alone.
+
+\subsection{Closed-Loop Utility Score}
+
+Standard localization metrics are necessary but incomplete for closed-loop evaluation. Position RMSE measures agreement with ground truth, while consistency diagnostics provide statistical information about the filter covariance. However, these metrics do not directly measure whether the controller can complete a route efficiently using the filter output. Therefore, the benchmark computes a closed-loop utility score, denoted by $S_{\mathrm{cl}}$, as
+\begin{equation}
+S_{\mathrm{cl}} =
+\frac{D C A (1 + I)}
+{1 + T + E_{\mathrm{ct}} + E_{95} + E_{\mathrm{yaw}} + E_{\mathrm{cons}} + E_{\mathrm{div}}},
+\label{eq:utility}
+\end{equation}
+where $D$ is the scenario difficulty factor, $C$ is the route completion factor, $A$ is the attempt factor, $I$ is the localization improvement ratio, $T$ is normalized completion time, $E_{\mathrm{ct}}$ is normalized mean cross-track error, $E_{95}$ is normalized 95th percentile cross-track error, $E_{\mathrm{yaw}}$ is normalized yaw error, $E_{\mathrm{cons}}$ is the consistency penalty, and $E_{\mathrm{div}}$ is the divergence penalty.
+
+The localization improvement ratio is computed from raw GNSS and filtered position errors as
+\begin{equation}
+I = \max\left(0,\frac{e_{\mathrm{raw}}}{\max(e_{\mathrm{filt}},\epsilon)} - 1\right),
+\label{eq:improvement}
+\end{equation}
+where $e_{\mathrm{raw}}$ and $e_{\mathrm{filt}}$ are the raw GNSS and filtered position RMSE values, respectively, and $\epsilon$ prevents division by zero. The attempt factor is defined as $A=1/\max(1,n_{\mathrm{att}})$, where $n_{\mathrm{att}}$ is the number of attempts required to complete the route. Failed or divergent runs are strongly penalized through $C$ and $E_{\mathrm{div}}$.
+
+The utility score is used as a compact route-level indicator. A high score indicates that the filter improves localization accuracy while also supporting route completion, low cross-track error, short completion time, and stable diagnostic behavior. The score is not intended to hide the underlying metrics. Therefore, all major submetrics are reported alongside it in the results.
+
+\section{Experimental Setup}
+\label{sec:experimental_setup}
+
+The experiments are conducted in CARLA on the Town04 map using a fixed validation route denoted as \texttt{route\_001\_mahalle}. A fixed route is used to isolate the effects of sensor noise, actuator realism, and tracking mode without introducing additional route-layout variability. The evaluated filter is the tuned CTRA-UKF, and raw GNSS is used as the measurement baseline. Other implemented Kalman-family filters remain available in the framework for comparison studies, but they are outside the experimental scope of this manuscript.
+
+The experimental matrix contains eight scenarios, formed by combining two sensor noise profiles, two actuator settings, and two tracking modes. The medium-noise setting represents moderate GNSS and inertial uncertainty, while the high-noise setting increases the measurement uncertainty. The perfect-actuator setting assumes ideal command execution, whereas the realistic-actuator setting includes more practical actuation behavior. The scenario codes are summarized in Table~\ref{tab:scenarios}.
+
+\begin{table}[!t]
+\renewcommand{\arraystretch}{1.15}
+\caption{Closed-Loop Evaluation Scenarios}
+\label{tab:scenarios}
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+Code & Noise & Actuator & Tracking \\
+\midrule
+HPA & High & Perfect & Active \\
+HPP & High & Perfect & Passive \\
+HRA & High & Realistic & Active \\
+HRP & High & Realistic & Passive \\
+MPA & Medium & Perfect & Active \\
+MPP & Medium & Perfect & Passive \\
+MRA & Medium & Realistic & Active \\
+MRP & Medium & Realistic & Passive \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Each scenario is evaluated using route completion status, completion time, raw GNSS position RMSE, filtered position RMSE, localization improvement, yaw RMSE, mean cross-track error, 95th percentile cross-track error, consistency penalty, divergence count, and the closed-loop utility score. Since the available computational budget limited the experiment campaign, the evaluation focuses on one representative route rather than a large multi-route benchmark. This keeps the analysis controlled, but it also limits claims about route-level generalization.
+
+\section{Results and Discussion}
+\label{sec:results}
+
+\subsection{Overall Closed-Loop Results}
+
+Table~\ref{tab:main_results} summarizes the closed-loop evaluation results. All eight scenarios completed the validation route successfully in a single attempt, and no divergence event was observed. This indicates that the tuned CTRA-UKF configurations remained stable under all tested combinations of sensor noise, actuator realism, and tracking mode.
+
+\begin{table*}[!t]
+\renewcommand{\arraystretch}{1.15}
+\caption{Closed-Loop Evaluation Results for the Tuned CTRA-UKF}
+\label{tab:main_results}
+\centering
+\scriptsize
+\begin{tabular}{@{}llcccccccc@{}}
+\toprule
+Scenario & Tracking & Done & Time & Raw & Filter & Red. & Mean & P95 & Utility \\
+ &  &  & (s) & RMSE & RMSE & (\%) & CTE & CTE &  \\
+\midrule
+HPA & Active  & Yes & 124.50 & 1.897 & 0.581 & 69.4 & 0.644 & 1.163 & 0.344 \\
+HPP & Passive & Yes & 120.65 & 1.888 & 0.569 & 69.9 & 0.602 & 1.030 & 0.355 \\
+HRA & Active  & Yes & 124.85 & 1.895 & 0.547 & 71.1 & 0.631 & 1.090 & 0.404 \\
+HRP & Passive & Yes & 121.85 & 1.913 & 0.570 & 70.2 & 0.630 & 1.100 & 0.398 \\
+MPA & Active  & Yes & 122.55 & 0.654 & 0.301 & 54.1 & 0.573 & 0.996 & 0.207 \\
+MPP & Passive & Yes & 119.90 & 0.637 & 0.317 & 50.3 & 0.572 & 1.004 & 0.200 \\
+MRA & Active  & Yes & 124.25 & 0.637 & 0.313 & 50.8 & 0.596 & 1.046 & 0.213 \\
+MRP & Passive & Yes & 121.10 & 0.643 & 0.322 & 50.0 & 0.567 & 0.987 & 0.215 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Across all scenarios, the raw GNSS position RMSE was 1.271 m on average, while the filtered RMSE was 0.440 m on average. This corresponds to an average position-error reduction of 60.7 percent relative to raw GNSS. The mean cross-track error was 0.602 m, the average 95th percentile cross-track error was 1.052 m, and the average completion time was 122.46 s. These results show that the tuned filter consistently improved localization accuracy while supporting stable route completion.
+
+The high-noise scenarios show larger utility values than the medium-noise scenarios. This does not imply that high-noise driving is easier. Instead, it reflects the difficulty-aware structure of the utility score and the larger improvement over raw GNSS when the raw measurements are noisier. For this reason, the utility score should be interpreted together with the absolute RMSE, cross-track error, and completion-time values.
+
+\subsection{Active and Passive Tracking Comparison}
+
+The paired active-passive comparison reveals an important closed-loop effect. Active tracking achieved lower filtered RMSE in three out of four paired scenarios: high noise with realistic actuator, medium noise with perfect actuator, and medium noise with realistic actuator. This suggests that control-related priors can improve estimator accuracy when the prediction model and actuation behavior are sufficiently compatible.
+
+However, this estimator-level improvement did not consistently translate into better route-following quality. Passive tracking completed the route faster in all four paired comparisons and produced lower mean cross-track error in all four comparisons. Table~\ref{tab:active_passive} summarizes the average behavior of the two tracking modes.
+
+\begin{table}[!t]
+\renewcommand{\arraystretch}{1.15}
+\caption{Average Active and Passive Tracking Behavior}
+\label{tab:active_passive}
+\centering
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Metric & Active & Passive \\
+\midrule
+Filter RMSE (m) & 0.436 & 0.444 \\
+Localization improvement & 1.734 & 1.671 \\
+Completion time (s) & 124.04 & 120.88 \\
+Mean CTE (m) & 0.611 & 0.593 \\
+P95 CTE (m) & 1.074 & 1.030 \\
+Utility score & 0.292 & 0.292 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This result is central to the motivation of the benchmark. If only position RMSE were considered, active tracking would appear preferable in most paired cases. If only route completion time or cross-track error were considered, passive tracking would appear more favorable. The closed-loop utility score exposes this trade-off by combining estimation accuracy and route-level driving behavior in a single diagnostic score while still preserving the individual metrics.
+
+\subsection{Implications for Closed-Loop Localization Evaluation}
+
+The results indicate that localization tuning should not be evaluated only as an estimator calibration problem. In closed-loop operation, the filter becomes part of a feedback system that includes the controller, route planner, actuator model, sensor noise, and vehicle dynamics. A parameter set that improves estimator RMSE can still be less useful if it leads to slower completion or larger route-tracking error. Conversely, a slightly less accurate estimator may produce smoother and more stable controller behavior.
+
+The active tracking results also suggest that the benefit of control-aware prediction may depend on route geometry and experiment duration. The present campaign used a single representative route due to computational budget limitations. Longer routes, wider curvature variation, repeated sharp turns, and more diverse acceleration profiles may reveal stronger advantages or disadvantages of active tracking. Therefore, the present results should be interpreted as a controlled closed-loop case study rather than a complete route-generalization benchmark.
+
+A further observation is that the consistency penalty remained non-negligible in the evaluated runs. This means that, although the tuned filter reduced position error and completed all routes, covariance calibration was not fully ideal. This is an important limitation for Kalman-based localization because an estimator can be accurate in position while still being statistically overconfident or underconfident. Future tuning objectives should therefore place stronger emphasis on balancing RMSE reduction with consistency diagnostics.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+This paper presented a CARLA-based closed-loop benchmarking and auto-tuning framework for Kalman-based vehicle localization filters. The framework combines offline replay, closed-loop validation, active and passive tracking modes, Bayesian-style parameter search, and paper-ready route-level metrics. A mathematical CTRA-UKF formulation was included to show how the planar vehicle state, nonlinear prediction model, GNSS position update, inertial sensor update, and UKF sigma-point equations are connected in the localization pipeline. A closed-loop utility score was introduced to evaluate localization filters not only by estimation accuracy, but also by route completion, tracking error, completion time, consistency diagnostics, divergence behavior, and scenario difficulty.
+
+Experiments with a tuned CTRA-UKF across eight controlled scenarios showed that the filter completed all closed-loop route validations without divergence and reduced position RMSE by an average of 60.7 percent relative to raw GNSS. Active tracking improved filtered RMSE in three out of four paired comparisons, but passive tracking provided faster completion and lower mean cross-track error in all paired comparisons. These findings support the main motivation of the work: closed-loop localization evaluation should include both estimation metrics and route-level driving utility. Future work will extend the benchmark to multiple maps, longer routes, broader curvature profiles, and stronger consistency-aware tuning objectives.
+
+
+\section*{Acknowledgment}
+The author acknowledges the use of ChatGPT during the preparation of this paper for grammatical enhancement, academic text polishing, and LaTeX code formatting for mathematical equations. All outputs were thoroughly reviewed by the author, who retains full responsibility for the final manuscript.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+
+\end{document}
