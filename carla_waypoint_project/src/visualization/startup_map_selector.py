@@ -90,6 +90,11 @@ AUTO_TUNE_OBJECTIVE_MODES = (
     "balanced_score",
 )
 
+CLOSED_LOOP_TUNE_ALGORITHMS = (
+    ("random_plus_coordinate_refinement", "Current adaptive/random search"),
+    ("optuna_tpe", "Optuna TPE / Bayesian search"),
+)
+
 
 def _auto_tune_objective_mode(value: object) -> str:
     text = str(value or "").strip().lower()
@@ -256,6 +261,8 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_active_trials = 9
         self._closed_loop_auto_tune_joint_trials = 6
         self._closed_loop_auto_tune_finalists = 1
+        self._closed_loop_auto_tune_strategy = "random_plus_coordinate_refinement"
+        self._closed_loop_auto_tune_algorithm_rects: dict[str, pygame.Rect] = {}
         self._closed_loop_auto_tune_status_lines: list[str] = []
         self._closed_loop_auto_tune_start_rect = pygame.Rect(0, 0, 1, 1)
         self._closed_loop_auto_tune_cancel_rect = pygame.Rect(0, 0, 1, 1)
@@ -1875,6 +1882,7 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_active_trials = budgets.active_control_trials
         self._closed_loop_auto_tune_joint_trials = budgets.joint_fine_tune_trials
         self._closed_loop_auto_tune_finalists = 1
+        self._closed_loop_auto_tune_strategy = "random_plus_coordinate_refinement"
         self._closed_loop_auto_tune_selected_log_indices = set()
         self._closed_loop_auto_tune_validation_route_index = (
             next(iter(self._selected_route_indices)) if len(self._selected_route_indices) == 1 else None
@@ -1884,6 +1892,7 @@ class StartupMapSelector:
         self._closed_loop_auto_tune_status_lines = [
             "Each stage runs one-attempt CARLA route trials in no-render mode.",
             "Trial 1 evaluates the context-aware sensor/model baseline.",
+            "Default algorithm preserves the current adaptive/random search.",
         ]
 
     def _handle_closed_loop_auto_tune_modal_event(self, event: pygame.event.Event, client: object) -> object:
@@ -1924,6 +1933,15 @@ class StartupMapSelector:
             self._closed_loop_auto_tune_joint_trials = min(500, int(self._closed_loop_auto_tune_joint_trials) + 1)
             self._sync_closed_loop_auto_tune_trial_total()
             return _NoSelection
+        for strategy, rect in self._closed_loop_auto_tune_algorithm_rects.items():
+            if rect.collidepoint(position):
+                self._closed_loop_auto_tune_strategy = strategy
+                label = next(
+                    (item_label for item_strategy, item_label in CLOSED_LOOP_TUNE_ALGORITHMS if item_strategy == strategy),
+                    strategy,
+                )
+                self._append_closed_loop_auto_tune_status(f"Tune algorithm selected: {label}.")
+                return _NoSelection
         for index, rect in self._closed_loop_auto_tune_route_rects.items():
             if rect.collidepoint(position):
                 self._closed_loop_auto_tune_validation_route_index = index
@@ -2022,7 +2040,11 @@ class StartupMapSelector:
             active_control_trials=stage_budgets.active_control_trials,
             joint_fine_tune_trials=stage_budgets.joint_fine_tune_trials,
             finalist_count=1,
-            strategy="optuna_tpe",
+            strategy=getattr(
+                self,
+                "_closed_loop_auto_tune_strategy",
+                "random_plus_coordinate_refinement",
+            ),
             output_root="benchmark_results",
             created_at=datetime.now().isoformat(timespec="seconds"),
             base_tune=self._current_filter_tune_values(record.filter_id),
@@ -2055,7 +2077,11 @@ class StartupMapSelector:
             active_control_trials=stage_budgets.active_control_trials,
             joint_fine_tune_trials=stage_budgets.joint_fine_tune_trials,
             finalist_count=1,
-            strategy="optuna_tpe",
+            strategy=getattr(
+                self,
+                "_closed_loop_auto_tune_strategy",
+                "random_plus_coordinate_refinement",
+            ),
             output_root="benchmark_results",
             metadata={
                 "startup_mode": "closed_loop_auto_tune",
@@ -2174,7 +2200,7 @@ class StartupMapSelector:
             self._draw_text(f"{display_map_name(item.route.map_name)} | {length}", (row.left + 8, row.top + 29), self._small_font, DASHBOARD.muted_text_color, row.width - 16)
 
     def _draw_closed_loop_auto_tune_settings_and_console(self, rect: pygame.Rect) -> None:
-        settings_h = min(330, max(286, rect.height - 118))
+        settings_h = min(370, max(330, rect.height - 118))
         settings = pygame.Rect(rect.left, rect.top, rect.width, settings_h)
         console = pygame.Rect(rect.left, settings.bottom + 10, rect.width, rect.bottom - settings.bottom - 10)
         pygame.draw.rect(self._surface, DASHBOARD.panel_inner_color, settings, border_radius=6)
@@ -2186,6 +2212,22 @@ class StartupMapSelector:
         y = content.top + 34
         label_w = max(260, content.width - 150)
         button_x = content.right - 70
+
+        self._draw_text("Tune algorithm", (content.left, y), self._small_font, DASHBOARD.text_color, content.width)
+        y += 22
+        self._closed_loop_auto_tune_algorithm_rects.clear()
+        algorithm_gap = 8
+        algorithm_width = max(150, (content.width - algorithm_gap) // len(CLOSED_LOOP_TUNE_ALGORITHMS))
+        for index, (strategy, label) in enumerate(CLOSED_LOOP_TUNE_ALGORITHMS):
+            button = pygame.Rect(
+                content.left + index * (algorithm_width + algorithm_gap),
+                y - 3,
+                algorithm_width,
+                27,
+            )
+            self._closed_loop_auto_tune_algorithm_rects[strategy] = button
+            self._draw_button(button, label, muted=strategy != self._closed_loop_auto_tune_strategy)
+        y += 39
 
         def draw_stage_row(
             label: str,

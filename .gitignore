@@ -59,6 +59,8 @@ CARLA_0.9.16/
 
 carla_waypoint_project/benchmark_results/
 carla_waypoint_project/logs/filter_tests/
+carla_waypoint_project/benchmark_results_optuna_validation
+carla_waypoint_project/benchmark_results_validation_smoke
 carla_waypoint_project/config/runtime_state.json
 
 todo

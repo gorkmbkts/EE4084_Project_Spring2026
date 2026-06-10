@@ -263,10 +263,27 @@ The repository includes two related tuning workflows:
 | Workflow | Backend | Input | Output |
 | --- | --- | --- | --- |
 | **Offline auto-tune** | `FilterAutoTuner` | Recorded GNSS/IMU logs | Candidate leaderboard, verification results, saved tune config |
-| **Closed-loop auto-tune** | `ClosedLoopBenchmarkAutoTuner` | Offline logs + validation route | Closed-loop route trial scores and validated tune config |
+| **Closed-loop auto-tune** | `ClosedLoopBenchmarkAutoTuner` | Current sensor/behavior/actuator settings + one validation route | Closed-loop route trial scores and validated tune config |
 
 The offline tuner can use Optuna TPE when `optuna` is installed. If Optuna is
 not available, the code falls back to a random/coordinate-refinement strategy.
+
+The closed-loop mini window has a **Tune algorithm** selector. Its default,
+**Current adaptive/random search**, preserves the existing staged family-local
+search. The optional **Optuna TPE / Bayesian search** uses per-stage Optuna
+studies, selects one parameter family per trial, and reports the completed
+CARLA route objective to the optimizer. Both paths use the filter's existing
+auto-tune profile bounds and keep per-trial plot generation disabled.
+
+For non-interactive validation against an already running CARLA server:
+
+```powershell
+$env:SDL_VIDEODRIVER = "dummy"
+$env:SDL_AUDIODRIVER = "dummy"
+python -m src.evaluation.closed_loop_autotune_cli `
+  --tracking active --noise "High Noise" --actuator "Realistic" `
+  --route mahalle --strategy optuna_tpe
+```
 
 <table>
   <tr>

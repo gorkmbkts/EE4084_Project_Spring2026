@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from config.settings import BENCHMARK  # noqa: E402
 from src.evaluation import filter_auto_tuner as filter_auto_tuner_module  # noqa: E402
 from src.evaluation.closed_loop_auto_tune import (  # noqa: E402
     ClosedLoopAutoTuneRequest,
@@ -340,6 +341,7 @@ def test_active_ctra_search_runs_explicit_control_ablations(tmp_path: Path) -> N
         sensor,
         tracking_mode=TRACKING_ACTIVE,
         filter_id="ctra_ukf",
+        strategy="random_plus_coordinate_refinement",
     )
     request = _with_stage_budgets(base_request, passive=1, active=4, joint=0)
 
@@ -425,7 +427,13 @@ def test_disabled_active_winner_stays_disabled_in_joint_phase(tmp_path: Path) ->
         }
     )
     request = _with_stage_budgets(
-        _request(tmp_path, (log_path,), sensor, tracking_mode=TRACKING_ACTIVE),
+        _request(
+            tmp_path,
+            (log_path,),
+            sensor,
+            tracking_mode=TRACKING_ACTIVE,
+            strategy="random_plus_coordinate_refinement",
+        ),
         passive=1,
         active=2,
         joint=1,
@@ -661,6 +669,17 @@ def test_closed_loop_validation_route_runner_uses_compact_route_artifact_folders
         raise AssertionError(f"regular benchmark route folder naming changed unexpectedly: {regular_folder}")
 
 
+def test_direct_closed_loop_route_runner_disables_automatic_plots() -> None:
+    runner = RouteTestRunner.__new__(RouteTestRunner)
+    runner._config = SimpleNamespace(metadata={"direct_closed_loop_mode": True})
+    if runner._automatic_plot_generation_enabled():
+        raise AssertionError("direct closed-loop trials re-enabled automatic route or aggregate plots")
+
+    runner._config = SimpleNamespace(metadata={})
+    if runner._automatic_plot_generation_enabled() != bool(BENCHMARK.generate_plots_on_completion):
+        raise AssertionError("normal benchmark automatic plot policy changed")
+
+
 def test_route_runner_one_attempt_policy_fails_without_retrying_candidate() -> None:
     if _configured_route_attempt_limit(SimpleNamespace(metadata={"max_route_attempts": 1})) != 1:
         raise AssertionError("direct benchmark metadata did not configure one route attempt")
@@ -766,6 +785,62 @@ def test_closed_loop_autotuner_records_fallback_when_optuna_unavailable(tmp_path
         raise AssertionError("closed-loop backend did not record fallback strategy when Optuna was unavailable")
     if config.get("optuna_available") is not False:
         raise AssertionError("closed-loop backend did not record Optuna availability")
+
+
+def test_closed_loop_request_defaults_to_legacy_adaptive_random_strategy() -> None:
+    if ClosedLoopAutoTuneRequest.__dataclass_fields__["strategy"].default != "random_plus_coordinate_refinement":
+        raise AssertionError("closed-loop request default no longer preserves the legacy adaptive/random strategy")
+
+
+def test_optuna_tpe_uses_real_closed_loop_scores_and_changes_candidates(tmp_path: Path) -> None:
+    sensor = {"preset_name": "Synthetic", "gnss_position_stddev_m": 1.25, "imu_accel_stddev_mps2": 0.45}
+    optuna_runner = _FakeValidationRunner(
+        {
+            1: {"route_completion_success": True, "eval_filtered_rmse_m": 3.0},
+            2: {"route_completion_success": True, "eval_filtered_rmse_m": 2.0},
+            3: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0},
+        }
+    )
+    legacy_runner = _FakeValidationRunner(
+        {
+            1: {"route_completion_success": True, "eval_filtered_rmse_m": 3.0},
+            2: {"route_completion_success": True, "eval_filtered_rmse_m": 2.0},
+            3: {"route_completion_success": True, "eval_filtered_rmse_m": 1.0},
+        }
+    )
+    optuna_request = _with_stage_budgets(
+        _request(tmp_path / "optuna", (), sensor, strategy="optuna_tpe"),
+        passive=3,
+        active=0,
+        joint=0,
+    )
+    legacy_request = _with_stage_budgets(
+        _request(tmp_path / "legacy", (), sensor, strategy="random_plus_coordinate_refinement"),
+        passive=3,
+        active=0,
+        joint=0,
+    )
+
+    optuna_result = ClosedLoopBenchmarkAutoTuner(validation_runner=optuna_runner).run(optuna_request)
+    ClosedLoopBenchmarkAutoTuner(validation_runner=legacy_runner).run(legacy_request)
+
+    if optuna_runner.requests[1].finalist.candidate_tune == legacy_runner.requests[1].finalist.candidate_tune:
+        raise AssertionError("Optuna selection did not change closed-loop candidate generation")
+    config = json.loads(optuna_result.saved_config_path.read_text(encoding="utf-8"))
+    if config.get("candidate_generation_strategy") != "direct_closed_loop_optuna_tpe":
+        raise AssertionError("Optuna strategy was not recorded in the saved tune config")
+    optimizer_summaries = config.get("optimizer_stage_summaries") or []
+    if not optimizer_summaries:
+        raise AssertionError("Optuna stage diagnostics were not saved")
+    reported_values = [
+        float(trial["value"])
+        for summary in optimizer_summaries
+        for trial in summary.get("trials", [])
+        if trial.get("value") is not None
+    ]
+    actual_scores = [float(item.closed_loop_score) for item in optuna_result.validation_results]
+    if not set(actual_scores).issubset(set(reported_values)):
+        raise AssertionError(f"Optuna did not receive real completed closed-loop scores: {reported_values}")
 
 
 def test_closed_loop_objective_penalizes_failure_and_timeout() -> None:

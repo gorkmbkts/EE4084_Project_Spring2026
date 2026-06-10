@@ -1506,6 +1506,19 @@ def test_closed_loop_auto_tune_builder_includes_explicit_session_fields(tmp_path
         raise AssertionError("closed-loop autotune request did not include explicit pending-session handoff metadata")
     if pending.get("offline_log_paths") != ():
         raise AssertionError("direct pending-session metadata did not preserve an empty optional log list")
+    if request.strategy != "random_plus_coordinate_refinement" or pending.get("strategy") != request.strategy:
+        raise AssertionError("closed-loop modal did not preserve the default adaptive/random algorithm")
+
+
+def test_closed_loop_auto_tune_builder_propagates_optuna_strategy(tmp_path: Path) -> None:
+    selector = _closed_loop_autotune_selector(tmp_path)
+    selector._closed_loop_auto_tune_strategy = "optuna_tpe"
+    request = selector._build_closed_loop_auto_tune_request_from_modal()
+    pending = request.metadata.get("pending_session")
+    if request.strategy != "optuna_tpe":
+        raise AssertionError("closed-loop modal did not propagate the selected Optuna strategy")
+    if not isinstance(pending, dict) or pending.get("strategy") != "optuna_tpe":
+        raise AssertionError("pending closed-loop session did not preserve the selected Optuna strategy")
 
 
 def test_closed_loop_auto_tune_builder_uses_current_gui_sensor_noise(tmp_path: Path) -> None:
@@ -1758,6 +1771,7 @@ def _closed_loop_autotune_selector(tmp_path: Path, include_mixed_noise: bool = F
     selector._behavior_preset = "Balanced"
     selector._closed_loop_auto_tune_trials = 12
     selector._closed_loop_auto_tune_finalists = 1
+    selector._closed_loop_auto_tune_strategy = "random_plus_coordinate_refinement"
     selector._closed_loop_auto_tune_status_lines = []
     selector._recommendation_applied_by_filter = {}
     selector._selected_route_indices = set()

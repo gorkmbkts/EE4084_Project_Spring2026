@@ -571,7 +571,7 @@ class RouteTestRunner:
             self._route_summaries.append(summary)
 
         plot_status = ""
-        if record_result and BENCHMARK.generate_plots_on_completion:
+        if record_result and self._automatic_plot_generation_enabled():
             if self._enqueue_route_plots_callback is not None:
                 try:
                     queued = self._enqueue_route_plots_callback(route_folder)
@@ -625,18 +625,19 @@ class RouteTestRunner:
         _write_json(self._run_folder / "aggregate_summary.json", aggregate)
         self._write_aggregate_csv(self._run_folder / "aggregate_summary.csv")
         plot_status = ""
-        if self._enqueue_aggregate_plots_callback is not None:
-            try:
-                queued = self._enqueue_aggregate_plots_callback(self._run_folder)
-                plot_status = ": aggregate plots queued" if queued else ": aggregate plot queue unavailable"
-            except Exception as exc:  # pragma: no cover - callback defensive guard.
-                aggregate["plot_error"] = str(exc)
+        if self._automatic_plot_generation_enabled():
+            if self._enqueue_aggregate_plots_callback is not None:
+                try:
+                    queued = self._enqueue_aggregate_plots_callback(self._run_folder)
+                    plot_status = ": aggregate plots queued" if queued else ": aggregate plot queue unavailable"
+                except Exception as exc:  # pragma: no cover - callback defensive guard.
+                    aggregate["plot_error"] = str(exc)
+                    _write_json(self._run_folder / "aggregate_summary.json", aggregate)
+                    plot_status = f": aggregate plot queue failed ({exc})"
+            else:
+                aggregate["plot_error"] = "Plot worker unavailable"
                 _write_json(self._run_folder / "aggregate_summary.json", aggregate)
-                plot_status = f": aggregate plot queue failed ({exc})"
-        else:
-            aggregate["plot_error"] = "Plot worker unavailable"
-            _write_json(self._run_folder / "aggregate_summary.json", aggregate)
-            plot_status = ": aggregate plot worker unavailable"
+                plot_status = ": aggregate plot worker unavailable"
 
         self._active = False
         self._route_running = False
@@ -919,6 +920,11 @@ class RouteTestRunner:
         config = self._config
         metadata = config.metadata if config is not None and isinstance(config.metadata, dict) else {}
         return bool(metadata.get("compact_route_output"))
+
+    def _automatic_plot_generation_enabled(self) -> bool:
+        config = self._config
+        metadata = config.metadata if config is not None and isinstance(config.metadata, dict) else {}
+        return bool(BENCHMARK.generate_plots_on_completion and not metadata.get("direct_closed_loop_mode"))
 
     def _route_output_folder(self, route: SavedTestRoute, route_index: int) -> Path:
         if self._compact_route_output_enabled():

@@ -46,6 +46,7 @@ from src.evaluation.benchmark_config import (
 )
 from src.evaluation.closed_loop_auto_tune import (
     ClosedLoopAutoTuneRequest,
+    ClosedLoopAutoTuneResult,
     ClosedLoopBenchmarkAutoTuner,
     ClosedLoopValidationRequest,
     closed_loop_stage_budgets,
@@ -228,6 +229,7 @@ class SimulationApp:
         self._benchmark_start_attempted = False
         self._offline_recording_start_attempted = False
         self._closed_loop_auto_tune_start_attempted = False
+        self._closed_loop_auto_tune_result: Optional[ClosedLoopAutoTuneResult] = None
         self._closed_loop_auto_tune_cancel_requested = False
         self._closed_loop_auto_tune_status_lines: list[str] = []
         self._closed_loop_auto_tune_live_line = ""
@@ -663,6 +665,7 @@ class SimulationApp:
             self._mark_closed_loop_auto_tune_progress_dirty()
             self._draw_closed_loop_auto_tune_progress_frame(force=True)
             return
+        self._closed_loop_auto_tune_result = result
         self._restore_closed_loop_auto_tune_rendering()
         if self._filter_manager is not None and result.best_tune:
             self._filter_manager.update_filter_tune(result.filter_id, result.best_tune, reset_active=True)

@@ -272,7 +272,7 @@ class ClosedLoopAutoTuneRequest:
     active_control_trials: Optional[int] = None
     joint_fine_tune_trials: Optional[int] = None
     finalist_count: int = 3
-    strategy: str = "optuna_tpe"
+    strategy: str = "random_plus_coordinate_refinement"
     output_root: str = "benchmark_results"
     random_seed: int = 4084
     allow_mixed_noise_logs: bool = False
@@ -555,6 +555,7 @@ class ClosedLoopBenchmarkAutoTuner:
         seen_candidates: set[str] = set()
         stage_summaries: list[dict[str, object]] = []
         adaptive_stage_states: list[AdaptiveStageState] = []
+        optimizer_stage_summaries: list[dict[str, object]] = []
         best_score_so_far: Optional[float] = None
         global_trial_index = 0
 
@@ -598,32 +599,61 @@ class ClosedLoopBenchmarkAutoTuner:
                 protected_result=protected_result,
             )
             adaptive_stage_states.append(adaptive_state)
+            optuna_study = _create_direct_optuna_study(
+                strategy,
+                request,
+                params,
+                stage_baseline,
+                enqueue_baseline=False,
+            )
+            if optuna_study is not None and protected_result is not None:
+                _seed_direct_optuna_study(
+                    optuna_study,
+                    params,
+                    protected_result.candidate_tune,
+                    protected_result.closed_loop_score,
+                )
             for stage_trial_index in range(1, stage_trial_count + 1):
                 if stop_requested is not None and stop_requested():
                     break
                 global_trial_index += 1
                 baseline_trial = evaluate_baseline_first and stage_trial_index == 1
-                plan = _adaptive_candidate_plan(
-                    adaptive_state,
-                    rng,
-                    baseline_trial=baseline_trial,
-                    failure_counts=failure_counts,
-                )
+                optuna_trial = None
+                if optuna_study is not None and not baseline_trial:
+                    optuna_trial = optuna_study.ask()
+                    plan = _direct_optuna_candidate_plan(
+                        state=adaptive_state,
+                        params=params,
+                        optuna_trial=optuna_trial,
+                    )
+                else:
+                    plan = _adaptive_candidate_plan(
+                        adaptive_state,
+                        rng,
+                        baseline_trial=baseline_trial,
+                        failure_counts=failure_counts,
+                    )
                 if baseline_trial:
                     plan = replace(plan, candidate_rationale=baseline_rationale)
-                candidate_tune = _ensure_unique_candidate(
-                    plan.tune,
-                    plan.anchor_tune,
-                    [
-                        param
-                        for param in params
-                        if adaptive_state.family_by_key.get(str(param.get("key") or "")) in plan.affected_families
-                    ],
-                    stage_tracking_mode,
-                    seen_candidates,
-                    rng,
-                    allow_existing=baseline_trial,
+                candidate_tune = (
+                    dict(plan.tune)
+                    if optuna_trial is not None
+                    else _ensure_unique_candidate(
+                        plan.tune,
+                        plan.anchor_tune,
+                        [
+                            param
+                            for param in params
+                            if adaptive_state.family_by_key.get(str(param.get("key") or "")) in plan.affected_families
+                        ],
+                        stage_tracking_mode,
+                        seen_candidates,
+                        rng,
+                        allow_existing=baseline_trial,
+                    )
                 )
+                if optuna_trial is not None:
+                    seen_candidates.add(_candidate_signature(candidate_tune, stage_tracking_mode))
                 if candidate_tune is not plan.tune:
                     plan = replace(plan, tune=candidate_tune)
                 changed_parameters = _changed_parameters(plan.anchor_tune, candidate_tune, adaptive_state.family_by_key)
@@ -633,6 +663,8 @@ class ClosedLoopBenchmarkAutoTuner:
                     if stage == CONTEXT_BASELINE_STAGE
                     else baseline_candidate_type
                     if baseline_trial
+                    else "optuna_tpe"
+                    if optuna_trial is not None
                     else "adaptive_family_local"
                 )
                 finalist = ClosedLoopFinalist(
@@ -692,6 +724,16 @@ class ClosedLoopBenchmarkAutoTuner:
                 )
                 runner_result = self._run_validation(validation_request)
                 validation = _validation_result_from_runner(runner_result, validation_request)
+                if optuna_study is not None:
+                    if optuna_trial is not None:
+                        optuna_study.tell(optuna_trial, float(validation.closed_loop_score))
+                    elif baseline_trial:
+                        _seed_direct_optuna_study(
+                            optuna_study,
+                            params,
+                            candidate_tune,
+                            validation.closed_loop_score,
+                        )
                 outcome_class = _trial_outcome_class(validation, adaptive_state.best_score)
                 adaptation_decisions = _update_adaptive_stage_state(
                     adaptive_state,
@@ -721,6 +763,19 @@ class ClosedLoopBenchmarkAutoTuner:
                         "outcome_class": outcome_class,
                         "parameter_attribution": [dict(item) for item in parameter_attribution],
                         "candidate_type": candidate_type,
+                        "optimizer": (
+                            {
+                                "name": "optuna_tpe",
+                                "trial_number": getattr(optuna_trial, "number", None),
+                                "reported_score": float(validation.closed_loop_score),
+                            }
+                            if optuna_study is not None
+                            else {
+                                "name": "adaptive_random",
+                                "trial_number": None,
+                                "reported_score": None,
+                            }
+                        ),
                     }
                 )
                 validation = replace(
@@ -810,6 +865,8 @@ class ClosedLoopBenchmarkAutoTuner:
                         "adaptive_state": adaptive_state.to_dict(),
                     }
                 )
+            if optuna_study is not None:
+                optimizer_stage_summaries.append(_direct_optuna_study_summary(stage, optuna_study))
             return stage_results
 
         context_results = run_stage(
@@ -837,6 +894,7 @@ class ClosedLoopBenchmarkAutoTuner:
 
         active_results: list[ClosedLoopValidationResult] = []
         best_active: Optional[ClosedLoopValidationResult] = None
+        active_baseline_validation: Optional[ClosedLoopValidationResult] = None
         if request.tracking_mode == TRACKING_ACTIVE and best_passive is not None:
             active_baseline = _active_control_baseline(
                 best_passive.candidate_tune,
@@ -844,6 +902,11 @@ class ClosedLoopBenchmarkAutoTuner:
                 tuple(record.tune_specs),
             )
             ablations = _active_control_ablation_tunes(active_baseline)
+            if strategy == "direct_closed_loop_optuna_tpe":
+                ablations = sorted(
+                    ablations,
+                    key=lambda item: (item[0] != "default_combined", item[0]),
+                )
             ablation_budget = min(stage_budgets.active_control_trials, len(ablations))
             enabled_ablation_results: list[ClosedLoopValidationResult] = []
             for name, ablation_tune, control_enabled in ablations[:ablation_budget]:
@@ -860,6 +923,8 @@ class ClosedLoopBenchmarkAutoTuner:
                     baseline_rationale=f"active-control ablation: {name}",
                 )
                 active_results.extend(ablation_results)
+                if name == "default_combined" and ablation_results:
+                    active_baseline_validation = ablation_results[0]
                 if control_enabled:
                     enabled_ablation_results.extend(ablation_results)
 
@@ -929,7 +994,13 @@ class ClosedLoopBenchmarkAutoTuner:
         best_metrics = dict(best_validation.raw_metrics)
         best_metrics["closed_loop_score"] = best_score
         selection_baseline = (
-            best_passive
+            active_baseline_validation
+            if (
+                strategy == "direct_closed_loop_optuna_tpe"
+                and request.tracking_mode == TRACKING_ACTIVE
+                and active_baseline_validation is not None
+            )
+            else best_passive
             if request.tracking_mode == TRACKING_ACTIVE and best_passive is not None
             else context_results[0] if context_results else None
         )
@@ -1010,6 +1081,7 @@ class ClosedLoopBenchmarkAutoTuner:
                 best_active=best_active,
                 final_validation=best_validation,
                 adaptive_stage_states=adaptive_stage_states,
+                optimizer_stage_summaries=optimizer_stage_summaries,
                 baseline_validation=selection_baseline,
                 final_phase_candidate_count=len(final_candidates),
             ),
@@ -2441,6 +2513,7 @@ def _closed_loop_extra_metadata(
     best_active: Optional[ClosedLoopValidationResult],
     final_validation: ClosedLoopValidationResult,
     adaptive_stage_states: list[AdaptiveStageState],
+    optimizer_stage_summaries: list[dict[str, object]],
     baseline_validation: Optional[ClosedLoopValidationResult],
     final_phase_candidate_count: int,
 ) -> dict[str, object]:
@@ -2508,6 +2581,12 @@ def _closed_loop_extra_metadata(
         "worst_changed_parameter_families": family_diagnostics["worst_families"],
         "bound_adaptation_history": adaptation_history,
         "adaptive_stage_diagnostics": [state.to_dict() for state in adaptive_stage_states],
+        "optimizer_stage_summaries": list(optimizer_stage_summaries),
+        "optimizer_score_reporting": (
+            "Each Optuna trial is told the completed closed-loop CARLA objective score."
+            if optimizer_stage_summaries
+            else "Not applicable to the legacy adaptive/random strategy."
+        ),
         "adaptive_search_policy": {
             "candidate_scope": "one parameter family or a small same-family group per trial",
             "anchor_policy": "all perturbations are anchored to the current protected best tune",
@@ -2685,7 +2764,10 @@ def _create_direct_optuna_study(
         return None
     study = optuna_module.create_study(  # type: ignore[union-attr]
         direction="minimize",
-        sampler=optuna_module.samplers.TPESampler(seed=int(request.random_seed)),  # type: ignore[union-attr]
+        sampler=optuna_module.samplers.TPESampler(  # type: ignore[union-attr]
+            seed=int(request.random_seed),
+            n_startup_trials=2,
+        ),
     )
     if enqueue_baseline:
         study.enqueue_trial(
@@ -2696,6 +2778,42 @@ def _create_direct_optuna_study(
             }
         )
     return study
+
+
+def _seed_direct_optuna_study(
+    study: object,
+    params: list[dict[str, object]],
+    tune: dict[str, object],
+    score: float,
+) -> None:
+    if not params or not math.isfinite(float(score)):
+        return
+    optuna_module = offline_auto_tuner_module.optuna
+    if optuna_module is None:
+        return
+    study.add_trial(
+        optuna_module.trial.create_trial(  # type: ignore[union-attr]
+            value=float(score),
+        )
+    )
+
+
+def _direct_optuna_study_summary(stage: str, study: object) -> dict[str, object]:
+    trials = list(getattr(study, "trials", ()) or ())
+    return {
+        "stage": stage,
+        "optimizer": "optuna_tpe",
+        "completed_trial_count": len(trials),
+        "trials": [
+            {
+                "number": getattr(trial, "number", None),
+                "state": str(getattr(getattr(trial, "state", None), "name", getattr(trial, "state", ""))),
+                "value": getattr(trial, "value", None),
+                "params": dict(getattr(trial, "params", {}) or {}),
+            }
+            for trial in trials
+        ],
+    }
 
 
 def _direct_candidate_tune(
@@ -2727,6 +2845,47 @@ def _direct_candidate_tune(
         if key:
             candidate[key] = _sample_param(rng, param, base_tune.get(key))
     return candidate
+
+
+def _direct_optuna_candidate_plan(
+    *,
+    state: AdaptiveStageState,
+    params: list[dict[str, object]],
+    optuna_trial: object,
+) -> AdaptiveCandidatePlan:
+    family_params: dict[str, list[dict[str, object]]] = {}
+    for param in params:
+        key = str(param.get("key") or "")
+        family = state.family_by_key.get(key)
+        if key and family:
+            family_params.setdefault(family, []).append(param)
+    if not family_params:
+        return AdaptiveCandidatePlan(
+            tune=dict(state.best_tune),
+            anchor_tune=dict(state.best_tune),
+            affected_families=(),
+            candidate_rationale="Optuna TPE found no supported parameter families",
+        )
+
+    families = sorted(family_params)
+    family = str(getattr(optuna_trial, "suggest_categorical")("parameter_family", families))
+    anchor = dict(state.best_tune)
+    candidate = dict(anchor)
+    suggest_float = getattr(optuna_trial, "suggest_float")
+    for param in family_params[family]:
+        key = str(param.get("key") or "")
+        low, high = _param_bounds(param, anchor.get(key))
+        log = str(param.get("scale") or "").lower() == "log" and low > 0.0 and high > low
+        candidate[key] = suggest_float(key, low, high, log=log)
+    return AdaptiveCandidatePlan(
+        tune=candidate,
+        anchor_tune=anchor,
+        affected_families=(family,),
+        candidate_rationale=(
+            f"Optuna TPE trial {getattr(optuna_trial, 'number', '?')} selected {family}; "
+            "all other families remain anchored to the protected best"
+        ),
+    )
 
 
 def _param_bound_or_base_value(param: dict[str, object], base_tune: dict[str, object]) -> float:
