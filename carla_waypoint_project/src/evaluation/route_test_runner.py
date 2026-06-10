@@ -16,6 +16,12 @@ from typing import Optional
 from config.settings import BENCHMARK
 from src.evaluation.benchmark_config import BenchmarkConfig, benchmark_output_root, project_commit_hash
 from src.evaluation.benchmark_metadata import build_benchmark_metadata
+from src.evaluation.closed_loop_metrics import (
+    CLOSED_LOOP_UTILITY_SCORE_FORMULA,
+    CLOSED_LOOP_UTILITY_SCORE_NOTES,
+    UTILITY_COMPONENT_FIELDS,
+    compute_closed_loop_utility_metrics,
+)
 from src.evaluation.filter_performance import FilterPerformanceLogger
 from src.evaluation.test_route_store import SavedTestRoute, TestRouteStore
 from src.utils.carla_import import ensure_carla_import
@@ -490,6 +496,13 @@ class RouteTestRunner:
         )
         metadata["attempt"] = attempt
         metadata["max_attempts"] = self._max_route_attempts
+        if self._config is not None:
+            run_metadata = dict(self._config.metadata or {})
+            metadata["benchmark_metadata"] = run_metadata
+            metadata["sensor_noise_profile"] = self._config.sensor_noise_preset
+            metadata["actuator_realism_profile"] = self._config.actuator_realism_preset
+            metadata["tune_algorithm"] = _tune_algorithm(run_metadata)
+            metadata["tune_config_path"] = _tune_config_path(run_metadata)
         _write_json(attempt_folder / "metadata.json", metadata)
         if self._automated:
             _write_json(route_folder / "metadata.json", metadata)
@@ -624,6 +637,7 @@ class RouteTestRunner:
         aggregate = self._build_aggregate_summary()
         _write_json(self._run_folder / "aggregate_summary.json", aggregate)
         self._write_aggregate_csv(self._run_folder / "aggregate_summary.csv")
+        self._write_paper_metrics_csv(self._run_folder / "paper_metrics.csv")
         plot_status = ""
         if self._automatic_plot_generation_enabled():
             if self._enqueue_aggregate_plots_callback is not None:
@@ -651,6 +665,10 @@ class RouteTestRunner:
         primary_rows = [_primary_metric_row(summary) for summary in self._route_summaries]
         filtered_values = _finite_row_values(primary_rows, "filtered_rmse_m")
         raw_values = _finite_row_values(primary_rows, "raw_gnss_rmse_m")
+        utility_means = {
+            f"mean_{field}": _mean(_finite_summary_values(self._route_summaries, field))
+            for field in UTILITY_COMPONENT_FIELDS
+        }
         return {
             "run_id": self._config.run_id if self._config is not None else self._benchmark_id,
             "created_at": self._config.created_at if self._config is not None else None,
@@ -681,6 +699,15 @@ class RouteTestRunner:
             "mean_position_nees_diagonal_approx": _mean(_finite_row_values(primary_rows, "mean_position_nees_diagonal_approx")),
             "position_nees_source": _aggregate_position_nees_source(primary_rows),
             "legacy_mean_nis_mixed": _mean(_finite_row_values(primary_rows, "legacy_mean_nis_mixed")),
+            "closed_loop_utility_score": utility_means["mean_closed_loop_utility_score"],
+            **utility_means,
+            "paper_ready_score_available": bool(self._route_summaries)
+            and all(bool(summary.get("paper_ready_score_available")) for summary in self._route_summaries),
+            "paper_ready_route_count": sum(
+                1 for summary in self._route_summaries if summary.get("paper_ready_score_available")
+            ),
+            "closed_loop_utility_score_formula": CLOSED_LOOP_UTILITY_SCORE_FORMULA,
+            "closed_loop_utility_score_notes": CLOSED_LOOP_UTILITY_SCORE_NOTES,
             "route_summaries": self._route_summaries,
             "segment_rmse_summary": self._aggregate_segment_metrics(),
         }
@@ -737,6 +764,17 @@ class RouteTestRunner:
             "overall_mean_position_nees_diagonal_approx",
             "overall_position_nees_source",
             "completion_time_s",
+            "raw_gnss_position_rmse_m",
+            "filtered_position_rmse_m",
+            *UTILITY_COMPONENT_FIELDS,
+            "paper_ready_score_available",
+            "consistency_status",
+            "consistency_penalty_source",
+            "divergence_penalty_source",
+            "difficulty_factor_source",
+            "route_timeout_s",
+            "route_timeout_source",
+            "time_norm_source",
             "route_folder",
             "error",
         ]
@@ -797,8 +835,111 @@ class RouteTestRunner:
                         "overall_mean_position_nees_diagonal_approx": metrics.get("overall_mean_position_nees_diagonal_approx"),
                         "overall_position_nees_source": metrics.get("overall_position_nees_source"),
                         "completion_time_s": summary.get("completion_time_s"),
+                        "raw_gnss_position_rmse_m": summary.get("raw_gnss_position_rmse_m"),
+                        "filtered_position_rmse_m": summary.get("filtered_position_rmse_m"),
+                        **{field: summary.get(field) for field in UTILITY_COMPONENT_FIELDS},
+                        "paper_ready_score_available": summary.get("paper_ready_score_available"),
+                        "consistency_status": summary.get("consistency_status"),
+                        "consistency_penalty_source": summary.get("consistency_penalty_source"),
+                        "divergence_penalty_source": summary.get("divergence_penalty_source"),
+                        "difficulty_factor_source": _csv_value(summary.get("difficulty_factor_source")),
+                        "route_timeout_s": summary.get("route_timeout_s"),
+                        "route_timeout_source": summary.get("route_timeout_source"),
+                        "time_norm_source": summary.get("time_norm_source"),
                         "route_folder": summary.get("route_folder"),
                         "error": summary.get("error"),
+                    }
+                )
+
+    def _write_paper_metrics_csv(self, path: Path) -> None:
+        fieldnames = [
+            "run_id",
+            "route_id",
+            "filter_id",
+            "tracking_mode",
+            "tune_algorithm",
+            "tune_config_path",
+            "sensor_noise_profile",
+            "actuator_realism_profile",
+            "route_name",
+            "map_name",
+            "route_completed",
+            "attempts_used",
+            "completion_time_s",
+            "raw_gnss_position_rmse_m",
+            "filtered_position_rmse_m",
+            "localization_improvement_ratio",
+            "yaw_rmse_deg",
+            "mean_cross_track_error_m",
+            "p95_cross_track_error_m",
+            "divergence_event_count",
+            "consistency_penalty",
+            "difficulty_factor",
+            "route_completed_factor",
+            "attempt_factor",
+            "time_norm",
+            "cte_norm",
+            "p95_cte_norm",
+            "yaw_norm",
+            "divergence_penalty",
+            "closed_loop_completion_efficiency",
+            "route_tracking_quality_score",
+            "closed_loop_utility_score",
+            "paper_ready_score_available",
+        ]
+        with path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+            for summary in self._route_summaries:
+                metrics = _primary_metric_row(summary)
+                writer.writerow(
+                    {
+                        "run_id": summary.get("run_id"),
+                        "route_id": summary.get("benchmark_id") or summary.get("route_index"),
+                        "filter_id": summary.get("selected_filter") or summary.get("active_filter_id"),
+                        "tracking_mode": summary.get("tracking_mode"),
+                        "tune_algorithm": summary.get("tune_algorithm"),
+                        "tune_config_path": summary.get("tune_config_path"),
+                        "sensor_noise_profile": summary.get("sensor_noise_profile"),
+                        "actuator_realism_profile": summary.get("actuator_realism_profile"),
+                        "route_name": summary.get("route_name"),
+                        "map_name": summary.get("map_name") or summary.get("route_map_name"),
+                        "route_completed": summary.get("route_completion_success"),
+                        "attempts_used": summary.get("attempts_used"),
+                        "completion_time_s": summary.get("completion_time_s"),
+                        "raw_gnss_position_rmse_m": summary.get("raw_gnss_position_rmse_m"),
+                        "filtered_position_rmse_m": summary.get("filtered_position_rmse_m"),
+                        "localization_improvement_ratio": summary.get("localization_improvement_ratio"),
+                        "yaw_rmse_deg": metrics.get("yaw_rmse_deg"),
+                        "mean_cross_track_error_m": _prefer_driving_metric(
+                            summary,
+                            "driving_mean_cross_track_error_m",
+                            "mean_cross_track_error_m",
+                        ),
+                        "p95_cross_track_error_m": _prefer_driving_metric(
+                            summary,
+                            "driving_p95_cross_track_error_m",
+                            "p95_cross_track_error_m",
+                        ),
+                        "divergence_event_count": _first_present(
+                            summary,
+                            "eval_divergence_event_count",
+                            "driving_divergence_event_count",
+                            "divergence_event_count",
+                        ),
+                        "consistency_penalty": summary.get("consistency_penalty"),
+                        "difficulty_factor": summary.get("difficulty_factor"),
+                        "route_completed_factor": summary.get("route_completed_factor"),
+                        "attempt_factor": summary.get("attempt_factor"),
+                        "time_norm": summary.get("time_norm"),
+                        "cte_norm": summary.get("cte_norm"),
+                        "p95_cte_norm": summary.get("p95_cte_norm"),
+                        "yaw_norm": summary.get("yaw_norm"),
+                        "divergence_penalty": summary.get("divergence_penalty"),
+                        "closed_loop_completion_efficiency": summary.get("closed_loop_completion_efficiency"),
+                        "route_tracking_quality_score": summary.get("route_tracking_quality_score"),
+                        "closed_loop_utility_score": summary.get("closed_loop_utility_score"),
+                        "paper_ready_score_available": summary.get("paper_ready_score_available"),
                     }
                 )
 
@@ -894,9 +1035,14 @@ class RouteTestRunner:
                 "tracking_mode": config.tracking_mode if config is not None else self._tracking_mode_callback(),
                 "active_control_input_used_by_filter": self._active_control_used_callback(),
                 "sensor_noise_config": config.sensor_noise_config.to_dict() if config is not None else None,
+                "sensor_noise_profile": config.sensor_noise_preset if config is not None else None,
                 "vehicle_behavior_config": config.vehicle_behavior_config if config is not None else None,
                 "actuator_realism_config": config.actuator_realism_config if config is not None else None,
+                "actuator_realism_profile": config.actuator_realism_preset if config is not None else None,
                 "random_seed": config.random_seed if config is not None else None,
+                "route_timeout_s": float(BENCHMARK.max_pass_duration_s),
+                "tune_algorithm": _tune_algorithm(config.metadata if config is not None else {}),
+                "tune_config_path": _tune_config_path(config.metadata if config is not None else {}),
                 "route_folder": str(route_folder),
                 "final_status": final_status,
                 "successful_attempt": attempts_used if route_success else None,
@@ -909,6 +1055,14 @@ class RouteTestRunner:
         primary_metrics = _primary_metric_row(enriched)
         enriched["improvement_percent"] = primary_metrics.get("improvement_percent")
         enriched["primary_metric_source"] = primary_metrics.get("primary_metric_source")
+        enriched.update(
+            compute_closed_loop_utility_metrics(
+                enriched,
+                sensor_noise_profile=enriched.get("sensor_noise_profile"),
+                actuator_realism_profile=enriched.get("actuator_realism_profile"),
+                route_timeout_s=BENCHMARK.max_pass_duration_s,
+            )
+        )
         return enriched
 
     def _pending_route(self) -> Optional[SavedTestRoute]:
@@ -1099,6 +1253,43 @@ def _failure_reasons_text(value: object) -> str:
             if reason:
                 reasons.append(f"{attempt}: {reason}" if attempt is not None else str(reason))
     return " | ".join(reasons)
+
+
+def _tune_algorithm(metadata: object) -> str:
+    data = metadata if isinstance(metadata, dict) else {}
+    for key in (
+        "tune_algorithm",
+        "candidate_generation_strategy",
+        "strategy",
+        "search_strategy",
+    ):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _tune_config_path(metadata: object) -> str:
+    data = metadata if isinstance(metadata, dict) else {}
+    for key in ("tune_config_path", "saved_config_path", "selected_tune_config_path"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _csv_value(value: object) -> object:
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, sort_keys=True)
+    return value
+
+
+def _first_present(data: dict[str, object], *keys: str) -> object:
+    for key in keys:
+        value = data.get(key)
+        if value is not None:
+            return value
+    return None
 
 
 def _finite_summary_values(summaries: Sequence[dict[str, object]], key: str) -> list[float]:

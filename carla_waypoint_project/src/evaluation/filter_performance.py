@@ -353,6 +353,7 @@ class FilterPerformanceLogger:
             "eval_filtered_max_error_m": eval_metrics["filtered_max_error_m"],
             "eval_filtered_p95_error_m": eval_metrics["filtered_p95_error_m"],
             "eval_filtered_p99_error_m": eval_metrics["filtered_p99_error_m"],
+            "eval_divergence_event_count": eval_metrics["divergence_event_count"],
             "eval_raw_gnss_rmse_m": eval_raw_gnss_rmse,
             "eval_raw_gnss_mae_m": eval_metrics["raw_gnss_mae_m"],
             "eval_raw_gnss_max_error_m": eval_metrics["raw_gnss_max_error_m"],
@@ -377,6 +378,8 @@ class FilterPerformanceLogger:
             "yaw_rmse_deg": overall_metrics["yaw_rmse_deg"],
             "filtered_max_error_m": overall_metrics["filtered_max_error_m"],
             "filtered_p95_error_m": overall_metrics["filtered_p95_error_m"],
+            "divergence_event_count": overall_metrics["divergence_event_count"],
+            "divergence_error_threshold_m": float(BENCHMARK.divergence_error_threshold_m),
             "kalman_rmse_m": filtered_rmse,
             "kalman_mae_m": overall_metrics["filtered_mae_m"],
             "kalman_max_error_m": overall_metrics["filtered_max_error_m"],
@@ -425,6 +428,7 @@ class FilterPerformanceLogger:
             "driving_yaw_rmse_deg": driving_metrics["yaw_rmse_deg"],
             "driving_filtered_max_error_m": driving_metrics["filtered_max_error_m"],
             "driving_filtered_p95_error_m": driving_metrics["filtered_p95_error_m"],
+            "driving_divergence_event_count": driving_metrics["divergence_event_count"],
             "driving_kalman_rmse_m": eval_filtered_rmse,
             "driving_kalman_mae_m": driving_metrics["filtered_mae_m"],
             "driving_kalman_max_error_m": driving_metrics["filtered_max_error_m"],
@@ -678,6 +682,11 @@ class FilterPerformanceLogger:
             "filtered_median_error_m": cls._percentile(filtered_errors, 50.0),
             "filtered_p95_error_m": cls._percentile(filtered_errors, 95.0),
             "filtered_p99_error_m": cls._percentile(filtered_errors, 99.0),
+            "divergence_event_count": sum(
+                1
+                for error in filtered_errors
+                if error >= float(BENCHMARK.divergence_error_threshold_m)
+            ),
             "raw_gnss_rmse_m": cls._rmse(raw_gnss_errors),
             "raw_gnss_mae_m": cls._mean(raw_gnss_errors),
             "raw_gnss_max_error_m": max(raw_gnss_errors) if raw_gnss_errors else None,

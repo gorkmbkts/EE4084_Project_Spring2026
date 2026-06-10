@@ -20,6 +20,11 @@ from typing import Callable, Optional
 from src.KalmanLab.registry import discover_filters
 from src.evaluation import filter_auto_tuner as offline_auto_tuner_module
 from src.evaluation.consistency_metrics import consistency_report_from_summaries
+from src.evaluation.closed_loop_metrics import (
+    PAPER_METRIC_FIELDS,
+    UTILITY_COMPONENT_FIELDS,
+    compute_closed_loop_utility_metrics,
+)
 from src.evaluation.evaluation_artifacts import benchmark_root, read_json, slugify, unique_folder, write_json
 from src.evaluation.filter_auto_tuner import (
     AutoTuneRequest,
@@ -355,6 +360,7 @@ class ClosedLoopValidationRequest:
     vehicle_behavior_config: dict[str, object]
     actuator_realism_config: dict[str, object]
     output_folder: Path
+    tune_algorithm: str = ""
     stage: str = ""
     stage_trial_index: int = 0
     stage_trial_total: int = 0
@@ -396,7 +402,7 @@ class ClosedLoopValidationResult:
     parameter_attribution: tuple[dict[str, object], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "finalist_rank": self.finalist_rank,
             "candidate_tune": dict(self.candidate_tune),
             "route_completion_success": self.route_completion_success,
@@ -426,6 +432,14 @@ class ClosedLoopValidationResult:
             "outcome_class": self.outcome_class,
             "parameter_attribution": [dict(item) for item in self.parameter_attribution],
         }
+        payload.update(
+            {
+                field: self.raw_metrics.get(field)
+                for field in PAPER_METRIC_FIELDS
+                if field in self.raw_metrics
+            }
+        )
+        return payload
 
 
 @dataclass(frozen=True)
@@ -693,6 +707,7 @@ class ClosedLoopBenchmarkAutoTuner:
                     vehicle_behavior_config=dict(request.vehicle_behavior_config),
                     actuator_realism_config=dict(request.actuator_realism_config),
                     output_folder=run_folder / "trials" / f"t{global_trial_index:03d}",
+                    tune_algorithm=strategy,
                     stage=stage,
                     stage_trial_index=stage_trial_index,
                     stage_trial_total=stage_trial_count,
@@ -1341,6 +1356,14 @@ def _validation_result_from_runner(result: object, request: ClosedLoopValidation
                 if not key.startswith("_") and not callable(getattr(result, key))
             }
     output_folder = _path_or_none(raw.get("output_folder") or raw.get("route_folder") or request.output_folder)
+    raw.update(
+        compute_closed_loop_utility_metrics(
+            raw,
+            sensor_noise_profile=request.sensor_noise_config,
+            actuator_realism_profile=request.actuator_realism_config,
+        )
+    )
+    raw.setdefault("tune_algorithm", request.tune_algorithm)
     raw["failure_class"] = _classify_failure(raw)
     score = closed_loop_objective_score(raw)
     return ClosedLoopValidationResult(
@@ -3110,11 +3133,22 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
                 "completion_time_s",
                 "eval_filtered_rmse_m",
                 "filtered_rmse_m",
+                "raw_gnss_position_rmse_m",
+                "filtered_position_rmse_m",
                 "mean_cross_track_error_m",
                 "max_cross_track_error_m",
                 "position_nees_source",
                 "mean_position_nees",
                 "mean_position_nees_diagonal_approx",
+                *UTILITY_COMPONENT_FIELDS,
+                "paper_ready_score_available",
+                "consistency_status",
+                "consistency_penalty_source",
+                "divergence_penalty_source",
+                "difficulty_factor_source",
+                "route_timeout_s",
+                "route_timeout_source",
+                "time_norm_source",
                 "changed_parameters_summary",
                 "candidate_tune",
                 "changed_parameters",
@@ -3142,11 +3176,28 @@ def _write_validations_csv(path: Path, validations: list[ClosedLoopValidationRes
                     "completion_time_s": validation.completion_time_s,
                     "eval_filtered_rmse_m": validation.eval_filtered_rmse_m,
                     "filtered_rmse_m": validation.filtered_rmse_m,
+                    "raw_gnss_position_rmse_m": validation.raw_metrics.get("raw_gnss_position_rmse_m"),
+                    "filtered_position_rmse_m": validation.raw_metrics.get("filtered_position_rmse_m"),
                     "mean_cross_track_error_m": validation.mean_cross_track_error_m,
                     "max_cross_track_error_m": validation.max_cross_track_error_m,
                     "position_nees_source": validation.position_nees_source,
                     "mean_position_nees": validation.mean_position_nees,
                     "mean_position_nees_diagonal_approx": validation.mean_position_nees_diagonal_approx,
+                    **{
+                        field: validation.raw_metrics.get(field)
+                        for field in UTILITY_COMPONENT_FIELDS
+                    },
+                    "paper_ready_score_available": validation.raw_metrics.get("paper_ready_score_available"),
+                    "consistency_status": validation.raw_metrics.get("consistency_status"),
+                    "consistency_penalty_source": validation.raw_metrics.get("consistency_penalty_source"),
+                    "divergence_penalty_source": validation.raw_metrics.get("divergence_penalty_source"),
+                    "difficulty_factor_source": json.dumps(
+                        validation.raw_metrics.get("difficulty_factor_source") or {},
+                        sort_keys=True,
+                    ),
+                    "route_timeout_s": validation.raw_metrics.get("route_timeout_s"),
+                    "route_timeout_source": validation.raw_metrics.get("route_timeout_source"),
+                    "time_norm_source": validation.raw_metrics.get("time_norm_source"),
                     "changed_parameters_summary": validation.changed_parameters_summary,
                     "candidate_tune": json.dumps(validation.candidate_tune, sort_keys=True),
                     "changed_parameters": json.dumps(validation.changed_parameters, sort_keys=True),

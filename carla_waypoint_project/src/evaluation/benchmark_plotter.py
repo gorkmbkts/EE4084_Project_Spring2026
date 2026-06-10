@@ -14,6 +14,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config.settings import BENCHMARK
+from src.evaluation.closed_loop_metrics import compute_closed_loop_utility_metrics
 
 DRIVING_PHASES = ("driving", "completed")
 STABILIZATION_PHASES = ("stabilization",)
@@ -60,6 +61,12 @@ def generate_aggregate_benchmark_plots(run_folder: Path) -> list[Path]:
         _plot_aggregate_bar(plots_dir / "position_rmse_per_route.png", rows, "filtered_rmse_m", "Position RMSE (m)"),
         _plot_aggregate_raw_vs_filtered(plots_dir / "raw_gnss_rmse_vs_filtered_rmse.png", rows),
         _plot_aggregate_bar(plots_dir / "improvement_percentage_per_route.png", rows, "improvement_percent", "Improvement (%)"),
+        _plot_aggregate_bar(
+            plots_dir / "closed_loop_utility_score_per_route.png",
+            rows,
+            "closed_loop_utility_score",
+            "Closed-loop utility score",
+        ),
         _plot_aggregate_dual_metric(
             plots_dir / "mean_nees_nis_per_route.png",
             rows,
@@ -292,42 +299,255 @@ def _plot_summary_dashboard(
     summary: dict[str, object],
     samples: list[dict[str, object]],
 ) -> Path:
-    fig = plt.figure(figsize=(16, 10))
-    grid = fig.add_gridspec(3, 2, width_ratios=(2.2, 1.0), height_ratios=(1.25, 1.0, 1.0))
+    dashboard_summary = dict(summary)
+    if dashboard_summary.get("closed_loop_utility_score") is None:
+        metric_context = dict(dashboard_summary)
+        metric_context.setdefault("sensor_noise_profile", _sensor_noise_profile(metadata, dashboard_summary))
+        metric_context.setdefault("actuator_realism_profile", _actuator_profile(metadata, dashboard_summary))
+        dashboard_summary.update(compute_closed_loop_utility_metrics(metric_context))
+
+    fig = plt.figure(figsize=(18, 12))
+    grid = fig.add_gridspec(
+        3,
+        3,
+        width_ratios=(1.0, 1.0, 1.0),
+        height_ratios=(1.1, 1.0, 0.9),
+    )
     trajectory_ax = fig.add_subplot(grid[0, 0])
-    localization_ax = fig.add_subplot(grid[1, 0])
-    cross_track_ax = fig.add_subplot(grid[2, 0])
-    text_ax = fig.add_subplot(grid[:, 1])
+    rmse_ax = fig.add_subplot(grid[0, 1])
+    driving_ax = fig.add_subplot(grid[0, 2])
+    localization_ax = fig.add_subplot(grid[1, :])
+    tracking_ax = fig.add_subplot(grid[2, 0])
+    diagnostics_ax = fig.add_subplot(grid[2, 1])
+    context_ax = fig.add_subplot(grid[2, 2])
 
     trajectory_info = _filtered_samples_for_trajectory(metadata, samples)
     _draw_trajectory_panel(trajectory_ax, metadata, samples, trajectory_info=trajectory_info)
     _draw_localization_error_panel(localization_ax, samples)
+    _draw_rmse_summary_panel(rmse_ax, dashboard_summary)
+    _draw_driving_score_panel(driving_ax, dashboard_summary)
+    _draw_route_tracking_summary_panel(tracking_ax, dashboard_summary)
+    _draw_diagnostics_summary_panel(diagnostics_ax, dashboard_summary)
 
-    metric_samples = _samples_for_metric_plots(samples)
-    _plot_series(cross_track_ax, metric_samples, "cross_track_error_m", "Cross-track error")
-    title_suffix = " (Driving Phase)" if BENCHMARK.metrics_use_driving_phase_only else " (All Phases)"
-    cross_track_ax.set_title(f"Cross-Track Error{title_suffix}")
-    cross_track_ax.set_xlabel("Time since benchmark start (s)")
-    cross_track_ax.set_ylabel("m")
-    cross_track_ax.grid(True, alpha=0.3)
-    _warn_if_no_series(cross_track_ax, metric_samples, "cross_track_error_m", "No cross-track samples to plot")
-    _legend_if_labels(cross_track_ax, fontsize=8)
-
-    text_ax.axis("off")
-    text_ax.text(
+    context_ax.axis("off")
+    context_ax.text(
         0.0,
         1.0,
-        _summary_text(metadata, summary, trajectory_info),
+        _dashboard_context_text(metadata, dashboard_summary),
         va="top",
         ha="left",
         family="monospace",
-        fontsize=8.3,
-        linespacing=1.22,
+        fontsize=8.5,
+        linespacing=1.3,
     )
-    fig.tight_layout()
+    fig.suptitle(_dashboard_title(metadata, dashboard_summary), fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.955))
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
     return output_path
+
+
+def _draw_rmse_summary_panel(ax, summary: dict[str, object]) -> None:
+    raw_rmse = _to_float(
+        _first(
+            summary,
+            "raw_gnss_position_rmse_m",
+            "eval_raw_gnss_rmse_m",
+            "driving_raw_gnss_rmse_m",
+            "raw_gnss_rmse_m",
+        )
+    )
+    filtered_rmse = _to_float(
+        _first(
+            summary,
+            "filtered_position_rmse_m",
+            "eval_filtered_rmse_m",
+            "driving_filtered_rmse_m",
+            "filtered_rmse_m",
+        )
+    )
+    values = [raw_rmse, filtered_rmse]
+    if any(value is not None for value in values):
+        bars = ax.bar(
+            ("Raw GNSS", "Filter"),
+            [value if value is not None else 0.0 for value in values],
+            color=("tab:orange", "tab:blue"),
+        )
+        for bar, value in zip(bars, values):
+            label = f"{value:.3f} m" if value is not None else "n/a"
+            ax.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height(), label, ha="center", va="bottom", fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "RMSE unavailable", transform=ax.transAxes, ha="center", va="center")
+    improvement = _to_float(summary.get("localization_improvement_ratio"))
+    subtitle = f"Improvement ratio: {improvement:.3f}" if improvement is not None else "Improvement ratio: n/a"
+    ax.set_title(f"Position RMSE\n{subtitle}")
+    ax.set_ylabel("RMSE (m)")
+    ax.grid(True, axis="y", alpha=0.3)
+
+
+def _draw_driving_score_panel(ax, summary: dict[str, object]) -> None:
+    utility = _to_float(summary.get("closed_loop_utility_score"))
+    efficiency = _to_float(summary.get("closed_loop_completion_efficiency"))
+    values = [utility, efficiency]
+    if any(value is not None for value in values):
+        bars = ax.bar(
+            ("Utility", "Completion\nefficiency"),
+            [value if value is not None else 0.0 for value in values],
+            color=("tab:purple", "tab:green"),
+        )
+        for bar, value in zip(bars, values):
+            label = f"{value:.3f}" if value is not None else "n/a"
+            ax.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height(), label, ha="center", va="bottom", fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "Driving scores unavailable", transform=ax.transAxes, ha="center", va="center")
+    attempts = summary.get("attempts_used")
+    completion_time = _to_float(summary.get("completion_time_s"))
+    completed = bool(summary.get("route_completion_success"))
+    time_text = f"{completion_time:.1f} s" if completion_time is not None else "n/a"
+    ax.set_title(
+        "Closed-Loop Driving\n"
+        f"{'Completed' if completed else 'Not completed'} | attempts {attempts if attempts is not None else 'n/a'} | "
+        f"time {time_text}"
+    )
+    ax.set_ylabel("Score")
+    ax.grid(True, axis="y", alpha=0.3)
+
+
+def _draw_route_tracking_summary_panel(ax, summary: dict[str, object]) -> None:
+    mean_cte = _to_float(_first(summary, "driving_mean_cross_track_error_m", "mean_cross_track_error_m"))
+    p95_cte = _to_float(_first(summary, "driving_p95_cross_track_error_m", "p95_cross_track_error_m"))
+    max_cte = _to_float(_first(summary, "driving_max_cross_track_error_m", "max_cross_track_error_m"))
+    values = [mean_cte, p95_cte, max_cte]
+    if any(value is not None for value in values):
+        bars = ax.bar(
+            ("Mean CTE", "P95 CTE", "Max CTE"),
+            [value if value is not None else 0.0 for value in values],
+            color=("tab:blue", "tab:orange", "tab:red"),
+        )
+        for bar, value in zip(bars, values):
+            if value is not None:
+                ax.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height(), f"{value:.2f}", ha="center", va="bottom", fontsize=7)
+    else:
+        ax.text(0.5, 0.5, "Tracking metrics unavailable", transform=ax.transAxes, ha="center", va="center")
+    yaw_rmse = _to_float(_first(summary, "eval_yaw_rmse_deg", "driving_yaw_rmse_deg", "yaw_rmse_deg"))
+    quality = _to_float(summary.get("route_tracking_quality_score"))
+    ax.set_title(
+        f"Route Tracking\nYaw RMSE {_fmt(yaw_rmse)} deg | quality {_fmt(quality)}"
+    )
+    ax.set_ylabel("Cross-track error (m)")
+    ax.tick_params(axis="x", labelrotation=15)
+    ax.grid(True, axis="y", alpha=0.3)
+
+
+def _draw_diagnostics_summary_panel(ax, summary: dict[str, object]) -> None:
+    consistency = _to_float(summary.get("consistency_penalty"))
+    if summary.get("consistency_penalty_source") == "unavailable":
+        consistency = None
+    divergence = _to_float(
+        _first(
+            summary,
+            "eval_divergence_event_count",
+            "driving_divergence_event_count",
+            "divergence_event_count",
+            "divergence_penalty",
+        )
+    )
+    if summary.get("divergence_penalty_source") == "unavailable":
+        divergence = None
+    values = [consistency, divergence]
+    if any(value is not None for value in values):
+        bars = ax.bar(
+            ("Consistency\npenalty", "Divergence\ncount"),
+            [value if value is not None else 0.0 for value in values],
+            color=("tab:cyan", "tab:red"),
+        )
+        for bar, value in zip(bars, values):
+            if value is not None:
+                ax.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height(), f"{value:.2f}", ha="center", va="bottom", fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "Diagnostics unavailable", transform=ax.transAxes, ha="center", va="center")
+    nis = _to_float(_first(summary, "eval_mean_nis", "driving_mean_nis", "mean_nis"))
+    nees = _to_float(
+        _first(
+            summary,
+            "eval_mean_position_nees",
+            "driving_mean_position_nees",
+            "mean_position_nees",
+            "eval_mean_position_nees_diagonal_approx",
+            "driving_mean_position_nees_diagonal_approx",
+            "mean_position_nees_diagonal_approx",
+        )
+    )
+    status = str(summary.get("consistency_status") or "unavailable")
+    ax.set_title(f"Consistency / Diagnostics\n{status} | NIS {_fmt(nis)} | NEES {_fmt(nees)}")
+    ax.grid(True, axis="y", alpha=0.3)
+
+
+def _dashboard_title(metadata: dict[str, object], summary: dict[str, object]) -> str:
+    general = metadata.get("general", {}) if isinstance(metadata.get("general"), dict) else {}
+    filter_name = _active_filter_name(metadata)
+    tracking = _tracking_mode_label(metadata, _active_filter_info(metadata), summary)
+    noise = _sensor_noise_profile(metadata, summary) or "noise n/a"
+    actuator = _actuator_profile(metadata, summary) or "actuator n/a"
+    algorithm = _tune_algorithm(metadata, summary) or "tune n/a"
+    route = general.get("route_name") or summary.get("route_name") or "route n/a"
+    map_name = general.get("map_name") or summary.get("map_name") or "map n/a"
+    return (
+        f"{filter_name} | {tracking} tracking | {noise} | {actuator} | {algorithm}\n"
+        f"{route} | {map_name}"
+    )
+
+
+def _dashboard_context_text(metadata: dict[str, object], summary: dict[str, object]) -> str:
+    completed = bool(summary.get("route_completion_success"))
+    return "\n".join(
+        (
+            "Run Context",
+            f"Status: {'completed' if completed else 'not completed'}",
+            f"Attempts: {summary.get('attempts_used') if summary.get('attempts_used') is not None else 'n/a'}",
+            f"Completion time: {_fmt(summary.get('completion_time_s'))} s",
+            f"Tracking mode: {_tracking_mode_label(metadata, _active_filter_info(metadata), summary)}",
+            f"Noise profile: {_sensor_noise_profile(metadata, summary) or 'n/a'}",
+            f"Actuator: {_actuator_profile(metadata, summary) or 'n/a'}",
+            f"Tune algorithm: {_tune_algorithm(metadata, summary) or 'n/a'}",
+            f"Paper score ready: {_fmt_bool(summary.get('paper_ready_score_available'))}",
+            "",
+            "Score Components",
+            f"Difficulty: {_fmt(summary.get('difficulty_factor'))}",
+            f"Attempt factor: {_fmt(summary.get('attempt_factor'))}",
+            f"Time norm: {_fmt(summary.get('time_norm'))}",
+            f"CTE norm: {_fmt(summary.get('cte_norm'))}",
+            f"P95 CTE norm: {_fmt(summary.get('p95_cte_norm'))}",
+            f"Yaw norm: {_fmt(summary.get('yaw_norm'))}",
+        )
+    )
+
+
+def _sensor_noise_profile(metadata: dict[str, object], summary: dict[str, object]) -> str:
+    direct = str(summary.get("sensor_noise_profile") or metadata.get("sensor_noise_profile") or "").strip()
+    if direct:
+        return direct
+    sensors = metadata.get("sensor_configuration") if isinstance(metadata.get("sensor_configuration"), dict) else {}
+    raw = sensors.get("raw_config") if isinstance(sensors.get("raw_config"), dict) else {}
+    return str(raw.get("preset_name") or raw.get("profile") or "").strip()
+
+
+def _actuator_profile(metadata: dict[str, object], summary: dict[str, object]) -> str:
+    direct = str(summary.get("actuator_realism_profile") or metadata.get("actuator_realism_profile") or "").strip()
+    if direct:
+        return direct
+    config = metadata.get("actuator_realism_config") if isinstance(metadata.get("actuator_realism_config"), dict) else {}
+    return str(config.get("preset_name") or config.get("profile") or "").strip()
+
+
+def _tune_algorithm(metadata: dict[str, object], summary: dict[str, object]) -> str:
+    run_metadata = metadata.get("benchmark_metadata") if isinstance(metadata.get("benchmark_metadata"), dict) else {}
+    for container in (summary, metadata, run_metadata):
+        for key in ("tune_algorithm", "candidate_generation_strategy", "strategy"):
+            value = str(container.get(key) or "").strip()
+            if value:
+                return value
+    return ""
 
 
 def _draw_trajectory_panel(

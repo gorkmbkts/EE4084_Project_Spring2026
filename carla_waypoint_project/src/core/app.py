@@ -1306,6 +1306,7 @@ class SimulationApp:
                 "offline_score": request.finalist.offline_score,
                 "offline_trial_index": request.finalist.trial_index,
                 "candidate_tune": dict(request.finalist.candidate_tune),
+                "tune_algorithm": request.tune_algorithm,
                 "tuning_stage": request.stage,
                 "stage_trial_index": request.stage_trial_index,
                 "stage_trial_total": request.stage_trial_total,
